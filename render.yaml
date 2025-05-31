@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: keiba-linebot
+    env: python
+    buildCommand: ""
+    startCommand: "python line_bot.py"
+    envVars:
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        value: your_line_channel_access_token
+      - key: LINE_CHANNEL_SECRET
+        value: your_line_channel_secret
+      - key: OPENAI_API_KEY
+        value: your_openai_api_key
