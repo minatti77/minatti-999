@@ -25,7 +25,7 @@ def handle_message(event):
     user_message = event.message.text
     try:
         response = openai.ChatCompletion.create(
-            model="gpt-4",
+            model="gpt-3.5-turbo ",
             messages=[
                 {"role": "system", "content": "あなたは競馬予想AIです。"},
                 {"role": "user", "content": user_message}
