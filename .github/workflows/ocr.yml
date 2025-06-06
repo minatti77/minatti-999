@@ -1,23 +1,45 @@
 name: OCR-Screenshot-Ingest
+
 on:
   push:
-    paths: ['Screenshot*.jpg']
+    paths:
+      - 'Screenshot*.jpg'
 
 jobs:
   ocr:
     runs-on: ubuntu-latest
     steps:
+      # ① リポジトリをチェックアウト
       - uses: actions/checkout@v4
 
+      # ② Python 3.11 をセットアップ
       - uses: actions/setup-python@v5
-        with: {python-version: '3.11'}
+        with:
+          python-version: '3.11'
 
-      - run: pip install pillow pytesseract pandas
+      # ③ Tesseract 本体（日本語モデル込み）をインストール
+      - name: Install system deps
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y tesseract-ocr tesseract-ocr-jpn
 
-      - run: python scripts/ocr_batch.py --pattern "Screenshot*.jpg"
+      # ④ Python ライブラリをインストール
+      - name: Install Python deps
+        run: pip install pillow pytesseract pandas
 
-      - uses: actions/upload-artifact@v4
-        with: {name: ocr_csv, path: output/ocr.csv}
+      # ⑤ スクショ → OCR → CSV 生成
+      - name: Run OCR
+        run: python scripts/ocr_batch.py --pattern "Screenshot*.jpg"
 
-      - run: curl -F "csv=@output/ocr.csv" "$WEBHOOK_URL"
-        env: {WEBHOOK_URL: ${{ secrets.MODEL_WEBHOOK }}}
+      # ⑥ CSV をアーティファクトとして保存
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr_csv
+          path: output/ocr.csv
+
+      # ⑦ Render の Webhook へ CSV を送信
+      - name: Call model webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.MODEL_WEBHOOK }}
+        run: curl -F "csv=@output/ocr.csv" "$WEBHOOK_URL"
