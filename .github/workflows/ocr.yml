@@ -21,10 +21,12 @@ jobs:
           sudo apt-get -qq install -y tesseract-ocr tesseract-ocr-jpn
 
       - name: Install Python deps
-        run: pip install pillow pytesseract pandas
+        run: |
+          pip install pillow pytesseract pandas
 
       - name: Run OCR
-        run: python scripts/ocr_batch.py --pattern "Screenshot*.jpg"
+        run: |
+          python scripts/ocr_batch.py --pattern "Screenshot*.jpg"
 
       - name: Upload CSV
         uses: actions/upload-artifact@v4
@@ -35,4 +37,5 @@ jobs:
       - name: Call model webhook
         env:
           WEBHOOK_URL: ${{ secrets.MODEL_WEBHOOK }}
-        run: curl -F "csv=@output/ocr.csv" "$WEBHOOK_URL"
+        run: |
+          curl -F "csv=@output/ocr.csv" "$WEBHOOK_URL"
