@@ -9,7 +9,7 @@ jobs:
   ocr:
     runs-on: ubuntu-latest
     steps:
-      # ① リポジトリをチェックアウト
+      # ① リポジトリをチェックアウト（←ここ修正済み）
       - uses: actions/checkout@v4
 
       # ② Python 3.11 をセットアップ
@@ -17,28 +17,28 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ③ Tesseract 本体（日本語モデル込み）をインストール
+      # ③ Tesseract（日本語対応）をインストール
       - name: Install system deps
         run: |
           sudo apt-get -qq update
           sudo apt-get -qq install -y tesseract-ocr tesseract-ocr-jpn
 
-      # ④ Python ライブラリをインストール
+      # ④ Pythonライブラリをインストール
       - name: Install Python deps
         run: pip install pillow pytesseract pandas
 
-      # ⑤ スクショ → OCR → CSV 生成
+      # ⑤ OCR実行 → CSV出力
       - name: Run OCR
         run: python scripts/ocr_batch.py --pattern "Screenshot*.jpg"
 
-      # ⑥ CSV をアーティファクトとして保存
+      # ⑥ CSVをGitHubアーティファクトとして保存
       - name: Upload CSV
         uses: actions/upload-artifact@v4
         with:
           name: ocr_csv
           path: output/ocr.csv
 
-      # ⑦ Render の Webhook へ CSV を送信
+      # ⑦ Webhook（Render）へCSV送信
       - name: Call model webhook
         env:
           WEBHOOK_URL: ${{ secrets.MODEL_WEBHOOK }}
