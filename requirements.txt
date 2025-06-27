@@ -1,3 +1,5 @@
 flask
 openai==0.28
 line-bot-sdk
+fastapi==0.110.0
+uvicorn==0.29.0
