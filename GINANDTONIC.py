@@ -1,0 +1,21931 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+# NOTE: AI Drive上では __pycache__ への書き込みでI/Oエラーになり得るため、
+# .pyc の自動生成を抑止（実行自体はソースから行う）。
+import sys
+import io
+
+sys.dont_write_bytecode = True
+
+"""GIN AND TONIC STELLA v1.33 RULES-ONLY（画像入力OCR対応 / 買い目＋監査Markdown）
+
+目的:
+- 画像（スクショ）からOCRして、v1.14固定ルールで
+  「複勝 + ワイド（◎軸流し4点以内）」を判定し、監査Markdownを出力します。
+- 部分買いOK（複勝だけ／ワイドだけでも成立）
+
+固定ルール（デフォルト）:
+- ◎決定：AnchorScore 最大
+- 複勝（rules）：p_place_est >= 0.26 → 購入（stake_place=1000円）
+- ワイド（rules）：◎軸流し「4点以内」（的中率重視）。下限市場（3.0等）の固定ゲートは廃止。
+- 三連複（rules）：三連複はフォーメーションのみを出力し、市場データは扱わない。
+  三連複フォーメーション（30点以内・写真パターン準拠）を必ず1つ提示（買い目テーブルは出さない）。
+
+削除したもの（あなたの指定 1.2）：
+- modelモード（EV/3点流し/ケリー配分などの旧分岐）
+- 実購入/払戻/精算まわりの機能（買い目作成＋監査Markdownに集中）
+
+OCR依存:
+- pillow / opencv-python / pytesseract が必要です
+- OS側の Tesseract 本体も必要です（pytesseract は呼び出しラッパー）
+
+"""
+
+import argparse
+import json
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import os
+import hashlib
+
+import numpy as np
+import pandas as pd
+import joblib
+
+# optional ML deps for pair model (p_pair)
+try:
+    import lightgbm as lgb
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.isotonic import IsotonicRegression
+    from sklearn.model_selection import GroupKFold
+except Exception:
+    lgb = None
+    CalibratedClassifierCV = None
+    IsotonicRegression = None
+    GroupKFold = None
+
+
+try:
+    from scipy.stats import beta as _beta_dist
+except Exception:
+    _beta_dist = None
+try:
+    from PIL import Image
+    import cv2
+    import pytesseract
+except Exception:  # allow non-OCR runs
+    Image = None
+    cv2 = None
+    pytesseract = None
+
+
+# =========================
+# 0) Utils
+
+# =========================
+# Params (balanced tuning)
+# =========================
+
+DEFAULT_PARAMS = {
+    # =========================
+    # MODE SWITCH
+    # =========================
+
+    # --- bet selection modes ---
+    # - 'model': 従来のEV/確率ベース
+    # - 'rules': 「絶対厳守ルール」準拠（満たせなければ見送り）
+    'wide_mode': 'rules',
+    'place_mode': 'rules',
+
+    # --- ABSOLUTE: 市場市場（単勝/複勝/ワイド等）は予想ロジックに使わない（表示のみ可） ---
+    'market_features_enabled': False,
+
+    # --- anchor score mode ---
+    # - 'add': 加点式（従来SAS）
+    # - 'mul': 掛算式（重み付き幾何平均）
+    'anchor_score_mode': 'mul',
+    'anchor_score_col': 'AnchorScore',
+    # SAS_UNIFIED: add geometric-mean stabilizer (AnchorScore要素をSASへ統合)
+    'sas_geo_blend': 0.25,  # 0..1 (0=add only, 1=geo only)
+    'sas_geo_floor': 15.0,
+    'sas_geo_ceil': 90.0,
+    # SAS_STABLE: anchor selection quantization (small SAS diffs won't flip ◎)
+    'sas_anchor_quantize': 0.5,  # 0.5点刻みで丸めて順位付け（0で無効）
+
+
+    # ===== Place probability calibration (PURE_DATA) =====
+    # p_place_est は市場市場を使わず、SASからの写像で作る。
+    # ブレ抑制のため、線形ではなく sigmoid(z-score) で飽和させる。
+    # 調整はここだけ触れば良い（実運用の的中ログが溜まったら合わせ込み）。
+    'place_calibration': {
+        'mode': 'sigmoid_z',
+        'tau': 12.0,        # 大きいほど平坦（ブレ↓）
+        'p_lo': 0.06,
+        'p_hi': 0.42,
+        'clip_lo': 0.05,
+        'clip_hi': 0.60,
+    },
+
+
+    # ---- Anchor guard (v10.12): market-based safety net ----
+    # If model top deviates from market top band, optionally switch to market top.
+    'anchor_market_guard_enabled': False,  # PURE_DATA: market guard disabled
+    'anchor_market_guard_topn': 3,
+    'anchor_market_guard_min_gap': 0.04,
+
+    # --- anchor front-risk guard (short sprint precision tune) ---
+    'anchor_front_risk_guard_enabled': True,
+    'anchor_front_risk_guard_max_gap_pct': 2.0,           # R26: 3.0→2.0 厳格化
+    'anchor_front_risk_guard_min_front_runners': 2,
+    'anchor_front_risk_guard_first3f_gap': 0.15,          # R26: 0.20→0.15 厳格化
+    'anchor_front_risk_guard_first3f_pack_gap': 0.35,
+    'anchor_front_risk_guard_first3f_extra_gap_pct': 1.2,
+    'anchor_front_risk_guard_first3f_pack_extra_gap_pct': 0.8,
+    'anchor_front_risk_guard_pace_h_extra_gap_pct': 0.8,
+    'anchor_front_risk_guard_pace_mlow_extra_gap_pct': 0.4,
+    'anchor_front_risk_guard_switch_nonfront_only': True,
+    'anchor_front_risk_guard_candidate_max_rank': 4,
+    # R26: ペースH時の先行馬 AnchorScore ペナルティ
+    'anchor_pace_h_front_penalty': 5.0,       # ペースH + 先行(FRONT)の軸候補への減点
+    'anchor_pace_h_front_style_penalty': 3.0, # 前走も先行スタイルの場合の追加減点
+    'anchor_pace_h_penalty_apply': True,      # 上記ペナルティの有効/無効フラグ
+    # ===== R30 案B → R31 改良: Hペース + REAR + HIGH確信度馬への AnchorScore 2層ボーナス =====
+    # R30: REAR+HIGH に一律+3.0 → 差別化なし
+    # R31: 2層構造
+    #   層1 (基本): REAR+HIGH → h_pace_rear_high_anchor_bonus (+1.5)
+    #   層2 (GRB):  REAR+HIGH + GateRecoveryBonus > grb_threshold → h_pace_rear_high_grb_extra (+1.5)
+    # 効果: ムーヴ型（GRB>0）= +3.0、普通のREAR+HIGH = +1.5 → 相対差別化
+    'h_pace_rear_high_anchor_bonus': 1.5,    # 層1: REAR+HIGH 基本ボーナス (R30の3.0→1.5)
+    'h_pace_rear_high_grb_extra': 1.5,       # 層2: GateRecoveryBonus 付き馬への追加ボーナス
+    'h_pace_rear_high_grb_threshold': 0.0,   # 層2 発動しきい値 (GRB > この値で追加)
+    'h_pace_rear_high_anchor_enabled': True, # 機能の有効/無効フラグ
+    # ===== R33: Hペース + MIDDLE + HIGH + GRB > 0 馬への AnchorScore ボーナス (案B汎用化) =====
+    # 論拠: GRB 付き差しMIDDLE馬はゲート不利を挽回する末脚力を持つ → Hペースでも評価
+    # REAR ほど末脚依存でないため、ボーナスは REAR の 2層合計 (3.0) より小さく設定
+    'h_pace_middle_high_grb_bonus': 1.0,     # MIDDLE+HIGH+GRB 馬への追加ボーナス
+    'h_pace_middle_high_grb_threshold': 1.5, # IMPROVE-④D: 2.0→1.5 MIDDLE+HIGH発動範囲拡大 (v1.33)
+                                              #      GRB>2.0 ⟺ gate_recovery_hits≥1(GRB=2.5>2.0)
+                                              #      弱いシグナル(GRB=0.5〜2.0)を除外し精度向上
+    'h_pace_middle_high_grb_enabled': True,  # 機能の有効/無効フラグ
+    # ===== IMPROVE-①A/D: ミドルペース時 前残り・好位ボーナス (v1.33) =====
+    # 論拠: ミドルペース展開では前目・好位の馬が有利（阪神12R教訓）
+    'm_pace_front_high_bonus':  2.0,    # ミドルペース + FRONT + HIGH → AnchorScore +2.0
+    'm_pace_front_bonus':       1.5,    # ミドルペース + FRONT（HIGH以外）→ +1.5
+    'm_pace_middle_high_bonus': 1.0,    # ミドルペース + MIDDLE + HIGH → +1.0
+    'm_pace_front_bonus_enabled': True, # ミドルペース前残りボーナスの有効/無効フラグ
+    # R26: 軸馬 BOX 自動切り替え
+    'anchor_box_gap_threshold': 3.0,  # IMPROVE-②A: 5.0→3.0 軸分散強化 (v1.33)
+    'anchor_box_max_count': 4,        # IMPROVE-②B: 3→4 13頭立て以上対応 (v1.33)
+    'anchor_box_enabled': True,       # BOX自動切り替えの有効/無効
+    # ===== IMPROVE-②C: 調教◎軸昇格ルール (v1.33) =====
+    # 調教ファクターが最高評価(◎)かつ AnchorScore 上位N位以内の馬をBOX候補に強制追加
+    'anchor_training_ex_enabled': True,   # 調教◎強制BOX昇格の有効/無効
+    'anchor_training_ex_rank_max': 5,     # AnchorScore 上位何位以内を対象にするか
+    'anchor_training_ex_score_min': 0.0,  # TrainingScore 最低値（0=制限なし）
+    # ===== IMPROVE-②D: 複数軸フォーメーション出力 (v1.33) =====
+    # AnchorScore上位2〜3頭を三連複A列に並列設定（W軸モード）
+    'multi_anchor_trio_enabled': True,    # 複数軸フォーメーションの有効/無効
+    'multi_anchor_trio_max': 3,           # 複数軸の最大頭数（A列に並列設定）
+    'multi_anchor_trio_gap': 4.0,         # この点差以内のAnchorScore馬をA列に追加
+
+    # --- R27: 走法分類 (classify_running_style) ---
+    'running_style_classify': {
+        'enabled': True,
+        # zone 列ごとの多数決重み (zone_4c が直近, zone_1c が最古)
+        'zone_weights': {'zone_4c': 0.40, 'zone_3c': 0.30, 'zone_2c': 0.20, 'zone_1c': 0.10},
+        # pred_first3f が上位 N 位以内 → FRONT 補正 (+補正値)
+        'first3f_top_n': 3,
+        'first3f_front_boost': 0.15,   # FRONT スコアへの補正量
+        # pred_last3f が上位 N 位以内 → REAR 補正
+        'last3f_top_n': 3,
+        'last3f_rear_boost': 0.10,
+        # ラベル確定閾値: スコアがこの値以上なら確定、未満は MIDDLE とみなす
+        'front_threshold': 0.45,
+        'rear_threshold':  0.40,
+        # 信頼度: zone_4c 単独一致かつ pred 補正が同方向なら HIGH
+        'high_confidence_min_score': 0.60,
+        # ペースH時に先行スタイル確定馬への追加減点を AnchorScore に適用するか
+        'pace_h_confirmed_extra_penalty': 2.0,
+    },
+
+    # --- comment / condition / gate structured signals ---
+    'comment_features': {
+        'enabled': True,
+        'target_total_weight': 0.11,
+        'comment_delta_cap': 2.5,
+        'comment_delta_scale': 0.045,
+        'gate_score_scale': 7.5,
+        'condition_score_scale': 8.5,
+        'trend_score_scale': 8.5,
+        'temperament_risk_scale': 10.0,
+        'start_risk_scale': 6.0,
+        # R24: SP指数最高値 vs 昇級点チェック用列名（IMP-5 ClassUpBonus）
+        # entries CSV に 'class_up_point'（または '昇級点' / 'class_up'）列を追加すると
+        # _cbf_apply_sp_weighting が自動で ClassUpBonus を計算して Ability に加算する。
+        # 列が存在しない場合は無効（後方互換）。
+        # 例: class_up_point = 76 の馬が speed_max = 80 なら ClassUpBonus = +0.4
+        'class_up_point_col': 'class_up_point',
+
+        # R22: 前走インタビューに「のっそり」「スタート」等が含まれる場合の AnchorScore ペナルティ量
+        # 例: 「のっそりしていた」→ +3.0 点ペナルティを AnchorScore から減算
+        'start_risk_prev_interview_penalty': 3.0,
+        # R22: True の場合 AnchorScore へペナルティを反映する
+        'start_risk_apply_to_anchor': True,
+        # R26: 前走コメントに「出遅れ」「ゲート不利」「発走不利」「後手」が含まれる場合に、
+        # 次走での回復ボーナスを CommentFit に加算する。
+        'gate_recovery_bonus': 2.5,
+        'gate_recovery_weight': 0.08,
+        'gate_recovery_bonus_max': 7.5,   # R37: GRB上限をパラメータ化 (旧ハードコード 10.0 → 7.5)
+                                           #      hits×2.5換算: 7.5=hits3件 (現実的な最大)
+                                           #      AnchorScoreへの影響はゼロ(GRB>threshold判定のみ)
+        'gate_recovery_keywords': [
+            '出遅れ', 'ゲート不利', '発走不利', '後手',
+            'スタートでつまずかれ', '出し遅れ',
+        ],
+        # ===== IMPROVE-⑤D: 前走インタビュー好調キーワード ボーナス (v1.33) =====
+        # 前走インタビューに好調ワードが含まれる場合、AnchorScore にボーナスを加算
+        'positive_interview_bonus_enabled': True,  # 好調キーワードボーナスの有効/無効
+        'positive_interview_bonus': 1.5,            # ボーナス量
+        'positive_interview_keywords': [
+            '想像以上', '凄く', 'すごく', '素晴らしい', 'よく頑張', '頑張ってくれ',
+            '強かった', '動き良', '状態良', '絶好調', '最高', '楽に', 'スムーズ',
+        ],
+        # ===== R30 案A: GateRecoveryBonus を GateFit にも直接反映 =====
+        # GateRecoveryBonus × gate_recovery_gate_scale を GateFit に加算する。
+        # 「出遅れたが回復傾向」の馬がゲート適性としても評価されるようにする。
+        # デフォルト 0.6 → GateRecoveryBonus=5.0 の場合 GateFit +3.0
+        'gate_recovery_gate_scale': 0.6,
+        # ===== IMPROVE-⑤C: 馬体重増減リスクフラグ (v1.33) =====
+        'weight_risk_enabled': True,       # 馬体重増減リスク評価を有効化
+        'weight_loss_risk_threshold': -10, # 馬体重 -10kg 以上減 → リスクフラグ
+        'weight_loss_risk_penalty': 2.0,   # AnchorScore への減点
+        'weight_gain_risk_threshold': 10,  # 馬体重 +10kg 以上増 → やや注意
+        'weight_gain_risk_penalty': 0.5,   # 増加時の軽微な減点
+        # ===== IMPROVE-⑤B: 実ペース vs 予測ペース乖離ログ (v1.33) =====
+        'pace_deviation_log_enabled': True,  # ペース乖離ログ記録の有効/無効
+        'pace_deviation_log_key': 'pace_deviation_log',  # ログ保存キー
+        # gate_recovery_gate_scale=0.0 で無効化
+    },
+
+    # ===== IMPROVE-①B: ペース5段階分類設定 (v1.33) =====
+    # 従来: H / M / L の3段階 → 5段化: H / MH / M / ML / L
+    # MH=ミドルハイ (前半33.5-34.5秒相当), ML=ミドルロー (前半35.5-36.5秒相当)
+    'pace_5level_enabled': True,       # 5段階ペース分類を有効化
+    'pace_mh_threshold_sec': 34.5,    # MH判定: 前半3F≤34.5s
+    'pace_ml_threshold_sec': 36.0,    # ML判定: 前半3F≥36.0s
+    # MHペース時: 中間的な重み（HとMの中間）
+    'mh_pace_timefit_weight': 0.04,   # MHペース時 TimeFit（H=0.06、M=0.02の中間）
+    'mh_pace_pacefit_weight': 0.14,   # MHペース時 PaceFit（H=0.12、M=0.16の中間）
+    # MLペース時: スロー寄りの重み
+    'ml_pace_timefit_weight': 0.02,   # MLペース時 TimeFit（スロー寄り）
+    'ml_pace_pacefit_weight': 0.18,   # MLペース時 PaceFit（スロー寄り、強め）
+
+    # ===== R30 案C: Hペース時 WPS重み動的変更 =====
+    # Hペース時に TimeFit (末脚適性) の重みを引き上げ、PaceFit を少し紹る。
+    # Ability固定 (0.45) は変更しない。小さい値で始めて対象レースで検証すること。
+    'h_pace_timefit_weight': 0.06,   # デフォルト 0.02 → Hペース時 0.06
+    'h_pace_pacefit_weight': 0.12,   # デフォルト 0.16 → Hペース時 0.12 (調整分)
+
+    # --- win-pattern / recent-form emphasis ---
+    'win_pattern_rules': {
+        'enabled': True,
+        'young_maiden_ability_weight': 0.35,
+        'young_maiden_recent_weight': 0.35,
+        'young_maiden_race_weight': 0.30,
+        'long_maiden_ability_weight': 0.34,
+        'long_maiden_recent_weight': 0.28,
+        'long_maiden_race_weight': 0.38,
+        'general_ability_weight': 0.40,
+        'general_recent_weight': 0.25,
+        'general_race_weight': 0.35,
+        'ability_time_weight': 0.18,
+        'ability_consist_weight': 0.12,
+        'recent_training_weight': 0.65,  # IMPROVE-④A: 0.58→0.65 調教重み強化 (v1.33)
+        'recent_trend_weight': 0.27,
+        'recent_delta_weight': 0.15,
+        'race_pace_weight': 0.35,  # IMPROVE-④C: 0.30→0.35 ペース適性重み強化 (v1.33)
+        'race_gate_weight': 0.24,
+        'race_condition_weight': 0.26,
+        'race_map_weight': 0.12,
+        'race_pos_weight': 0.08,
+        'signal_promote_threshold': 3,
+        'signal_promote_bonus_win': 4.5,
+        'signal_promote_bonus_place': 2.5,
+        'temperament_penalty_win_scale': 0.85,
+        'temperament_penalty_place_scale': 0.35,
+        'long_maiden_pace_m_weight': 0.65,
+        'long_maiden_pace_s_weight': 0.35,
+        'long_maiden_pace_front_bias': -3.0,
+        'long_maiden_pace_middle_bias': 2.0,
+        'long_maiden_pace_rear_bias': 4.0,
+        'long_maiden_frontfade_base_penalty': 6.0,
+        'long_maiden_frontfade_extra_penalty': 2.0,
+        'long_maiden_recovery_rating_rank_threshold': 5,
+        'long_maiden_recovery_bonus_win': 3.5,
+        'long_maiden_recovery_bonus_place': 5.0,
+        'long_maiden_recovery_bonus_win_core': 1.5,
+        'long_maiden_recovery_bonus_place_core': 2.5,
+    },
+
+    # --- insurance line promotion (value hedge) ---
+    'insurance_rules': {
+        'enabled': True,
+        'signal_threshold': 3,
+        'rise_trend_threshold': 58.0,
+        'delta_train_threshold': 1.0,
+        'training_score_threshold': 58.0,
+        'training_rank_threshold': 4,
+        'comment_fit_threshold': 56.0,
+        'track_adv_threshold': 58.0,
+        # ===== IMPROVE-③C: 「注」馬の三連複C列必須化 (v1.33) =====
+        # insurance_line（注）馬を三連複C列に自動追加する
+        'force_trio_c_enabled': True,   # 注馬をC列強制追加する有効/無効
+        'force_trio_c_max': 2,          # C列に強制追加する最大頭数
+    },
+
+    # --- next-run recommendation (watch list / follow-up) ---
+    'next_run_rules': {
+        'enabled': True,
+        'main_score_min': 62.0,
+        'watch_score_min': 57.0,
+        'top_n': 5,
+        'ability_weight': 0.22,
+        'recent_weight': 0.18,
+        'stability_weight': 0.16,
+        'distance_weight': 0.14,
+        'training_weight': 0.18,  # IMPROVE-④B: 0.12→0.18 調教重み統一強化 (v1.33)
+        'comment_trend_weight': 0.08,
+        'upside_weight': 0.06,
+        'place_axis_weight': 0.04,
+        'recovery_signal_bonus': 4.0,
+        'insurance_signal_bonus': 1.2,
+        'training_rank_bonus': 2.0,
+        'delta_train_bonus': 1.0,
+        'pace_mismatch_bonus': 2.0,
+        'start_issue_bonus': 1.5,
+        'temperament_relief_bonus': 1.0,
+        'severe_temp_penalty_scale': 1.2,
+        'severe_stamina_penalty_scale': 1.0,
+    },
+
+    # ===== IMPROVE-⑥: 結果フィードバックループ設定 (v1.33) =====
+    'feedback_rules': {
+        'enabled': True,
+        # ===== ⑥A: レース後自動検証 =====
+        # 予想◎と実着順を比較し、的中/不的中・収支を自動ログに記録
+        'auto_verify_enabled': True,
+        'verify_log_file': 'race_verify_log.jsonl',  # JSONL形式で追記保存
+        # ===== ⑥B: パラメータ自動提案 =====
+        # 不的中が連続したファクターのウェイト調整を提案（実際の変更は手動）
+        'auto_suggest_enabled': True,
+        'suggest_consecutive_miss': 3,   # 何連続不的中でサジェスト発動するか
+        # ===== ⑥C: コース×クラス×ペース別統計 =====
+        'course_class_stat_enabled': True,
+        'course_class_stat_file': 'course_class_stat.json',
+        # ===== ⑥D: ◎的中率トラッキング =====
+        'anchor_accuracy_tracking_enabled': True,
+        'anchor_accuracy_target': 0.50,  # ◎複勝的中率の目標値（50%）
+        'anchor_accuracy_log_file': 'anchor_accuracy_log.jsonl',
+        # ===== ⑥: 監査Markdownへの検証サマリー出力 =====
+        'feedback_summary_in_md': True,  # 監査Markdownに検証サマリーを含める
+    },
+
+    # --- favorite / dangerous popularity / hole picking ---
+    'favorite_logic_rules': {
+        'enabled': True,
+        'favorite_top_bonus': 3.2,
+        'favorite_start_penalty_scale': 0.60,
+        'favorite_start_penalty_cap': 1.8,
+        'favorite_override_min_recent': 58.0,
+        'favorite_override_min_training': 58.0,
+        'favorite_override_min_comment': 55.0,
+        'maintenance_relief_bonus_win': 3.5,  # IMPROVE-②E: 2.0→3.5 休み明け絞り馬評価強化 (v1.33)
+        'maintenance_relief_bonus_place': 0.8,
+        'development_wait_penalty_win': 3.2,
+        'development_wait_penalty_place': 1.0,
+        'danger_flag_threshold': 3.0,
+        'value_hole_score_min': 58.0,
+    },
+
+    # rules preset (used when *_mode='rules')
+    'place_rules': {
+        # 複勝は「◎ 1点」のみ（部分買いOK方針）
+        # stake は固定（wide_rules とは別財布として扱う）
+        'stake_place': 1000,
+        # ===== IMPROVE-③D: 複勝分散買い (v1.33) =====
+        # BOXモード時に上位2頭へ500円ずつ分散する
+        'stake_place_split_on_box': True,   # BOX時に複勝を分散するか
+        'stake_place_split_num': 2,          # 分散先の頭数（最大）
+        'stake_place_split_each': 500,       # 分散時の1頭あたり金額（円）
+        # --- 安定性ゲート（未設定=0で無効）---
+        # (1) 最低限の信頼度: p_place_est >= min_p_place_est
+        'min_p_place_est':  0.32,
+        # (1b) 保守下限ゲート: p_place_low（one-sided下限）>= min_p_place_low
+        'min_p_place_low': 0.22,
+        # (2) 低すぎる複勝は資金効率が悪くブレやすいので下限ゲート
+        #     市場レンジ表記の左側（下限）で判定。
+        'min_place_market_min':  0.0,
+        # (3) 高すぎる複勝は◎の信頼度不足になりやすいので上限ゲート（任意）
+        #     0以下なら無効。
+        'max_place_market_min': 0.0,
+        # absolute: place does not gate by EV/Beta-low
+        'ev_gate_enabled': False,
+        'require_p_low_positive': False,
+        # ===== R40: 信頼度フィルター（Place Confidence Filter）=====
+        # confidence_filter_enabled: True にすると、信頼度が LOW の場合は place_ok=False に強制
+        'confidence_filter_enabled': True,
+        # HIGH判定条件: p_place_est >= この値 AND score_gap >= confidence_score_gap_min AND 非BOX
+        'confidence_high_p_place_min': 0.32,  # IMPROVE-④E: 0.35→0.32 HIGH判定緩和 (v1.33)
+        # MEDIUM判定条件: p_place_est >= この値 AND score_gap >= confidence_score_gap_medium
+        'confidence_medium_p_place_min': 0.32,
+        # スコアギャップ閾値（1位 - 2位 AnchorScore）
+        'confidence_score_gap_min': 3.0,    # HIGH用
+        'confidence_score_gap_medium': 1.5, # MEDIUM用
+    },
+
+    # rules preset (used when wide_mode='rules')
+    'wide_rules': {
+        'trio_formation_stake_yen_per_ticket': 100,  # A) 均等100円/点
+        'trio_formation_budget_yen': 3000,  # 三連複の予算上限（円）。0以下なら上限なし
+        # ===== IMPROVE-③E: 信頼度別予算動的調整 (v1.33) =====
+        # 信頼度 HIGH: 三連複予算増額, LOW: 削減
+        'trio_budget_high_confidence': 2000,  # HIGH時の三連複予算（円）
+        'trio_budget_low_confidence':  1000,  # LOW/BOX時の三連複予算（円）
+        'wide_budget_high_confidence': 2000,  # HIGH時のワイド予算（円）
+        'wide_budget_low_confidence':  1500,  # LOW/BOX時のワイド予算（円）
+        'trio_formation_stake_mode': 'equal',  # 配分は均等固定（厚張りしない）
+        # =========================
+        # ワイド：◎軸流し 4点（安全寄り・的中率優先 / 絶対厳守）
+        # =========================
+        # 目的：回収より『的中率』を優先。
+        # 方針：
+        #  - 低め市場（=人気寄り）を許容して当たりやすさを上げる
+        #  - 高すぎる市場（=穴）を上限で排除
+        #  - モデル上の同時的中率が低い相手は排除
+        'n_points': 4,
+
+        # 全点で満たす条件（validate_paramsで安全側に丸める）
+        # NOTE(v10.12): ワイド下限（3.0等）の固定ゲートは廃止。
+        # min_all は 0.0（下限なし）をデフォルトとする。
+        'min_all':  0.0,
+        'max_all':  0.0,
+        'min_p_wide_model_pct': 8.0,
+
+        # ===== MC stability (PURE_DATA) =====
+        # wideのp_low（下限）は seed違いrunの分位点で近似しているため、
+        # run数とサンプル数を上げるほどブレが減る（処理時間は増える）。
+        'p_low_n_runs': 9,
+        'p_low_n_samples': 12000,
+
+        # 選抜スコアの重み（改善: 相手の地力も見る）
+        # - 中山5Rの反省（本線相手を落として弱い相手が混ざる）を抑えるため、
+        #   opp_strength の比重を少し上げる
+        'pick_weights': {
+            'p_wide': 0.50,
+            'opp_strength': 0.20,
+            'market_safety': 0.00
+        },
+
+        # zone被りペナルティ（安全寄りなので弱める）
+        'zone_dup_penalty': 0.01,
+
+        # 改善(中山5R): 4点が揃わない時に無理に弱い相手を入れない（2〜3点でも出力可）
+        'min_points': 2,
+
+        # ワイド4点のうち1点は『連軸プラス推奨』枠（=三連複フォメ3頭目候補の最上位）から必ず採る
+        'ensure_trio_plus_candidate_in_wide': True,
+
+        # 改善(中山5R): "相手の地力上位" を優先しやすくするためのコアボーナス
+        'core_top_n': 6,
+        'core_bonus': 0.04,
+
+        # 改善: ワイドは的中率重視 → EVゲートはデフォルトOFF
+        'ev_gate_enabled': False,
+
+        # 購入金額（円）
+        'stake_total_yen': 5000,
+        'stake_unit_yen': 100,
+        'stake_list': None,
+        # ===== 2-layer upgrade (Nakayama6R/7R learnings) =====
+        # (Layer-1) Market core: lock N lowest-market wide pairs as 'main line'
+        # Purpose: do not drift too far from high-probability market band
+        'base_market_n': 0,  # market disabled
+
+        # (Layer-2) Front longshot (optional side bet): when multiple FRONT runners are likely,
+        # add 1 extra wide with a FRONT longshot (separate wallet).
+        'front_longshot_enabled': True,
+        'front_longshot_min_front_runners': 2,
+        'front_longshot_min_market': 6.0,
+        'front_longshot_max_market': 20.0,
+        'front_longshot_stake_yen': 200,
+
+        # scenario weight: pace tilt is uncertain -> keep small
+        'scenario_pace_tilt': 0.08,
+        # safety: if anchor place probability is too low, skip wide (avoid total collapse)
+        'skip_wide_if_anchor_p_place_lt': 0.22,
+        # ===== dual-axis scenario split (Nakayama10R learning) =====
+        # Do not one-shot the pace. When pace is uncertain (H/M),
+        # reserve some main-line points for a '差し受け(=REAR/MIDDLE)' axis.
+        'scenario_split_enabled': True,
+        'scenario_split_when_pace_in': ['H','M'],
+        'scenario_split_rear_min_points': 2,
+        'scenario_split_front_min_points': 1,
+
+
+        # ===== exception wide (insurance) ruleization (Hanshin2R learning) =====
+        # (legacy) exception wide (insurance). 下限ゲート廃止時は原則不要（min_all<=0 なら実質スキップ）。
+        # Conditions (safe):
+        # - anchor p_place_est >= exception_require_anchor_p_place
+        # - candidate must be high-ranked by model p_wide (top-K)
+        'exception_require_anchor_p_place': 0.26,
+        'exception_require_p_wide_rank_max': 2,
+
+        # --- improved (optional) ---
+        # ペースに応じた「脚質(=zone_4c)」の加点。
+        # 例: H(ハイ)なら差し寄り(REAR/MIDDLE)を少し上げて、
+        #     4点の中に差し筋を混ぜやすくする。
+        # ※デフォルトは軽い加点（入れ過ぎると人気サイドが抜ける）
+        'pace_zone_bonus': {
+            'H': {'REAR': 0.03, 'MIDDLE': 0.06, 'FRONT': -0.02},
+            'M': {'REAR': 0.02, 'MIDDLE': 0.03, 'FRONT': 0.00},
+            'S': {'REAR': -0.01, 'MIDDLE': 0.02, 'FRONT': 0.05},
+        },
+        'win_support_bonus': 0.03,
+        'tight_race_win_support_bonus': 0.07,
+        'high_pace_front_penalty': 0.04,
+        'high_pace_front_fast_penalty': 0.03,
+        'high_pace_middle_bonus': 0.04,
+        'high_pace_rear_bonus': 0.02,
+        'win_candidate_support_bonus': 0.06,
+        'condition_support_bonus': 0.04,
+        'gate_support_bonus': 0.03,
+        'win_group_support_bonus': 0.03,
+        'tight_race_win_group_support_bonus': 0.05,
+        'insurance_support_bonus': 0.05,
+        'tight_race_insurance_support_bonus': 0.07,
+        'insurance_signal_support_bonus': 0.03,
+        'temperament_wide_penalty': 0.02,
+
+        # stake allocation mode for wide
+        # - 'equal'           : 従来通り均等配分
+        # - 'low_market_heavy'  : 低市場側を厚め（的中率寄り）
+        # - 'score_heavy'     : pick_score の高い順に厚め
+        'stake_mode': 'equal',
+
+        # ===== R28: ワイド対抗スコア ペース別重み行列 =====
+        # pace M vs S で別列の重みを使用。
+        # 各キーは 'FRONT'/'MIDDLE'/'REAR' → pick_score_base への加算値
+        'wide_scoring_matrix': {
+            'M': {'FRONT': 0.00, 'MIDDLE': 0.04, 'REAR': 0.03},
+            'S': {'FRONT': 0.06, 'MIDDLE': 0.03, 'REAR': -0.01},
+            # H は既存の pace_zone_bonus を使用（下位互換）
+        },
+        'wide_scoring_matrix_enabled': True,
+
+        # ===== R28: 走法別上り評価 (差し馬補正) =====
+        # RunningStyleLabel=REAR かつ pred_last3f 上位 N 位の馬にボーナス。
+        'rear_finish_bonus_enabled': True,
+        'rear_finish_top_n': 3,          # pred_last3f 上位 N 位以内の差し馬に適用
+        'rear_finish_bonus_amount': 0.04, # pick_score_base への加算
+        'middle_finish_top_n': 3,        # MIDDLE + last3f 上位にも軽い補正
+        'middle_finish_bonus_amount': 0.02,
+        # RunningStyleConf=HIGH の差し馬に追加ボーナス
+        'rear_finish_high_conf_extra': 0.02,
+
+        # ===== R22: 先行注意 → スロー展開タイルトブースト =====
+        # meta.bias 等のトラックコメントに「先行注意」が含まれる場合、
+        # scenario_pace_tilt に加算するブースト量（デフォルト +0.15）。
+        # 0.0 で無効化。実効値は min(tilt + boost, 0.40) でクランプ。
+        'senkyo_chui_tilt_boost': 0.15,
+
+        # ===== R20: ポジションアドバンテージ馬番リスト =====
+        # 枠や内外ポジションで有利になる馬番を指定すると、
+        # _bam_fp_ai_rear_include が自動でワイド相手候補に加える。
+        # 指定形式: リスト [12, 16, 17] または カンマ区切り文字列 '12,16,17'
+        # 空リスト [] または None で機能無効（デフォルト）。
+        'pos_advantage_nums': [],
+
+        # 例外ワイド（任意のサイドベット）
+        # 本線ペアが 3.0未満(例: 2.x)で弾かれるケースの救済。
+        # 絶対厳守の4点とは別財布として「追加1点」を出せる。
+        # デフォルトは無効（完全に従来互換）。
+        'exception_enabled': True,
+        'exception_min_market': 1.8,
+        'exception_stake_yen': 500,
+
+        # ===== 三連複フォーメーション（買い目/30点以内・写真パターン準拠） =====
+        # 形式：
+        #   1頭目 = ◎
+        #   2頭目 = 連軸（= ワイド推奨の相手：1〜4点）
+        #   3頭目 = ワイド推奨相手 + 追加推奨馬（30点以内になるまで）
+        # 点数計算（写真パターンの仕様）:
+        #   点数 = k*(n-1) - C(k,2)
+        #     k = 2頭目の頭数（=ワイド点数）
+        #     n = 3頭目の頭数（2頭目の馬を含む）
+        'trio_formation_enabled': True,
+        'trio_formation_max_points': 30,
+        'trio_formation_extra_max': 18,
+        # trio extras filter (Option 1.2: exclude high-trap horses from extra list only)
+        'trio_formation_trap_filter_enabled': True,
+        'trio_formation_trap_score_ge_exclude': 45.0,
+
+        # ===== R40: ワイド相手スタイル互換性ボーナス =====
+        # zone_4c(脚質)の組み合わせでワイド相手を評価する追加ボーナス
+        'style_compat_bonus_enabled': True,
+        'style_compat_bonus_high': 0.05,           # FRONT×REARの高相性ボーナス
+        'style_compat_bonus_mid': 0.025,            # FRONT×MIDDLE、MIDDLE×REAR
+        'style_compat_penalty_same': -0.01,         # 同ゾーンまたがりペナルティ
+        'style_compat_penalty_front_front': -0.04,  # FRONT×FRONTの先行過密ペナルティ
+
+    },
+
+    # --- anchor score weights (mul/add の両方で利用可) --- (mul/add の両方で利用可) ---
+    # 目的: ◎決定に「単勝/複勝の市場シグナル」も強く効かせる
+    # ※Consistは固定比率、残りはraw比率で正規化。
+    # 安定性寄り: Consist の固定比率を少し上げる（弱点を拾いやすい）
+    'anchor_fixed_consist': 0.30,
+    'anchor_raw': {
+        'Ability': 0.28,
+        'PosFit': 0.18,
+        'MapFit': 0.05,
+        'FactorFit': None,          # filled from factor_w (wet_mode)
+        'MichiakuFit': None,        # filled from michiaku_w (wet_mode)
+        # 安定性寄り: 単勝市場より複勝市場をやや重めに
+        'MarketWinFit': 0.00,  # market disabled
+        'MarketPlaceFit': 0.00,  # market disabled
+    },
+
+    # --- place model uses which score ---
+    'place_model_score_col': 'PlaceAxisScore',
+    'win_model_score_col': 'WinCandidateScore',
+    'tight_race_time_gap_sec': 0.50,
+    'tight_race_win_gap_pts': 2.5,
+    'tight_race_place_gap_pts': 3.5,
+    'force_win_group_safety_wide': True,
+
+    # --- PL strength uses which score ---
+    'pl_strength_score_col': 'PlaceAxisScore',
+
+    # =========================
+    # legacy fields below
+    # =========================
+
+    # blend ratios
+    # - 'model': 従来のEV/確率ベース3点選定
+    # - 'rules': 「競馬ワイド馬券購入_絶対厳守ルール_保存版」準拠（3点固定・帯域選抜・満たせなければ見送り）
+    
+    # blend ratios
+    'w_place_model': 0.55,          # p_place = blend(model, market)  ※市場寄りにして軸崩れを減らす
+    'w_place_model_when_pace_conf_low': 0.45,  # pace OCRが怪しい時は市場をさらに重視
+    'w_wide_model': 0.70,           # p_wide_final = blend(model, market)
+    'w_pl_strength_model': 0.70,    # PL strength: model vs market
+    'gamma_pl_mkt': 0.60,           # market emphasis in PL strength
+
+    # wide selection
+    'min_ev_wide': 0.03,            # balanced: slightly lower than strict EV
+
+    # SAS raw weights (Consist fixed=0.30; the rest will be normalized)
+    'sas_raw': {
+        'Ability': 0.34,
+        'PosFit': 0.22,
+        'MapFit': 0.06,
+        'FactorFit': None,          # filled from factor_w (wet_mode)
+        'MichiakuFit': None,        # filled from michiaku_w (wet_mode)
+        'MarketWinFit': 0.00,  # market disabled
+        'MarketPlaceFit': 0.00,  # market disabled
+    },
+
+    # correlation coef by (anchor_zone, opp_zone)
+    'corr_zone': {
+        'FRONT':  {'FRONT': 0.96, 'MIDDLE': 1.02, 'REAR': 1.01},
+        'MIDDLE': {'FRONT': 1.02, 'MIDDLE': 1.00, 'REAR': 0.99},
+        'REAR':   {'FRONT': 1.01, 'MIDDLE': 0.99, 'REAR': 0.97},
+    },
+}
+
+
+def _deep_merge_dict(base: dict, override: dict) -> dict:
+    """辞書を再帰マージ（override優先）。
+
+    NOTE: 既存実装は1階層のみマージだったため、wide_rules.pick_weights 等を部分上書きすると
+    他キーが消える事故が起きやすい。v1.14最適化として再帰マージに統一。
+    """
+    out = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_dict(out.get(k, {}), v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_params(params_json: str | None) -> dict:
+    """Load params from json file path and merge with DEFAULT_PARAMS.
+
+    - 再帰マージ（ネストdictも安全に上書き）
+    - 読み込み失敗は stderr に理由を出してデフォルト継続
+    """
+    p = _deep_merge_dict({}, DEFAULT_PARAMS)
+    if not params_json:
+        return p
+    try:
+        with open(params_json, 'r', encoding='utf-8') as f:
+            u = json.load(f)
+        if isinstance(u, dict):
+            p = _deep_merge_dict(p, u)
+    except Exception as e:
+        try:
+            import sys
+            print(f"[WARN] params_json load failed: {params_json} ({e})", file=sys.stderr)
+        except Exception:
+            pass
+    return p
+
+
+def _apply_auto_thresholds_from_bundles(params: dict, place_model_bundle: Optional[PlaceModelBundle], pair_model_bundle: Optional[PairModelBundle]) -> dict:
+    """Resolve 'auto' placeholders in params using trained model bundle metadata.
+
+    - place_rules.min_p_place_est: probability threshold in 0..1
+    - wide_rules.min_p_wide_model_pct: percent threshold (0..100)
+
+    If bundle is missing, fallback to safe defaults (Place: 0.26, Wide: 8.0%).
+
+    Note:
+      validate_params() should be called AFTER this to enforce safety gates.
+    """
+    params = params or {}
+    topt = params.get('threshold_opt', {}) or {}
+    strategy = str(topt.get('strategy', 'conservative_max') or 'conservative_max')
+
+    # Place
+    try:
+        pr = params.get('place_rules', {}) or {}
+        if isinstance(pr.get('min_p_place_est', None), str) and str(pr.get('min_p_place_est')).strip().lower() == 'auto':
+            if place_model_bundle is not None and isinstance(getattr(place_model_bundle, 'meta', None), dict):
+                best = place_model_bundle.meta.get('thresholds', {}) or {}
+                t_sel = choose_threshold_from_metrics(best, strategy=strategy)
+                pr['min_p_place_est'] = float(t_sel)
+                pr['_auto_threshold'] = {'metric_best': best, 'strategy': strategy, 'selected': float(t_sel)}
+            else:
+                pr['min_p_place_est'] = 0.26
+                pr['_auto_threshold'] = {'metric_best': {}, 'strategy': 'fallback', 'selected': 0.26}
+        params['place_rules'] = pr
+    except Exception:
+        pass
+
+    # Wide (Pair)
+    try:
+        wr = params.get('wide_rules', {}) or {}
+        if isinstance(wr.get('min_p_wide_model_pct', None), str) and str(wr.get('min_p_wide_model_pct')).strip().lower() == 'auto':
+            if pair_model_bundle is not None and isinstance(getattr(pair_model_bundle, 'meta', None), dict):
+                best = pair_model_bundle.meta.get('thresholds', {}) or {}
+                t_sel = choose_threshold_from_metrics(best, strategy=strategy)
+                wr['min_p_wide_model_pct'] = float(t_sel) * 100.0
+                wr['_auto_threshold'] = {
+                    'metric_best': best,
+                    'strategy': strategy,
+                    'selected_prob': float(t_sel),
+                    'selected_pct': float(t_sel) * 100.0,
+                }
+            else:
+                wr['min_p_wide_model_pct'] = 8.0
+                wr['_auto_threshold'] = {'metric_best': {}, 'strategy': 'fallback', 'selected_pct': 8.0}
+        params['wide_rules'] = wr
+    except Exception:
+        pass
+
+    return params
+
+
+def _vp_place_rules(pr: dict) -> dict:
+    """place_rules サブ辞書を検証・正規化して返す。"""
+    pr['stake_place'] = int(pr.get('stake_place', 1000) or 1000)
+    _mp = pr.get('min_p_place_est', 0.26)
+    if isinstance(_mp, str) and _mp.strip().lower() == 'auto':
+        pr['min_p_place_est'] = 'auto'
+    else:
+        pr['min_p_place_est'] = float(_mp or 0.26)
+    try:
+        pr['min_p_place_low'] = float(pr.get('min_p_place_low', 0.0) or 0.0)
+        pr['min_p_place_low'] = 0.0 if pr['min_p_place_low'] < 0.0 else (
+            1.0 if pr['min_p_place_low'] > 1.0 else pr['min_p_place_low'])
+    except Exception:
+        pr['min_p_place_low'] = 0.0
+    pr['min_place_market_min'] = float(pr.get('min_place_market_min', 0.0) or 0.0)
+    # PLACE_ODDS_GATE_OFF_V1: 市場由来ゲート無効化
+    pr['min_place_market_min'] = 0.0
+    pr['max_place_market_min'] = 0.0
+    pr['max_place_market_min'] = float(pr.get('max_place_market_min', 0.0) or 0.0)
+    pr['ev_gate_enabled'] = bool(pr.get('ev_gate_enabled', False))
+    pr['min_ev'] = float(pr.get('min_ev', 0.0) or 0.0)
+    pr['beta_q_low'] = float(pr.get('beta_q_low', 0.05) or 0.05)
+    pr['beta_a0'] = float(pr.get('beta_a0', 1.0) or 1.0)
+    pr['beta_b0'] = float(pr.get('beta_b0', 1.0) or 1.0)
+    pr['place_beta_n'] = int(pr.get('place_beta_n', 100) or 100)
+    pr['require_p_low_positive'] = bool(pr.get('require_p_low_positive', False))
+    return pr
+
+
+def _vp_wide_rules_basic(wr: dict) -> dict:
+    """wide_rules の基本設定（n_points / stake / weights / zone_dup / pace_bonus / exception）を検証して返す。"""
+    wr['n_points'] = int(wr.get('n_points', 4) or 4)
+    wr['n_points'] = 4 if wr['n_points'] <= 0 else wr['n_points']
+    wr['min_all'] = float(wr.get('min_all', 0.0) or 0.0)
+    wr['stake_total_yen'] = int(wr.get('stake_total_yen', 5000) or 5000)
+    wr['stake_unit_yen'] = int(wr.get('stake_unit_yen', 100) or 100)
+    # stake_list length check
+    sl = wr.get('stake_list', None)
+    if sl is not None:
+        try:
+            sl = [int(x) for x in sl]
+        except Exception:
+            sl = None
+    if sl is not None and len(sl) != wr['n_points']:
+        sl = None
+    wr['stake_list'] = sl
+    pw = wr.get('pick_weights', {}) or {}
+    pw = _deep_merge_dict({'p_wide': 0.55, 'opp_strength': 0.25, 'market_safety': 0.20}, pw)
+    wr['pick_weights'] = pw
+    # ===== 絶対厳守ルール =====
+    wr['n_points'] = 4
+    wr['ensure_trio_plus_candidate_in_wide'] = True
+    try:
+        wr['min_all'] = float(wr.get('min_all', 0.0) or 0.0)
+    except Exception:
+        wr['min_all'] = 0.0
+    if wr['min_all'] < 0.0:
+        wr['min_all'] = 0.0
+    try:
+        wr['max_all'] = float(wr.get('max_all', 0.0) or 0.0)
+    except Exception:
+        wr['max_all'] = 0.0
+    if float(wr['max_all']) < 0.0:
+        wr['max_all'] = 0.0
+    _mw = wr.get('min_p_wide_model_pct', 8.0)
+    if isinstance(_mw, str) and _mw.strip().lower() == 'auto':
+        wr['min_p_wide_model_pct'] = 'auto'
+    else:
+        try:
+            wr['min_p_wide_model_pct'] = float(_mw or 8.0)
+        except Exception:
+            wr['min_p_wide_model_pct'] = 8.0
+        if float(wr['min_p_wide_model_pct']) < 8.0:
+            wr['min_p_wide_model_pct'] = 8.0
+    wr['pick_weights'] = {'p_wide': 0.50, 'opp_strength': 0.20, 'market_safety': 0.00}
+    try:
+        wr['zone_dup_penalty'] = float(wr.get('zone_dup_penalty', 0.01) or 0.01)
+    except Exception:
+        wr['zone_dup_penalty'] = 0.01
+    if float(wr['zone_dup_penalty']) > 0.01:
+        wr['zone_dup_penalty'] = 0.01
+    if float(wr['zone_dup_penalty']) < 0.0:
+        wr['zone_dup_penalty'] = 0.0
+    sm = str(wr.get('stake_mode', 'low_market_heavy') or 'low_market_heavy').lower().strip()
+    if sm not in ['equal', 'low_market_heavy', 'score_heavy']:
+        sm = 'low_market_heavy'
+    wr['stake_mode'] = sm
+    pb = wr.get('pace_zone_bonus', None)
+    if not isinstance(pb, dict):
+        pb = DEFAULT_PARAMS.get('wide_rules', {}).get('pace_zone_bonus', {})
+    wr['pace_zone_bonus'] = pb
+    wr['exception_enabled'] = bool(wr.get('exception_enabled', False))
+    try:
+        wr['exception_min_market'] = float(wr.get('exception_min_market', 2.4) or 2.4)
+    except Exception:
+        wr['exception_min_market'] = 2.4
+    if wr['exception_min_market'] <= 0:
+        wr['exception_min_market'] = 2.4
+    try:
+        wr['exception_stake_yen'] = int(wr.get('exception_stake_yen', 500) or 500)
+    except Exception:
+        wr['exception_stake_yen'] = 500
+    if wr['exception_stake_yen'] < 0:
+        wr['exception_stake_yen'] = 0
+    try:
+        wr['min_points'] = int(wr.get('min_points', 2) or 2)
+    except Exception:
+        wr['min_points'] = 2
+    if wr['min_points'] <= 0:
+        wr['min_points'] = 2
+    try:
+        wr['core_top_n'] = int(wr.get('core_top_n', 6) or 6)
+    except Exception:
+        wr['core_top_n'] = 6
+    if wr['core_top_n'] <= 0:
+        wr['core_top_n'] = 6
+    try:
+        wr['core_bonus'] = float(wr.get('core_bonus', 0.04) or 0.04)
+    except Exception:
+        wr['core_bonus'] = 0.04
+    wr['ev_gate_enabled'] = bool(wr.get('ev_gate_enabled', False))
+    try:
+        wr['scenario_pace_tilt'] = float(wr.get('scenario_pace_tilt', 0.08) or 0.08)
+    except Exception:
+        wr['scenario_pace_tilt'] = 0.08
+    if wr['scenario_pace_tilt'] < 0.0:
+        wr['scenario_pace_tilt'] = 0.0
+    if wr['scenario_pace_tilt'] > 0.15:
+        wr['scenario_pace_tilt'] = 0.15
+    try:
+        wr['skip_wide_if_anchor_p_place_lt'] = float(wr.get('skip_wide_if_anchor_p_place_lt', 0.0) or 0.0)
+    except Exception:
+        wr['skip_wide_if_anchor_p_place_lt'] = 0.0
+    if wr['skip_wide_if_anchor_p_place_lt'] < 0.0:
+        wr['skip_wide_if_anchor_p_place_lt'] = 0.0
+    if wr['skip_wide_if_anchor_p_place_lt'] > 0.40:
+        wr['skip_wide_if_anchor_p_place_lt'] = 0.40
+    return wr
+
+
+def _vpwrs_validate_scenario(wr: dict) -> dict:
+    """wide_rules のシナリオ分割 / 2-layer 設定を検証して返す。(R21: _vp_wide_rules_scenario から分離)"""
+    wr['scenario_split_enabled'] = bool(wr.get('scenario_split_enabled', True))
+    try:
+        _when = wr.get('scenario_split_when_pace_in', ['H', 'M'])
+        if isinstance(_when, str):
+            _when = [_when]
+        _when2 = []
+        for x in (_when or []):
+            t = str(x or '').upper().strip()[:1]
+            if t in ['H', 'M', 'S'] and t not in _when2:
+                _when2.append(t)
+        wr['scenario_split_when_pace_in'] = _when2 if _when2 else ['H', 'M']
+    except Exception:
+        wr['scenario_split_when_pace_in'] = ['H', 'M']
+    for key, default in [('scenario_split_rear_min_points', 2), ('scenario_split_front_min_points', 1)]:
+        try:
+            wr[key] = max(0, min(4, int(wr.get(key, default) or default)))
+        except Exception:
+            wr[key] = default
+    try:
+        _np = int(wr.get('n_points', 4) or 4)
+    except Exception:
+        _np = 4
+    if wr['scenario_split_rear_min_points'] + wr['scenario_split_front_min_points'] > _np:
+        wr['scenario_split_front_min_points'] = max(0, _np - wr['scenario_split_rear_min_points'])
+    try:
+        wr['exception_require_anchor_p_place'] = float(wr.get('exception_require_anchor_p_place', 0.26) or 0.26)
+    except Exception:
+        wr['exception_require_anchor_p_place'] = 0.26
+    try:
+        wr['exception_require_p_wide_rank_max'] = max(1, min(4, int(wr.get('exception_require_p_wide_rank_max', 2) or 2)))
+    except Exception:
+        wr['exception_require_p_wide_rank_max'] = 2
+    # 2-layer upgrade
+    try:
+        wr['base_market_n'] = max(0, min(3, int(wr.get('base_market_n', 2) or 0)))
+    except Exception:
+        wr['base_market_n'] = 2
+    wr['base_market_n'] = 0  # BASE_MARKET_N_OFF_V1
+    wr['front_longshot_enabled'] = bool(wr.get('front_longshot_enabled', True))
+    try:
+        wr['front_longshot_min_front_runners'] = max(1, int(wr.get('front_longshot_min_front_runners', 2) or 2))
+    except Exception:
+        wr['front_longshot_min_front_runners'] = 2
+    for fkey, fdef in [('front_longshot_min_market', 6.0), ('front_longshot_max_market', 20.0)]:
+        try:
+            v = float(wr.get(fkey, fdef) or fdef)
+            wr[fkey] = v if v > 0 else fdef
+        except Exception:
+            wr[fkey] = fdef
+    if wr['front_longshot_max_market'] < wr['front_longshot_min_market']:
+        wr['front_longshot_max_market'] = wr['front_longshot_min_market']
+    try:
+        wr['front_longshot_stake_yen'] = max(0, int(wr.get('front_longshot_stake_yen', 200) or 200))
+    except Exception:
+        wr['front_longshot_stake_yen'] = 200
+    return wr
+
+
+def _vpwrs_validate_trio(wr: dict) -> dict:
+    """wide_rules の trio_formation 設定を検証して返す。(R21: _vp_wide_rules_scenario から分離)"""
+    wr['trio_formation_enabled'] = True  # BUG FIX R16: was over-indented in original
+    # TRIO_STAKE_RULE_V1
+    wr['trio_formation_stake_mode'] = 'equal'
+    wr['trio_formation_stake_yen_per_ticket'] = 100
+    try:
+        wr['trio_formation_max_points'] = int(wr.get('trio_formation_max_points', 30) or 30)
+    except Exception:
+        wr['trio_formation_max_points'] = 30
+    try:
+        bud = int(wr.get('trio_formation_budget_yen', 3000) or 3000)
+    except Exception:
+        bud = 3000
+    if bud is None:
+        bud = 3000
+    if int(bud) > 0:
+        max_by_budget = int(max(1, int(bud) // 100))
+        try:
+            wr['trio_formation_max_points'] = int(min(
+                int(wr.get('trio_formation_max_points', 30) or 30), max_by_budget))
+        except Exception:
+            wr['trio_formation_max_points'] = int(min(30, max_by_budget))
+    wr['trio_formation_max_points'] = max(1, min(30, wr['trio_formation_max_points']))
+    try:
+        wr['trio_formation_extra_max'] = max(0, min(18, int(wr.get('trio_formation_extra_max', 18) or 18)))
+    except Exception:
+        wr['trio_formation_extra_max'] = 18
+    return wr
+
+
+def _vp_wide_rules_scenario(wr: dict) -> dict:
+    """wide_rules のシナリオ分割 / 2-layer / trio_formation 設定を検証して返す。(R21: サブ関数委譲)"""
+    wr = _vpwrs_validate_scenario(wr)
+    wr = _vpwrs_validate_trio(wr)
+    return wr
+
+
+def _vp_trio_est(te: dict) -> dict:
+    """trio_est サブ辞書を検証・正規化して返す。"""
+    te['enabled'] = bool(te.get('enabled', True))
+    te['top_mass'] = float(te.get('top_mass', 0.22) or 0.22)
+    te['n_samples'] = int(te.get('n_samples', 25000) or 25000)
+    te['n_runs'] = int(te.get('n_runs', 4) or 4)
+    te['seed'] = int(te.get('seed', 0) or 0)
+    te['mode'] = str(te.get('mode', 'global_then_filter_anchor') or 'global_then_filter_anchor')
+    te['z_ci'] = float(te.get('z_ci', 1.281551565545) or 1.281551565545)
+    return te
+
+
+def validate_params(params: dict) -> dict:
+    """paramsの最低限の整合性を担保し、危険な設定は安全側に丸める。
+
+    NOTE:
+    - 本スクリプトは "rules-only" の安全運用を最優先するため、
+      wide_rules の点数（n_points=4）は固定。市場の下限/上限（min_all/max_all）は任意（0以下で無効）。
+    - ただし、"改善版" として
+        * ペース連動の zone ボーナス（スコア加点のみ）
+        * ステーク配分モード
+        * 例外ワイド（4点とは別財布）
+      のような **ゲートを緩めない追加機能** は params 側で有効化できる。
+    """
+    params = params or {}
+    # modes
+    for k in ['wide_mode', 'place_mode']:
+        v = str(params.get(k, 'rules')).lower().strip()
+        params[k] = v if v in ['model', 'rules'] else 'rules'
+    # FORCE_MARKET_FEATURES_OFF_V2
+    params['market_features_enabled'] = False
+    params['anchor_market_guard_enabled'] = False
+    # place_rules
+    pr = params.get('place_rules', {}) or {}
+    params['place_rules'] = _vp_place_rules(pr)
+    # wide_rules
+    wr = params.get('wide_rules', {}) or {}
+    wr = _vp_wide_rules_basic(wr)
+    wr = _vp_wide_rules_scenario(wr)
+    params['wide_rules'] = wr
+    # trio_est
+    te = params.get('trio_est', {}) or {}
+    params['trio_est'] = _vp_trio_est(te)
+    return params
+def require_ocr_deps() -> None:
+    """OCR 依存（PIL / cv2 / pytesseract）が無い環境で呼ばれたとき明示的に落とす。
+
+    CSV 運用のみの場合は不要（= import 失敗でも動く）。
+    """
+    if Image is None or cv2 is None or pytesseract is None:
+        raise ImportError(
+            "OCR dependencies are missing. Install: pillow, opencv-python, pytesseract. "
+            "If you run CSV-only, do not pass any *_img arguments."
+        )
+
+
+# =========================
+# RUN cache helpers (v10.6)
+# =========================
+
+def _run_cache_key_from_inputs(args, params: dict) -> str:
+    """入力ファイルパスと params のハッシュから実行キャッシュ用のキー文字列を生成する。"""
+    import hashlib
+    import json
+
+    def _h_file(p: str) -> str:
+        """ファイルのSHA-1ハッシュ(16進数)を返す。例外発生時はパス文字列を返す。"""
+        try:
+            return _sha1_of_file(str(p))
+        except Exception:
+            return str(p)
+
+    parts = []
+
+    # core images
+    for k in ['meta_img', 'ai_time_img', 'rating_img', 'speed_index_img', 'factor_img']:
+        v = getattr(args, k, None)
+        if v:
+            parts.append(f"{k}={_h_file(v)}")
+
+    # pred times images
+    for i, v in enumerate(list(getattr(args, 'pred_times_imgs', None) or [])):
+        if v:
+            parts.append(f"pred_times_imgs[{i}]={_h_file(v)}")
+
+    # pair model (explicit)
+    v = getattr(args, 'pair_model_in', None)
+    if v:
+        parts.append(f"pair_model_in={_h_file(v)}")
+
+    # params_json (explicit) + expanded params dict
+    v = getattr(args, 'params_json', None)
+    if v:
+        parts.append(f"params_json={_h_file(v)}")
+    try:
+        parts.append('params=' + json.dumps(params, ensure_ascii=False, sort_keys=True))
+    except Exception:
+        pass
+
+    raw = ('\\n'.join(parts)).encode('utf-8', errors='ignore')
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _run_cache_paths(cache_dir: str, key: str) -> Dict[str, str]:
+    """cache_dir / key をベースに実行キャッシュのファイルパス辞書を返す。"""
+    from pathlib import Path
+    d = Path(cache_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    return {
+        'md': str(d / f"{key}.md"),
+        'meta': str(d / f"{key}.json"),
+    }
+
+
+def try_load_run_cache(cache_dir: Optional[str], key: str) -> Optional[str]:
+    """実行キャッシュを読み込み、存在すれば Markdown テキストを返す。なければ None。"""
+    if not cache_dir:
+        return None
+    try:
+        from pathlib import Path
+        p = _run_cache_paths(cache_dir, key)['md']
+        pp = Path(p)
+        if pp.exists() and pp.stat().st_size > 0:
+            return pp.read_text(encoding='utf-8')
+    except Exception:
+        return None
+    return None
+
+
+def save_run_cache(cache_dir: Optional[str], key: str, md_text: str, meta: Optional[Dict] = None) -> None:
+    """実行結果 Markdown テキストをキャッシュに保存する。"""
+    if not cache_dir:
+        return
+    try:
+        from pathlib import Path
+        paths = _run_cache_paths(cache_dir, key)
+        Path(paths['md']).write_text(md_text or '', encoding='utf-8')
+        if meta is not None:
+            import json
+            Path(paths['meta']).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+
+
+# =========================
+# R39: レース結果保存機能 (Race Result Storage)
+# =========================
+
+def _r39_race_id_from_meta(meta: Optional[Dict]) -> str:
+    """meta 辞書からレースIDを生成する。race, date, venue の組み合わせを使う。"""
+    if meta is None:
+        meta = {}
+    try:
+        race  = str(meta.get('race', '') or '').strip()
+        date  = str(meta.get('date', '') or '').strip()
+        venue = str(meta.get('venue', '') or '').strip()
+        if race and date:
+            return f"{date.replace('/', '').replace('-', '')}_{venue}_{race}".strip('_')
+        if race:
+            import datetime as _dt
+            today = _dt.date.today().strftime('%Y%m%d')
+            return f"{today}_{venue}_{race}".strip('_')
+    except Exception:
+        pass
+    import datetime as _dt
+    import hashlib
+    ts = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    h  = hashlib.md5(str(meta).encode('utf-8', errors='ignore')).hexdigest()[:6]
+    return f"race_{ts}_{h}"
+
+
+def _r39_extract_wide_nums(scored_df: pd.DataFrame, anchor_num: str, params: Optional[dict]) -> list:
+    """fixed_template で選ばれる A（ワイド4点）の馬番リストを生成する。
+
+    SAS降順でアンカー以外を並べ、上位4頭を返す（fixed_templateと同じロジック）。
+    """
+    if params is None:
+        params = {}
+    try:
+        d0 = scored_df.copy()
+        d0['num'] = d0['num'].astype(str)
+        dI = d0[d0['num'] != str(anchor_num)].copy()
+        dI['SAS'] = _num_series(dI.get('SAS', 50.0), 50.0, index=dI.index)
+        dI = dI.sort_values(['SAS', 'num'], ascending=[False, True])
+        return dI['num'].astype(str).head(4).tolist()
+    except Exception:
+        return []
+
+
+def _r39_extract_trio_form(scored_df: pd.DataFrame, anchor_num: str, params: Optional[dict]) -> dict:
+    """build_trio_formation_from_wide をラップし、三連複フォーメーション情報を返す。"""
+    if params is None:
+        params = {}
+    try:
+        wide_nums = _r39_extract_wide_nums(scored_df, anchor_num, params)
+        form = build_trio_formation_from_wide(
+            anchor_num=str(anchor_num),
+            wide_opp_nums=wide_nums,
+            df=scored_df,
+            params=params,
+        )
+        return {
+            'a': str(form.get('a', '') or ''),
+            'b': [str(x) for x in (form.get('b', []) or [])],
+            'c': [str(x) for x in (form.get('c', []) or [])],
+            'points': int(form.get('points', 0) or 0),
+        }
+    except Exception:
+        return {'a': str(anchor_num), 'b': [], 'c': [], 'points': 0}
+
+
+def _r39_scored_df_to_records(scored_df: pd.DataFrame) -> list:
+    """scored_df の各行を JSON シリアライズ可能な dict のリストに変換する。"""
+    score_cols = [
+        'num', 'name',
+        'AnchorScore', 'SAS', 'Ability', 'PosFit', 'MapFit',
+        'TimeFit', 'Consist', 'GateRecoveryBonus',
+        'CommentFit', 'TrainingScore',
+        'p_place_est', 'p_place_est_pct',
+        'PaceFit', 'WinCandidateScore', 'PlaceAxisScore', 'CourseProfileFit',
+    ]
+    records = []
+    try:
+        for _, row in scored_df.iterrows():
+            rec = {}
+            for col in score_cols:
+                if col in scored_df.columns:
+                    v = row[col]
+                    try:
+                        if isinstance(v, float) and not np.isfinite(v):
+                            rec[col] = None
+                        else:
+                            rec[col] = float(v) if isinstance(v, (float, int, np.floating, np.integer)) else str(v)
+                    except Exception:
+                        rec[col] = str(v) if v is not None else None
+            records.append(rec)
+    except Exception:
+        pass
+    return records
+
+
+def save_race_result(
+    result_dir: str,
+    meta: Dict[str, str],
+    anchor: dict,
+    scored_df: pd.DataFrame,
+    params: Optional[dict] = None,
+    race_id: Optional[str] = None,
+    wide_nums: Optional[list] = None,
+    trio_form: Optional[dict] = None,
+    place_ok: bool = False,
+    confidence_level: Optional[str] = None,    # R41: 信頼度レベル（HIGH/MEDIUM/LOW）
+    confidence_score_gap: Optional[float] = None,  # R41: AnchorScoreギャップ
+) -> str:
+    """レース予想結果を JSON ファイルとして result_dir に保存する。
+
+    保存形式:
+        {result_dir}/{race_id}.json
+
+    Returns:
+        保存したファイルパス。失敗した場合は空文字列。
+
+    JSON スキーマ:
+        - race_id (str)
+        - created_at (ISO8601 str)
+        - meta (dict): レース情報 (race, date, venue, pace など)
+        - prediction (dict):
+            - anchor_num (str)
+            - anchor_name (str)
+            - anchor_score (float)
+            - p_place_est (float)
+            - p_place_est_pct (float)
+            - place_ok (bool)
+            - wide_nums (list[str])
+            - trio_form (dict): {a, b, c, points}
+        - scores (list[dict]): 各馬のスコア行
+        - actual (dict): 実際の結果（後から記録、初期は null）
+            - rank_1st (str|null)
+            - rank_2nd (str|null)
+            - rank_3rd (str|null)
+            - anchor_rank (int|null)
+            - place_hit (bool|null)
+            - wide_hits (list[str]|null)
+            - trio_hit (bool|null)
+    """
+    import json
+    import datetime as _dt
+    from pathlib import Path
+
+    if params is None:
+        params = {}
+    if race_id is None or str(race_id).strip() == '':
+        race_id = _r39_race_id_from_meta(meta)
+
+    # アンカー情報
+    anchor_num  = str(anchor.get('num', '') or '')
+    anchor_name = str(anchor.get('name', '') or '')
+    try:
+        anchor_score = float(anchor.get('AnchorScore', float('nan')))
+        if not np.isfinite(anchor_score):
+            anchor_score = None
+    except Exception:
+        anchor_score = None
+    try:
+        p_place_est = float(anchor.get('p_place_est', float('nan')))
+        if not np.isfinite(p_place_est):
+            p_place_est = None
+    except Exception:
+        p_place_est = None
+    try:
+        p_place_est_pct = float(anchor.get('p_place_est_pct', float('nan')))
+        if not np.isfinite(p_place_est_pct):
+            p_place_est_pct = None
+    except Exception:
+        p_place_est_pct = None
+
+    # ワイド・三連複（引数優先、なければ自動生成）
+    if wide_nums is None:
+        wide_nums = _r39_extract_wide_nums(scored_df, anchor_num, params)
+    if trio_form is None:
+        trio_form = _r39_extract_trio_form(scored_df, anchor_num, params)
+
+    # meta の JSON シリアライズ
+    try:
+        meta_clean = {k: str(v) if v is not None else None for k, v in (meta or {}).items()}
+    except Exception:
+        meta_clean = {}
+
+    # 全体辞書
+    result_obj = {
+        'race_id':    race_id,
+        'created_at': _dt.datetime.now().isoformat(timespec='seconds'),
+        'meta':       meta_clean,
+        'prediction': {
+            'anchor_num':       anchor_num,
+            'anchor_name':      anchor_name,
+            'anchor_score':     anchor_score,
+            'p_place_est':      p_place_est,
+            'p_place_est_pct':  p_place_est_pct,
+            'place_ok':         bool(place_ok),
+            'confidence_level':     str(confidence_level) if confidence_level else None,   # R41
+            'confidence_score_gap': float(confidence_score_gap) if confidence_score_gap is not None and np.isfinite(float(confidence_score_gap)) else None,  # R41
+            'wide_nums':        [str(x) for x in (wide_nums or [])],
+            'trio_form':        trio_form or {},
+        },
+        'scores': _r39_scored_df_to_records(scored_df),
+        'actual': {
+            'rank_1st':   None,
+            'rank_2nd':   None,
+            'rank_3rd':   None,
+            'anchor_rank': None,
+            'place_hit':  None,
+            'wide_hits':  None,
+            'trio_hit':   None,
+        },
+    }
+
+    # 保存
+    try:
+        out_dir = Path(result_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # ファイル名は race_id をサニタイズ
+        safe_id  = str(race_id).replace('/', '_').replace('\\', '_').replace(' ', '_')
+        out_path = out_dir / f"{safe_id}.json"
+        out_path.write_text(json.dumps(result_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+        return str(out_path)
+    except Exception:
+        return ''
+
+
+
+def save_full_race_result(
+    result_dir: str,
+    race_id: str,
+    rank_1st: str,
+    rank_2nd: str,
+    rank_3rd: str,
+    full_order: Optional[list] = None,
+    meta: Optional[Dict[str, str]] = None,
+    payouts: Optional[dict] = None,
+    all_results: Optional[list] = None,
+    interviews: Optional[dict] = None,
+    prediction: Optional[dict] = None,
+) -> str:
+    """画像OCR結果などから得たレース結果を完全な形でJSONに保存する。
+
+    R39追加: 予想JSONがない場合でも、実際の着順・払戻金・騎手コメントを
+    単独で保存できる汎用保存関数。後から record_race_actual で更新も可能。
+
+    Args:
+        result_dir:  保存先ディレクトリ
+        race_id:     レースID (例: '20260326_東京_R11')
+        rank_1st:    1着馬番 (str)
+        rank_2nd:    2着馬番 (str)
+        rank_3rd:    3着馬番 (str)
+        full_order:  全着順の馬番リスト (任意)
+        meta:        レース情報辞書 (date, venue, race, pace など)
+        payouts:     払戻金辞書 (tansho, fukusho, wide, sanrenpuku など)
+        all_results: 各馬の結果リスト (rank, num, name, time, last3f, weight, popularity)
+        interviews:  騎手コメント辞書 {馬番: コメント文字列}
+        prediction:  事前のSTELLA予想情報 (anchor_num, wide_nums など)
+
+    Returns:
+        保存したファイルパス。失敗した場合は空文字列。
+    """
+    import json
+    import datetime as _dt
+    from pathlib import Path
+
+    if meta is None:
+        meta = {}
+    if prediction is None:
+        prediction = {
+            'anchor_num': '', 'anchor_name': '', 'anchor_score': None,
+            'p_place_est': None, 'p_place_est_pct': None,
+            'place_ok': None, 'wide_nums': [],
+            'trio_form': {'a': '', 'b': [], 'c': [], 'points': 0},
+        }
+
+    # 的中判定
+    top3 = [str(rank_1st), str(rank_2nd), str(rank_3rd)]
+    anchor = str(prediction.get('anchor_num', '') or '')
+    wide_nums = [str(x) for x in (prediction.get('wide_nums', []) or [])]
+
+    anchor_rank = None
+    place_hit   = None
+    wide_hits   = None
+    trio_hit    = None
+
+    if anchor:
+        for i, n in enumerate(top3, 1):
+            if n == anchor:
+                anchor_rank = i
+                break
+        place_hit = (anchor_rank is not None and anchor_rank <= 3)
+        wide_hits = [x for x in top3 if x != anchor and x in wide_nums]
+        trio_form = prediction.get('trio_form', {}) or {}
+        trio_a = str(trio_form.get('a', '') or '')
+        trio_b = [str(x) for x in (trio_form.get('b', []) or [])]
+        trio_c = [str(x) for x in (trio_form.get('c', []) or [])]
+        if len(top3) >= 3 and trio_a in set(top3):
+            top3_set = set(top3)
+            for bn in trio_b:
+                for cn in trio_c:
+                    if len({trio_a, bn, cn}) == 3 and {trio_a, bn, cn} == top3_set:
+                        trio_hit = True
+
+    result_obj = {
+        'race_id':    str(race_id),
+        'created_at': _dt.datetime.now().isoformat(timespec='seconds'),
+        'meta':       {k: str(v) if v is not None else None for k, v in meta.items()},
+        'prediction': prediction,
+        'scores':     [],
+        'actual': {
+            'rank_1st':    str(rank_1st),
+            'rank_2nd':    str(rank_2nd),
+            'rank_3rd':    str(rank_3rd),
+            'full_order':  [str(x) for x in (full_order or [])],
+            'anchor_rank': anchor_rank,
+            'place_hit':   place_hit,
+            'wide_hits':   wide_hits if wide_hits is not None else [],
+            'trio_hit':    trio_hit,
+            'payouts':     payouts or {},
+            'all_results': all_results or [],
+            'interviews':  interviews or {},
+        },
+    }
+
+    try:
+        out_dir = Path(result_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_id  = str(race_id).replace('/', '_').replace('\\', '_').replace(' ', '_')
+        out_path = out_dir / f"{safe_id}.json"
+        out_path.write_text(json.dumps(result_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+        return str(out_path)
+    except Exception:
+        return ''
+
+
+def load_race_results(result_dir: str) -> pd.DataFrame:
+    """result_dir 内の全 JSON ファイルを読み込み、予想サマリー DataFrame を返す。
+
+    Returns:
+        DataFrame 列:
+            race_id, created_at, date, venue, race,
+            anchor_num, anchor_name, anchor_score, p_place_est, p_place_est_pct,
+            place_ok, wide_nums, trio_points,
+            rank_1st, rank_2nd, rank_3rd, anchor_rank,
+            place_hit, wide_hits, trio_hit
+    """
+    import json
+    from pathlib import Path
+
+    rows = []
+    try:
+        p = Path(result_dir)
+        if not p.exists():
+            return pd.DataFrame()
+        for fp in sorted(p.glob('*.json')):
+            try:
+                obj = json.loads(fp.read_text(encoding='utf-8'))
+                pred   = obj.get('prediction', {}) or {}
+                actual = obj.get('actual', {}) or {}
+                meta_m = obj.get('meta', {}) or {}
+                row = {
+                    'race_id':          str(obj.get('race_id', '') or ''),
+                    'created_at':       str(obj.get('created_at', '') or ''),
+                    'date':             str(meta_m.get('date', '') or ''),
+                    'venue':            str(meta_m.get('venue', '') or ''),
+                    'race':             str(meta_m.get('race', '') or ''),
+                    'anchor_num':       str(pred.get('anchor_num', '') or ''),
+                    'anchor_name':      str(pred.get('anchor_name', '') or ''),
+                    'anchor_score':     pred.get('anchor_score'),
+                    'p_place_est':      pred.get('p_place_est'),
+                    'p_place_est_pct':  pred.get('p_place_est_pct'),
+                    'place_ok':         bool(pred.get('place_ok', False)),
+                    'wide_nums':        ','.join([str(x) for x in (pred.get('wide_nums', []) or [])]),
+                    'trio_points':      int((pred.get('trio_form', {}) or {}).get('points', 0) or 0),
+                    'rank_1st':         actual.get('rank_1st'),
+                    'rank_2nd':         actual.get('rank_2nd'),
+                    'rank_3rd':         actual.get('rank_3rd'),
+                    'anchor_rank':      actual.get('anchor_rank'),
+                    'place_hit':        actual.get('place_hit'),
+                    'wide_hits':        actual.get('wide_hits'),
+                    'trio_hit':         actual.get('trio_hit'),
+                }
+                rows.append(row)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def record_race_actual(
+    result_dir: str,
+    race_id: str,
+    rank_1st: Optional[str] = None,
+    rank_2nd: Optional[str] = None,
+    rank_3rd: Optional[str] = None,
+) -> bool:
+    """既存の JSON ファイルに実際の着順を追記する。
+
+    race_id に対応するファイルを更新し、以下を自動計算:
+    - anchor_rank: ◎の着順
+    - place_hit: ◎が3着以内なら True
+    - wide_hits: ◎と3着以内馬のワイド的中リスト
+    - trio_hit: 三連複フォーメーションが的中したか
+
+    Returns:
+        True: 成功 / False: 失敗
+    """
+    import json
+    from pathlib import Path
+
+    try:
+        p = Path(result_dir)
+        safe_id  = str(race_id).replace('/', '_').replace('\\', '_').replace(' ', '_')
+        fp = p / f"{safe_id}.json"
+        if not fp.exists():
+            return False
+        obj    = json.loads(fp.read_text(encoding='utf-8'))
+        pred   = obj.get('prediction', {}) or {}
+        actual = obj.get('actual', {}) or {}
+
+        top3   = [str(x) for x in [rank_1st, rank_2nd, rank_3rd] if x is not None]
+        anchor = str(pred.get('anchor_num', '') or '')
+
+        # anchor_rank
+        anchor_rank = None
+        for i, n in enumerate(top3, 1):
+            if str(n) == anchor:
+                anchor_rank = i
+                break
+
+        # place_hit
+        place_hit = (anchor_rank is not None and anchor_rank <= 3)
+
+        # wide_hits
+        wide_nums = [str(x) for x in (pred.get('wide_nums', []) or [])]
+        wide_hits = [x for x in top3 if x != anchor and x in wide_nums]
+
+        # trio_hit
+        trio_form  = pred.get('trio_form', {}) or {}
+        trio_a     = str(trio_form.get('a', '') or '')
+        trio_b     = [str(x) for x in (trio_form.get('b', []) or [])]
+        trio_c     = [str(x) for x in (trio_form.get('c', []) or [])]
+        trio_hit   = False
+        if len(top3) >= 3:
+            top3_set = set(top3[:3])
+            # a が3着以内 + b, c から各1頭ずつ3着以内
+            if trio_a in top3_set:
+                trio_b_hit = [x for x in trio_b if x in top3_set and x != trio_a]
+                trio_c_hit = [x for x in trio_c if x in top3_set and x != trio_a]
+                # A-B-C フォーメーション: a固定, b1頭, c1頭（3頭で top3覆う）
+                for bn in trio_b_hit:
+                    for cn in trio_c_hit:
+                        if len({trio_a, bn, cn}) == 3 and {trio_a, bn, cn} == top3_set:
+                            trio_hit = True
+
+        actual['rank_1st']    = str(rank_1st) if rank_1st is not None else None
+        actual['rank_2nd']    = str(rank_2nd) if rank_2nd is not None else None
+        actual['rank_3rd']    = str(rank_3rd) if rank_3rd is not None else None
+        actual['anchor_rank'] = anchor_rank
+        actual['place_hit']   = place_hit
+        actual['wide_hits']   = wide_hits
+        actual['trio_hit']    = trio_hit
+
+        obj['actual'] = actual
+        fp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding='utf-8')
+        return True
+    except Exception:
+        return False
+
+
+
+# =========================
+# R40: 信頼度フィルター（Place Confidence Filter）
+# =========================
+
+def _r40_score_gap(anchor_num: str, df: "pd.DataFrame", score_col: str = 'AnchorScore') -> float:
+    """◎馬と2位馬のスコアギャップを返す。
+
+    Args:
+        anchor_num: 軸馬番号（str）
+        df: 馬別スコアDataFrame（score_col列必須）
+        score_col: 比較するスコア列名（default 'AnchorScore'）
+
+    Returns:
+        float: score_gap（1位 - 2位）。計算不能時は nan。
+    """
+    try:
+        if df is None or len(df) == 0 or score_col not in df.columns:
+            return float('nan')
+        sc = _num_series(df[score_col], float('nan'), index=df.index)
+        sorted_sc = sc.sort_values(ascending=False)
+        if len(sorted_sc) < 1:
+            return float('nan')
+        top1_val = float(sorted_sc.iloc[0])
+        if not np.isfinite(top1_val):
+            return float('nan')
+        if len(sorted_sc) < 2:
+            return float('nan')  # 1頭しかいない場合はギャップ計算不能
+        top2_val = float(sorted_sc.iloc[1])
+        if not np.isfinite(top2_val):
+            return float('nan')
+        return float(top1_val - top2_val)
+    except Exception:
+        return float('nan')
+
+
+def _r40_place_confidence_level(
+    anchor: dict,
+    df: "pd.DataFrame",
+    params: Optional[dict] = None,
+) -> dict:
+    """◎馬の複勝信頼度レベルを計算して返す。
+
+    信頼度ロジック:
+        HIGH  : p_place_est >= high_p_min AND score_gap >= gap_high AND anchor_mode != 'BOX'
+        MEDIUM: p_place_est >= medium_p_min AND score_gap >= gap_medium
+        LOW   : 上記いずれにも該当しない
+
+    Args:
+        anchor: select_anchor()が返す軸馬辞書
+        df: 馬別スコアDataFrame
+        params: 設定辞書（place_rules.confidence_* キーを参照）
+
+    Returns:
+        dict with keys:
+            level     (str)  : 'HIGH' | 'MEDIUM' | 'LOW'
+            score_gap (float): AnchorScoreギャップ（1位 - 2位）
+            p_place_est (float): 軸馬のp_place_est値（0~1）
+            reasons   (list) : 判定根拠の文字列リスト
+            skip_reason (str): confidence_filterによるSKIP理由（非SKIPなら空文字）
+    """
+    params = params or {}
+    pr = params.get('place_rules', {}) or {}
+
+    # --- パラメータ読み込み ---
+    high_p_min    = float(pr.get('confidence_high_p_place_min', 0.35) or 0.35)
+    medium_p_min  = float(pr.get('confidence_medium_p_place_min', 0.32) or 0.32)
+    gap_high      = float(pr.get('confidence_score_gap_min', 3.0) or 3.0)
+    gap_medium    = float(pr.get('confidence_score_gap_medium', 1.5) or 1.5)
+    score_col     = str(params.get('anchor_score_col', 'AnchorScore'))
+
+    # --- 値取得 ---
+    try:
+        p_place_est_pct = float(anchor.get('p_place_est_pct', 0.0) or 0.0)
+        p_place_est_pct = float(np.clip(p_place_est_pct, 0.0, 100.0)) if np.isfinite(p_place_est_pct) else 0.0
+    except Exception:
+        p_place_est_pct = 0.0
+    p_place_est = p_place_est_pct / 100.0
+
+    score_gap = _r40_score_gap(str(anchor.get('num', '')), df, score_col)
+
+    anchor_mode = str(anchor.get('anchor_mode', 'SINGLE')).upper()
+    is_box = (anchor_mode == 'BOX')
+
+    reasons = []
+    level = 'LOW'
+
+    # HIGH判定
+    if (p_place_est >= high_p_min
+            and np.isfinite(score_gap)
+            and score_gap >= gap_high
+            and not is_box):
+        level = 'HIGH'
+        reasons.append(f"p_place_est={p_place_est:.3f}>={high_p_min}")
+        reasons.append(f"score_gap={score_gap:.2f}pt>={gap_high}pt")
+        reasons.append("BOXモードなし")
+    # MEDIUM判定
+    elif (p_place_est >= medium_p_min
+          and np.isfinite(score_gap)
+          and score_gap >= gap_medium):
+        level = 'MEDIUM'
+        reasons.append(f"p_place_est={p_place_est:.3f}>={medium_p_min}")
+        reasons.append(f"score_gap={score_gap:.2f}pt>={gap_medium}pt")
+        if is_box:
+            reasons.append("BOXモード（MEDIUMに留まる）")
+    else:
+        level = 'LOW'
+        if p_place_est < medium_p_min:
+            reasons.append(f"p_place_est={p_place_est:.3f}<{medium_p_min}（不足）")
+        if not np.isfinite(score_gap) or score_gap < gap_medium:
+            _g = f"{score_gap:.2f}" if np.isfinite(score_gap) else "nan"
+            reasons.append(f"score_gap={_g}pt<{gap_medium}pt（不足）")
+        if is_box:
+            reasons.append("BOXモード（分散リスク）")
+
+    return dict(
+        level=level,
+        score_gap=float(score_gap) if np.isfinite(score_gap) else None,
+        p_place_est=float(p_place_est),
+        reasons=reasons,
+    )
+
+
+def _r40_style_compat_bonus(
+    anchor: dict,
+    opp_row: dict,
+    params: Optional[dict] = None,
+) -> float:
+    """ワイド相手のスタイル互換性ボーナス（0.0〜bonus_max）を返す。
+
+    互換性ロジック（zone_4c ベース）:
+      - FRONT × REAR   → 高ボーナス（ペース分散カバー）
+      - FRONT × MIDDLE → 中ボーナス
+      - MIDDLE × REAR  → 中ボーナス
+      - 同ゾーン        → ペナルティ（-bonus_min）
+      - FRONT × FRONT  → 大ペナルティ（先行過密リスク）
+      - その他          → 0.0
+
+    Returns:
+        float: bonus（正=ボーナス、負=ペナルティ）
+    """
+    params = params or {}
+    wr = params.get('wide_rules', {}) or {}
+    style_bonus_enabled = bool(wr.get('style_compat_bonus_enabled', True))
+    if not style_bonus_enabled:
+        return 0.0
+
+    bonus_high = float(wr.get('style_compat_bonus_high', 0.05) or 0.05)
+    bonus_mid  = float(wr.get('style_compat_bonus_mid', 0.025) or 0.025)
+    penalty_same = float(wr.get('style_compat_penalty_same', -0.01) or -0.01)
+    penalty_front_front = float(wr.get('style_compat_penalty_front_front', -0.04) or -0.04)
+
+    try:
+        az = str(anchor.get('zone_4c', anchor.get('zone4c', '')) or '').upper().strip()
+        oz = str(opp_row.get('zone_4c', opp_row.get('zone4c', '')) or '').upper().strip()
+
+        if not az or not oz:
+            return 0.0
+
+        pair = frozenset([az, oz])
+
+        if az == oz:
+            if az == 'FRONT':
+                return penalty_front_front
+            return penalty_same
+        if pair == frozenset(['FRONT', 'REAR']):
+            return bonus_high
+        if pair in (frozenset(['FRONT', 'MIDDLE']), frozenset(['MIDDLE', 'REAR'])):
+            return bonus_mid
+        return 0.0
+    except Exception:
+        return 0.0
+
+# =========================
+# R41: 事後分析機能 (Post-Race Analysis)
+# ========================= (Post-Race Analysis)
+# =========================
+
+def _r41_load_results_df(result_dir: str) -> "pd.DataFrame":
+    """result_dir 内の JSON ファイルをすべて読み込み、フラット化した DataFrame を返す。
+
+    抽出する列（利用可能なものだけ）:
+        race_id, created_at, date, venue, race, pace
+        anchor_num, anchor_name, anchor_score
+        p_place_est, p_place_est_pct, place_ok
+        confidence_level, confidence_score_gap
+        wide_nums (list→str), trio_form_points
+        actual.rank_1st/2nd/3rd, anchor_rank, place_hit, wide_hits, trio_hit
+        payout_fukusho, payout_wide_max, payout_tansho
+    """
+    import json
+    from pathlib import Path
+
+    records = []
+    try:
+        p = Path(result_dir)
+        if not p.is_dir():
+            return pd.DataFrame()
+        files = sorted(p.glob('*.json'))
+    except Exception:
+        return pd.DataFrame()
+
+    for fp in files:
+        try:
+            obj = json.loads(fp.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+
+        meta = obj.get('meta', {}) or {}
+        pred = obj.get('prediction', {}) or {}
+        actual = obj.get('actual', {}) or {}
+        payouts = actual.get('payouts', {}) or {}
+
+        # 払戻金の抽出ヘルパー
+        def _first_payout(key: str) -> Optional[float]:
+            """payoutsの最初のエントリの払戻金額（円）を返す。"""
+            try:
+                entries = payouts.get(key, []) or []
+                if not entries:
+                    return None
+                return float(entries[0].get('payout', float('nan')))
+            except Exception:
+                return None
+
+        def _max_payout(key: str) -> Optional[float]:
+            """payoutsの最大払戻金額を返す。"""
+            try:
+                entries = payouts.get(key, []) or []
+                if not entries:
+                    return None
+                vals = [float(e.get('payout', float('nan'))) for e in entries]
+                vals = [v for v in vals if np.isfinite(v)]
+                return max(vals) if vals else None
+            except Exception:
+                return None
+
+        # wide_hits の件数
+        wide_hits = actual.get('wide_hits', None)
+        try:
+            wide_hit_count = len(wide_hits) if isinstance(wide_hits, list) else (int(wide_hits) if wide_hits is not None else None)
+        except Exception:
+            wide_hit_count = None
+
+        # wide_nums（予測）の件数
+        wide_nums = pred.get('wide_nums', []) or []
+        try:
+            wide_num_count = len(wide_nums)
+        except Exception:
+            wide_num_count = 0
+
+        # trio_form_points
+        try:
+            trio_form_points = int((pred.get('trio_form', {}) or {}).get('points', 0) or 0)
+        except Exception:
+            trio_form_points = 0
+
+        # ペース（H/M/S/''）の正規化
+        pace_raw = str(meta.get('pace', '') or '').strip().upper()
+        if 'ハイ' in pace_raw or pace_raw.startswith('H'):
+            pace = 'H'
+        elif 'スロー' in pace_raw or pace_raw.startswith('S'):
+            pace = 'S'
+        elif 'ミドル' in pace_raw or pace_raw.startswith('M'):
+            pace = 'M'
+        else:
+            pace = pace_raw[:1] if pace_raw else ''
+
+        # p_place_est_pct 帯域（5%刻み）
+        try:
+            _pct = float(pred.get('p_place_est_pct') or float('nan'))
+            if np.isfinite(_pct):
+                pband = f"{int(_pct // 5) * 5}-{int(_pct // 5) * 5 + 5}%"
+            else:
+                pband = ''
+        except Exception:
+            pband = ''
+
+        rec = {
+            'race_id':              str(obj.get('race_id', '') or fp.stem),
+            'created_at':           str(obj.get('created_at', '') or ''),
+            'date':                 str(meta.get('date', '') or ''),
+            'venue':                str(meta.get('venue', '') or ''),
+            'race':                 str(meta.get('race', '') or ''),
+            'pace':                 pace,
+            # prediction
+            'anchor_num':           str(pred.get('anchor_num', '') or ''),
+            'anchor_name':          str(pred.get('anchor_name', '') or ''),
+            'anchor_score':         _safe_float(pred.get('anchor_score')),
+            'p_place_est':          _safe_float(pred.get('p_place_est')),
+            'p_place_est_pct':      _safe_float(pred.get('p_place_est_pct')),
+            'place_ok':             _safe_bool(pred.get('place_ok')),
+            'confidence_level':     str(pred.get('confidence_level', '') or ''),
+            'confidence_score_gap': _safe_float(pred.get('confidence_score_gap')),
+            'wide_num_count':       wide_num_count,
+            'trio_form_points':     trio_form_points,
+            'pband':                pband,
+            # actual
+            'rank_1st':             str(actual.get('rank_1st', '') or ''),
+            'rank_2nd':             str(actual.get('rank_2nd', '') or ''),
+            'rank_3rd':             str(actual.get('rank_3rd', '') or ''),
+            'anchor_rank':          _safe_int(actual.get('anchor_rank')),
+            'place_hit':            _safe_bool(actual.get('place_hit')),
+            'wide_hit_count':       wide_hit_count,
+            'trio_hit':             _safe_bool(actual.get('trio_hit')),
+            # payouts
+            'payout_tansho':        _first_payout('tansho'),
+            'payout_fukusho_max':   _max_payout('fukusho'),
+            'payout_fukusho_first': _first_payout('fukusho'),
+            'payout_wide_max':      _max_payout('wide'),
+            'payout_sanrenpuku':    _first_payout('sanrenpuku'),
+        }
+        records.append(rec)
+
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    return df
+
+
+def _safe_float(v) -> Optional[float]:
+    """None/NaN 安全な float 変換。変換不能時は None。"""
+    try:
+        x = float(v)
+        return x if np.isfinite(x) else None
+    except Exception:
+        return None
+
+
+def _safe_bool(v) -> Optional[bool]:
+    """None 安全な bool 変換。None は None を返す。"""
+    if v is None:
+        return None
+    try:
+        return bool(v)
+    except Exception:
+        return None
+
+
+def _safe_int(v) -> Optional[int]:
+    """None 安全な int 変換。None/変換不能は None を返す。"""
+    if v is None:
+        return None
+    try:
+        x = int(v)
+        return x
+    except Exception:
+        return None
+
+
+def _r41_confidence_stats(df: "pd.DataFrame") -> "pd.DataFrame":
+    """confidence_level 別の複勝的中統計を集計して DataFrame を返す。
+
+    集計対象: place_ok=True（購入レース）のみ。
+    列: confidence_level, n_races, n_hit, hit_rate, avg_payout, roi_pct
+    """
+    result_rows = []
+    for level in ['HIGH', 'MEDIUM', 'LOW', '']:
+        if level == '':
+            mask = df['confidence_level'].isna() | (df['confidence_level'] == '')
+            label = '(未記録)'
+        else:
+            mask = df['confidence_level'] == level
+            label = level
+
+        sub = df[mask & (df['place_ok'] == True)].copy()
+        n = len(sub)
+        if n == 0:
+            continue
+
+        # 的中数（place_hit が True のもの）
+        ph = sub['place_hit'].dropna()
+        n_with_actual = len(ph)
+        n_hit = int(ph.sum()) if n_with_actual > 0 else 0
+        hit_rate = float(n_hit / n_with_actual * 100) if n_with_actual > 0 else float('nan')
+
+        # 平均払戻（複勝・実績あり）
+        pay_col = sub['payout_fukusho_first'].dropna()
+        avg_pay = float(pay_col.mean()) if len(pay_col) > 0 else float('nan')
+
+        # ROI = (合計回収 - 合計投資) / 合計投資 × 100%
+        # stake仮定: 1000円/レース
+        stake_per = 1000.0
+        total_invest = float(n_with_actual) * stake_per
+        # 的中時のみ払戻あり（10口=1000円ベース: payout÷100×1000）
+        # 競馬は100円単位払戻なので 1000円購入 = 10口 → payout × 10
+        total_return = 0.0
+        if n_hit > 0:
+            for _idx in ph[ph == True].index:
+                _pay = sub.loc[_idx, 'payout_fukusho_first'] if _idx in sub.index else None
+                if _pay is not None and pd.notna(_pay):
+                    total_return += float(_pay) * 10.0
+        roi_pct = float((total_return - total_invest) / total_invest * 100) if total_invest > 0 else float('nan')
+
+        result_rows.append({
+            'confidence_level': label,
+            'n_buy':    n,
+            'n_actual': n_with_actual,
+            'n_hit':    n_hit,
+            'hit_rate_pct': round(hit_rate, 1) if np.isfinite(hit_rate) else None,
+            'avg_payout':   round(avg_pay, 0) if np.isfinite(avg_pay) else None,
+            'roi_pct':      round(roi_pct, 1) if np.isfinite(roi_pct) else None,
+        })
+
+    if not result_rows:
+        return pd.DataFrame(columns=['confidence_level','n_buy','n_actual','n_hit','hit_rate_pct','avg_payout','roi_pct'])
+    return pd.DataFrame(result_rows)
+
+
+def _r41_pace_stats(df: "pd.DataFrame") -> "pd.DataFrame":
+    """ペース（H/M/S）別の的中統計を集計して DataFrame を返す。
+
+    place_ok=True のレースのみ対象。
+    """
+    result_rows = []
+    for pace in ['H', 'M', 'S', '']:
+        if pace == '':
+            mask = df['pace'].isna() | (df['pace'] == '')
+            label = '(不明)'
+        else:
+            mask = df['pace'] == pace
+            label = pace
+
+        sub = df[mask & (df['place_ok'] == True)].copy()
+        n = len(sub)
+        if n == 0:
+            continue
+
+        ph = sub['place_hit'].dropna()
+        n_actual = len(ph)
+        n_hit = int(ph.sum()) if n_actual > 0 else 0
+        hit_rate = float(n_hit / n_actual * 100) if n_actual > 0 else float('nan')
+
+        # ワイド的中数（wide_hit_count >= 1）
+        wh = sub['wide_hit_count'].dropna()
+        n_wide_buy = len(wh)
+        n_wide_hit = int((wh >= 1).sum()) if n_wide_buy > 0 else 0
+        wide_hit_rate = float(n_wide_hit / n_wide_buy * 100) if n_wide_buy > 0 else float('nan')
+
+        result_rows.append({
+            'pace': label,
+            'n_buy': n,
+            'n_actual': n_actual,
+            'place_n_hit': n_hit,
+            'place_hit_rate_pct': round(hit_rate, 1) if np.isfinite(hit_rate) else None,
+            'wide_n_buy': n_wide_buy,
+            'wide_n_hit': n_wide_hit,
+            'wide_hit_rate_pct': round(wide_hit_rate, 1) if np.isfinite(wide_hit_rate) else None,
+        })
+
+    if not result_rows:
+        return pd.DataFrame(columns=['pace','n_buy','n_actual','place_n_hit','place_hit_rate_pct',
+                                      'wide_n_buy','wide_n_hit','wide_hit_rate_pct'])
+    return pd.DataFrame(result_rows)
+
+
+def _r41_pband_stats(df: "pd.DataFrame") -> "pd.DataFrame":
+    """p_place_est_pct 帯域（5%刻み）別の的中統計を集計して DataFrame を返す。
+
+    place_ok=True のレースのみ対象。
+    """
+    result_rows = []
+
+    # 有効なレコードのみ
+    sub_all = df[df['place_ok'] == True].copy()
+    sub_all = sub_all[sub_all['p_place_est_pct'].notna()].copy()
+
+    if len(sub_all) == 0:
+        return pd.DataFrame(columns=['pband','n_buy','n_actual','n_hit','hit_rate_pct'])
+
+    # 5%刻みのビン分割（25%〜60%）
+    bins = list(range(25, 65, 5))
+    for lo in bins:
+        hi = lo + 5
+        mask = (sub_all['p_place_est_pct'] >= lo) & (sub_all['p_place_est_pct'] < hi)
+        sub = sub_all[mask]
+        n = len(sub)
+        if n == 0:
+            continue
+        ph = sub['place_hit'].dropna()
+        n_actual = len(ph)
+        n_hit = int(ph.sum()) if n_actual > 0 else 0
+        hit_rate = float(n_hit / n_actual * 100) if n_actual > 0 else float('nan')
+        result_rows.append({
+            'pband': f"{lo}-{hi}%",
+            'n_buy': n,
+            'n_actual': n_actual,
+            'n_hit': n_hit,
+            'hit_rate_pct': round(hit_rate, 1) if np.isfinite(hit_rate) else None,
+        })
+
+    if not result_rows:
+        return pd.DataFrame(columns=['pband','n_buy','n_actual','n_hit','hit_rate_pct'])
+    return pd.DataFrame(result_rows)
+
+
+def _r41_roi_stats(
+    df: "pd.DataFrame",
+    stake_place: float = 1000.0,
+    stake_wide_per: float = 500.0,
+    stake_trio: float = 3000.0,
+) -> dict:
+    """複勝・ワイド・三連複の ROI 統計を計算して辞書で返す。
+
+    Returns:
+        dict with keys:
+            place: {n_buy, n_hit, total_invest, total_return, roi_pct, hit_rate_pct}
+            wide:  {n_buy, n_hit, total_invest, total_return, roi_pct, hit_rate_pct}
+            trio:  {n_buy, n_hit, total_invest, total_return, roi_pct, hit_rate_pct}
+    """
+    result = {}
+
+    # ── 複勝 ──
+    sub_p = df[df['place_ok'] == True].copy()
+    ph = sub_p['place_hit'].dropna()
+    n_buy_p = len(sub_p)
+    n_actual_p = len(ph)
+    n_hit_p = int(ph.sum()) if n_actual_p > 0 else 0
+    invest_p = n_actual_p * stake_place
+    # 複勝払戻: payout_fukusho_first は100円単位 → stake_place÷100 倍
+    unit_mul_p = stake_place / 100.0
+    return_p = 0.0
+    if n_hit_p > 0:
+        hit_idx = ph[ph == True].index
+        for i in hit_idx:
+            pay = _safe_float(sub_p.loc[i, 'payout_fukusho_first'])
+            if pay is not None and np.isfinite(pay):
+                return_p += pay * unit_mul_p
+    roi_p = float((return_p - invest_p) / invest_p * 100) if invest_p > 0 else float('nan')
+    result['place'] = {
+        'n_buy': n_buy_p,
+        'n_actual': n_actual_p,
+        'n_hit': n_hit_p,
+        'hit_rate_pct': round(n_hit_p / n_actual_p * 100, 1) if n_actual_p > 0 else None,
+        'total_invest': round(invest_p, 0),
+        'total_return': round(return_p, 0),
+        'roi_pct': round(roi_p, 1) if np.isfinite(roi_p) else None,
+    }
+
+    # ── ワイド ──
+    sub_w = df[(df['place_ok'] == True) & (df['wide_num_count'] > 0)].copy()
+    wh = sub_w['wide_hit_count'].dropna()
+    n_buy_w = len(sub_w)
+    n_actual_w = len(wh)
+    n_hit_w = int((wh >= 1).sum()) if n_actual_w > 0 else 0
+    # 投資 = n_points * stake_wide_per（4点がデフォルト）
+    invest_w_total = 0.0
+    for i in sub_w.index:
+        npts = int(sub_w.loc[i, 'wide_num_count'] or 0)
+        invest_w_total += npts * stake_wide_per
+    # 回収 = wide_hit_count * wide_pay_max (max払戻) * stake_wide_per÷100
+    unit_mul_w = stake_wide_per / 100.0
+    return_w = 0.0
+    for i in wh[wh >= 1].index:
+        pay = _safe_float(sub_w.loc[i, 'payout_wide_max'])
+        hits = int(wh[i]) if not pd.isna(wh[i]) else 0
+        if pay is not None and np.isfinite(pay) and hits > 0:
+            return_w += pay * unit_mul_w * hits
+    roi_w = float((return_w - invest_w_total) / invest_w_total * 100) if invest_w_total > 0 else float('nan')
+    result['wide'] = {
+        'n_buy': n_buy_w,
+        'n_actual': n_actual_w,
+        'n_hit': n_hit_w,
+        'hit_rate_pct': round(n_hit_w / n_actual_w * 100, 1) if n_actual_w > 0 else None,
+        'total_invest': round(invest_w_total, 0),
+        'total_return': round(return_w, 0),
+        'roi_pct': round(roi_w, 1) if np.isfinite(roi_w) else None,
+    }
+
+    # ── 三連複 ──
+    sub_t = df[(df['place_ok'] == True) & (df['trio_form_points'] > 0)].copy()
+    th = sub_t['trio_hit'].dropna()
+    n_buy_t = len(sub_t)
+    n_actual_t = len(th)
+    n_hit_t = int(th.sum()) if n_actual_t > 0 else 0
+    invest_t_total = 0.0
+    for i in sub_t.index:
+        pts = int(sub_t.loc[i, 'trio_form_points'] or 0)
+        invest_t_total += pts * (stake_trio / max(1, int(sub_t.loc[i, 'trio_form_points'] or 1)))
+    # 簡易: 全レースでstake_trio投資
+    invest_t_total = float(n_actual_t) * stake_trio
+    unit_mul_t = stake_trio / 100.0
+    return_t = 0.0
+    if n_hit_t > 0:
+        hit_idx = th[th == True].index
+        for i in hit_idx:
+            pay = _safe_float(sub_t.loc[i, 'payout_sanrenpuku'])
+            if pay is not None and np.isfinite(pay):
+                return_t += pay * unit_mul_t
+    roi_t = float((return_t - invest_t_total) / invest_t_total * 100) if invest_t_total > 0 else float('nan')
+    result['trio'] = {
+        'n_buy': n_buy_t,
+        'n_actual': n_actual_t,
+        'n_hit': n_hit_t,
+        'hit_rate_pct': round(n_hit_t / n_actual_t * 100, 1) if n_actual_t > 0 else None,
+        'total_invest': round(invest_t_total, 0),
+        'total_return': round(return_t, 0),
+        'roi_pct': round(roi_t, 1) if np.isfinite(roi_t) else None,
+    }
+
+    return result
+
+
+def analyze_race_results(
+    result_dir: str,
+    params: Optional[dict] = None,
+    stake_place: float = 1000.0,
+    stake_wide_per: float = 500.0,
+    stake_trio: float = 3000.0,
+    out_md: Optional[str] = None,
+) -> str:
+    """保存済みレース結果 JSON から事後分析レポートを生成して Markdown 文字列を返す。
+
+    Args:
+        result_dir:      JSON を格納しているディレクトリ
+        params:          STELLAパラメータ辞書（現在未使用、将来の拡張用）
+        stake_place:     複勝購入金額想定（円）
+        stake_wide_per:  ワイド1点あたり購入金額想定（円）
+        stake_trio:      三連複予算想定（円）
+        out_md:          指定した場合、分析レポートをファイルに書き出す
+
+    Returns:
+        Markdown形式の分析レポート文字列
+    """
+    import datetime as _dt
+    from pathlib import Path
+
+    df = _r41_load_results_df(result_dir)
+    now_str = _dt.datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    out = f'# STELLA v1.18 事後分析レポート (R41)\n\n'
+    out += f'- 生成日時: {now_str}\n'
+    out += f'- 読込ディレクトリ: `{result_dir}`\n'
+
+    if df is None or len(df) == 0:
+        out += '\n> ⚠️ 分析対象のレース結果が見つかりませんでした。\n'
+        out += '> `--result_dir` で保存したJSONファイルが存在するか確認してください。\n'
+        if out_md:
+            try:
+                Path(out_md).write_text(out, encoding='utf-8')
+            except Exception:
+                pass
+        return out
+
+    n_total = len(df)
+    n_with_actual = int(df['place_hit'].notna().sum())
+    n_buy = int((df['place_ok'] == True).sum())
+    out += f'- 総レース数: {n_total}件（実績記録済み: {n_with_actual}件、うち複勝購入: {n_buy}件）\n\n'
+
+    # ── 1. 信頼度別統計 ──
+    out += '## 1. 信頼度別 複勝的中統計（R40 confidence_filter）\n\n'
+    conf_df = _r41_confidence_stats(df)
+    if len(conf_df) > 0:
+        out += '|信頼度|購入|実績|的中|的中率|平均払戻|ROI|\n'
+        out += '|---|---:|---:|---:|---:|---:|---:|\n'
+        for _, row in conf_df.iterrows():
+            lv = str(row['confidence_level'])
+            emoji = {'HIGH': '🟢', 'MEDIUM': '🟡', 'LOW': '🔴'}.get(lv, '⚪')
+            hr  = f"{row['hit_rate_pct']:.1f}%" if row['hit_rate_pct'] is not None else '-'
+            ap  = f"¥{int(row['avg_payout']):,}" if row['avg_payout'] is not None else '-'
+            roi = f"{row['roi_pct']:+.1f}%" if row['roi_pct'] is not None else '-'
+            out += f"|{emoji} {lv}|{int(row['n_buy'])}|{int(row['n_actual'])}|{int(row['n_hit'])}|{hr}|{ap}|{roi}|\n"
+        out += '\n'
+        # 洞察コメント
+        out += '_【R40フィルター効果】_\n'
+        for _, row in conf_df.iterrows():
+            lv = str(row['confidence_level'])
+            if lv == 'HIGH' and row['hit_rate_pct'] is not None:
+                out += f"- 🟢 HIGH ({row['n_actual']}件): 的中率 {row['hit_rate_pct']:.1f}% "
+                out += "(目標: ≥55% ← モデル期待値)\n"
+            elif lv == 'LOW' and row['hit_rate_pct'] is not None:
+                out += f"- 🔴 LOW ({row['n_actual']}件): 的中率 {row['hit_rate_pct']:.1f}% "
+                out += "← R40フィルターがSKIPすべき領域\n"
+        out += '\n'
+    else:
+        out += '> ℹ️ confidence_level が記録されたレースがありません。\n'
+        out += '> R40以降で `--result_dir` を使ったレースから記録されます。\n\n'
+
+    # ── 2. ペース別統計 ──
+    out += '## 2. ペース別 複勝・ワイド的中統計\n\n'
+    pace_df = _r41_pace_stats(df)
+    if len(pace_df) > 0:
+        out += '|ペース|複勝購入|複勝的中|複勝的中率|ワイド購入|ワイド的中|ワイド的中率|\n'
+        out += '|---|---:|---:|---:|---:|---:|---:|\n'
+        for _, row in pace_df.iterrows():
+            ph  = f"{row['place_hit_rate_pct']:.1f}%" if row['place_hit_rate_pct'] is not None else '-'
+            wh  = f"{row['wide_hit_rate_pct']:.1f}%" if row['wide_hit_rate_pct'] is not None else '-'
+            out += f"|{row['pace']}|{int(row['n_actual'])}|{int(row['place_n_hit'])}|{ph}|{int(row['wide_n_buy'])}|{int(row['wide_n_hit'])}|{wh}|\n"
+        out += '\n'
+    else:
+        out += '> ℹ️ ペース情報付きの実績レコードがありません。\n\n'
+
+    # ── 3. p_place_est 帯域別統計 ──
+    out += '## 3. 複勝確率帯域別 的中統計\n\n'
+    pband_df = _r41_pband_stats(df)
+    if len(pband_df) > 0:
+        out += '|p_place帯域|購入|実績|的中|的中率|\n'
+        out += '|---|---:|---:|---:|---:|\n'
+        for _, row in pband_df.iterrows():
+            hr = f"{row['hit_rate_pct']:.1f}%" if row['hit_rate_pct'] is not None else '-'
+            out += f"|{row['pband']}|{int(row['n_buy'])}|{int(row['n_actual'])}|{int(row['n_hit'])}|{hr}|\n"
+        out += '\n'
+    else:
+        out += '> ℹ️ 帯域別集計データが不足しています。\n\n'
+
+    # ── 4. ROI サマリー ──
+    out += '## 4. 賭け種別 ROI サマリー\n\n'
+    roi = _r41_roi_stats(df, stake_place, stake_wide_per, stake_trio)
+    out += f'（想定単価: 複勝¥{int(stake_place):,} / ワイド¥{int(stake_wide_per):,}/点 / 三連複¥{int(stake_trio):,}）\n\n'
+    out += '|賭け種|対象|実績|的中|的中率|合計投資|合計回収|ROI|\n'
+    out += '|---|---:|---:|---:|---:|---:|---:|---:|\n'
+    for kind, label in [('place','複勝'), ('wide','ワイド'), ('trio','三連複')]:
+        r = roi.get(kind, {})
+        hr  = f"{r['hit_rate_pct']:.1f}%" if r.get('hit_rate_pct') is not None else '-'
+        inv = f"¥{int(r.get('total_invest', 0)):,}" if r.get('total_invest') is not None else '-'
+        ret = f"¥{int(r.get('total_return', 0)):,}" if r.get('total_return') is not None else '-'
+        roi_v = f"{r['roi_pct']:+.1f}%" if r.get('roi_pct') is not None else '-'
+        out += f"|{label}|{r.get('n_buy',0)}|{r.get('n_actual',0)}|{r.get('n_hit',0)}|{hr}|{inv}|{ret}|{roi_v}|\n"
+    out += '\n'
+
+    # ── 5. ◎馬の着順分布 ──
+    out += '## 5. ◎馬 着順分布（place_ok=True のレース）\n\n'
+    sub_ranked = df[(df['place_ok'] == True) & df['anchor_rank'].notna()].copy()
+    if len(sub_ranked) > 0:
+        rank_counts = {}
+        for r in sub_ranked['anchor_rank']:
+            try:
+                k = int(r)
+                rank_counts[k] = rank_counts.get(k, 0) + 1
+            except Exception:
+                pass
+        total_ranked = sum(rank_counts.values())
+        out += '|着順|件数|割合|\n|---|---:|---:|\n'
+        for k in sorted(rank_counts.keys()):
+            pct = rank_counts[k] / total_ranked * 100
+            bar = '▓' * min(int(pct / 5), 20)
+            out += f"|{k}着|{rank_counts[k]}|{pct:.1f}% {bar}|\n"
+        # 3着内率
+        in3 = sum(v for k, v in rank_counts.items() if k <= 3)
+        out += f"\n- **3着内率(複勝的中率)**: {in3}/{total_ranked} = {in3/total_ranked*100:.1f}%\n\n"
+    else:
+        out += '> ℹ️ 着順データがありません。`record_race_actual()` で実績を記録してください。\n\n'
+
+    # ── 6. 直近レース一覧 ──
+    out += '## 6. 直近レース一覧（最大20件）\n\n'
+    recent = df.sort_values('created_at', ascending=False).head(20)
+    if len(recent) > 0:
+        out += '|race_id|ペース|◎|place_ok|信頼度|的中|ワイド|\n'
+        out += '|---|---|---|---|---|---|---|\n'
+        for _, row in recent.iterrows():
+            pid = str(row['race_id'])[:24]
+            pce = str(row['pace']) or '-'
+            anc = f"{row['anchor_num']}.{str(row['anchor_name'])[:6]}" if row['anchor_num'] else '-'
+            pok = '✅BUY' if row['place_ok'] == True else ('⬛SKIP' if row['place_ok'] == False else '-')
+            lv  = str(row['confidence_level'] or '-')
+            ph  = '◯' if row['place_hit'] == True else ('✗' if row['place_hit'] == False else '-')
+            wh  = f"{int(row['wide_hit_count'])}hit" if row['wide_hit_count'] is not None else '-'
+            out += f"|{pid}|{pce}|{anc}|{pok}|{lv}|{ph}|{wh}|\n"
+        out += '\n'
+
+    out += '---\n'
+    out += f'- version: STELLA v1.18 事後分析 (R41)\n'
+    out += f'- source: `analyze_race_results("{result_dir}")`\n'
+
+    # ファイル書き出し
+    if out_md:
+        try:
+            Path(out_md).write_text(out, encoding='utf-8')
+            print(f'[R41] analysis report saved -> {out_md}')
+        except Exception as e:
+            print(f'[R41] report save failed: {e}')
+
+    return out
+
+# =========================
+# R42: confidence 自動チューニング (v1.18)
+# =========================
+
+# =========================
+# R42: confidence 自動チューニング (v1.18)
+# =========================
+
+def _r42_rescore_df(
+    df: "pd.DataFrame",
+    high_p_min: float,
+    medium_p_min: float,
+    gap_high: float,
+    gap_medium: float,
+) -> "pd.DataFrame":
+    """保存済み p_place_est / confidence_score_gap から confidence_level を再計算する。
+
+    Args:
+        df: _r41_load_results_df() が返す DataFrame
+            必要列: p_place_est, confidence_score_gap
+        high_p_min:   HIGH判定の p_place_est 下限（例: 0.35）
+        medium_p_min: MEDIUM判定の p_place_est 下限（例: 0.32）
+        gap_high:     HIGH判定の score_gap 下限（例: 3.0）
+        gap_medium:   MEDIUM判定の score_gap 下限（例: 1.5）
+
+    Returns:
+        df に 'r42_level' 列を追加したコピー
+    """
+    df = df.copy()
+
+    def _level_for_row(row) -> str:
+        p = _safe_float(row.get('p_place_est'))
+        g = _safe_float(row.get('confidence_score_gap'))
+        if p is None or not np.isfinite(p):
+            return 'LOW'
+        if g is None or not np.isfinite(g):
+            g = 0.0
+        # anchor_mode BOXは高信頼度に上げない（保存JSONに情報なし → 非BOX仮定）
+        if p >= high_p_min and g >= gap_high:
+            return 'HIGH'
+        elif p >= medium_p_min and g >= gap_medium:
+            return 'MEDIUM'
+        return 'LOW'
+
+    df['r42_level'] = df.apply(_level_for_row, axis=1)
+    return df
+
+
+def _r42_eval_params(
+    df: "pd.DataFrame",
+    high_p_min: float,
+    medium_p_min: float,
+    gap_high: float,
+    gap_medium: float,
+    min_high_n: int = 3,
+    w_high_hit: float = 0.40,
+    w_roi:      float = 0.30,
+    w_low_skip: float = 0.30,
+    stake_per:  float = 1000.0,
+) -> dict:
+    """パラメータセットの評価スコアを計算して辞書で返す。
+
+    評価指標:
+        composite_score = HIGH_hit_rate * w_high_hit
+                        + clamp(HIGH_roi / 100, -1, 1) * w_roi
+                        + (1 - LOW_buy_rate) * w_low_skip
+
+    制約:
+        HIGH件数 < min_high_n → スコア -999（無効）
+
+    Returns:
+        dict with keys:
+            composite_score, high_hit_rate, high_roi_pct,
+            high_n, medium_n, low_n, low_buy_rate,
+            valid (bool)
+    """
+    scored = _r42_rescore_df(df, high_p_min, medium_p_min, gap_high, gap_medium)
+    n_total = len(scored)
+
+    # — HIGH stats —
+    high_sub = scored[(scored['r42_level'] == 'HIGH')].copy()
+    high_n = len(high_sub)
+    if high_n < min_high_n:
+        return dict(composite_score=-999.0, high_n=high_n, valid=False,
+                    high_hit_rate=None, high_roi_pct=None,
+                    medium_n=None, low_n=None, low_buy_rate=None)
+
+    high_ph = high_sub['place_hit'].dropna()
+    high_n_actual = len(high_ph)
+    high_n_hit = int(high_ph.sum()) if high_n_actual > 0 else 0
+    high_hit_rate = float(high_n_hit / high_n_actual) if high_n_actual > 0 else 0.0
+
+    # HIGH ROI
+    unit_mul = stake_per / 100.0
+    high_invest = float(high_n_actual) * stake_per
+    high_return = 0.0
+    if high_n_hit > 0:
+        for _idx in high_ph[high_ph == True].index:
+            _pay = high_sub.loc[_idx, 'payout_fukusho_first'] if _idx in high_sub.index else None
+            if _pay is not None and pd.notna(_pay):
+                try:
+                    high_return += float(_pay) * unit_mul
+                except Exception:
+                    pass
+    high_roi = float((high_return - high_invest) / high_invest * 100) if high_invest > 0 else 0.0
+
+    # — LOW / MEDIUM stats —
+    medium_n = int((scored['r42_level'] == 'MEDIUM').sum())
+    low_n     = int((scored['r42_level'] == 'LOW').sum())
+    # 「LOWなのに購入していたレース」率 = LOW買い件数 / 購入済み全件数
+    bought_n  = int((df['place_ok'] == True).sum())
+    low_buy_n = int(((scored['r42_level'] == 'LOW') & (df['place_ok'] == True)).sum())
+    low_buy_rate = float(low_buy_n / bought_n) if bought_n > 0 else 0.0
+
+    # — 複合スコア —
+    roi_norm = float(np.clip(high_roi / 100.0, -1.0, 1.0))
+    composite = (
+        high_hit_rate * w_high_hit
+        + roi_norm    * w_roi
+        + (1.0 - low_buy_rate) * w_low_skip
+    )
+
+    return dict(
+        composite_score=round(composite, 6),
+        high_n=high_n,
+        high_n_actual=high_n_actual,
+        high_n_hit=high_n_hit,
+        high_hit_rate=round(high_hit_rate * 100, 1),
+        high_roi_pct=round(high_roi, 1),
+        medium_n=medium_n,
+        low_n=low_n,
+        low_buy_n=low_buy_n,
+        low_buy_rate=round(low_buy_rate * 100, 1),
+        valid=True,
+    )
+
+
+def _r42_grid_search(
+    df: "pd.DataFrame",
+    grid_config: Optional[dict] = None,
+    min_high_n: int = 3,
+    w_high_hit: float = 0.40,
+    w_roi:      float = 0.30,
+    w_low_skip: float = 0.30,
+    stake_per:  float = 1000.0,
+    verbose:    bool  = False,
+) -> list:
+    """グリッドサーチを実行して上位結果リストを返す。
+
+    Args:
+        df:          _r41_load_results_df() が返すDataFrame
+        grid_config: グリッド設定辞書（省略時はデフォルト）
+            {
+              'high_p_min':   [0.30, 0.32, ..., 0.45],
+              'medium_p_min': [0.28, ..., 0.42],
+              'gap_high':     [1.0, 1.5, ..., 6.0],
+              'gap_medium':   [0.5, 1.0, ..., 3.0],
+            }
+        min_high_n: HIGH件数の最小要件（これを下回る組み合わせは無効）
+        verbose:    進捗を表示するか
+
+    Returns:
+        上位50件の評価結果辞書リスト（composite_score 降順）
+    """
+    # デフォルトグリッド
+    default_grid = {
+        'high_p_min':   [round(v, 2) for v in np.arange(0.30, 0.46, 0.01)],
+        'medium_p_min': [round(v, 2) for v in np.arange(0.28, 0.43, 0.01)],
+        'gap_high':     [round(v, 1) for v in np.arange(1.0, 6.5, 0.5)],
+        'gap_medium':   [round(v, 1) for v in np.arange(0.5, 3.5, 0.5)],
+    }
+    if grid_config:
+        for k, v in grid_config.items():
+            default_grid[k] = v
+
+    hp_list  = default_grid['high_p_min']
+    mp_list  = default_grid['medium_p_min']
+    gh_list  = default_grid['gap_high']
+    gm_list  = default_grid['gap_medium']
+
+    total = len(hp_list) * len(mp_list) * len(gh_list) * len(gm_list)
+    if verbose:
+        print(f'[R42] グリッドサーチ開始: {total:,} 組み合わせ')
+
+    results = []
+    count = 0
+    for hp in hp_list:
+        for mp in mp_list:
+            # 制約: high_p_min >= medium_p_min
+            if hp < mp:
+                continue
+            for gh in gh_list:
+                for gm in gm_list:
+                    # 制約: gap_high >= gap_medium
+                    if gh < gm:
+                        continue
+                    ev = _r42_eval_params(
+                        df, hp, mp, gh, gm,
+                        min_high_n=min_high_n,
+                        w_high_hit=w_high_hit,
+                        w_roi=w_roi,
+                        w_low_skip=w_low_skip,
+                        stake_per=stake_per,
+                    )
+                    if ev.get('valid', False):
+                        ev['params'] = {
+                            'confidence_high_p_place_min':   hp,
+                            'confidence_medium_p_place_min': mp,
+                            'confidence_score_gap_min':      gh,
+                            'confidence_score_gap_medium':   gm,
+                        }
+                        results.append(ev)
+                    count += 1
+
+    if verbose:
+        n_valid = len(results)
+        print(f'[R42] 有効組み合わせ: {n_valid:,} / {count:,}')
+
+    results.sort(key=lambda x: x['composite_score'], reverse=True)
+    return results[:50]
+
+
+def _r42_apply_tuned_params(
+    params: dict,
+    tuned: dict,
+) -> dict:
+    """グリッドサーチ最適パラメータを params 辞書に適用して返す（in-place）。
+
+    Args:
+        params: STELLAパラメータ辞書
+        tuned:  _r42_grid_search() の先頭要素（best result dict）
+
+    Returns:
+        更新後の params 辞書
+    """
+    pr = params.get('place_rules', {}) or {}
+    best_params = tuned.get('params', {})
+    for k, v in best_params.items():
+        pr[k] = v
+    params['place_rules'] = pr
+    return params
+
+
+def tune_confidence_params(
+    result_dir: str,
+    params:      Optional[dict] = None,
+    grid_config: Optional[dict] = None,
+    min_high_n:  int = 3,
+    w_high_hit:  float = 0.40,
+    w_roi:       float = 0.30,
+    w_low_skip:  float = 0.30,
+    stake_per:   float = 1000.0,
+    out_json:    Optional[str] = None,
+    verbose:     bool = True,
+) -> dict:
+    """保存済みJSONからconfidenceパラメータを自動チューニングする。
+
+    Args:
+        result_dir:  save_race_result() で保存したJSONのディレクトリ
+        params:      現在のSTELLAパラメータ辞書（省略可）
+        grid_config: グリッド設定（省略時はデフォルト）
+        min_high_n:  有効なHIGH候補の最小件数（デフォルト3）
+        w_high_hit:  HIGH的中率の重み
+        w_roi:       HIGH ROIの重み
+        w_low_skip:  LOWのスキップ率重み
+        stake_per:   ROI計算基準単価
+        out_json:    チューニング結果をJSONファイルに保存（省略可）
+        verbose:     進捗表示
+
+    Returns:
+        dict with keys:
+            best_params: 最適パラメータ辞書
+            best_score:  複合スコア
+            top_results: 上位10件の評価結果リスト
+            n_races:     分析レース数
+            report_md:   Markdownレポート文字列
+            current_params: チューニング前のパラメータ
+    """
+    import datetime as _dt
+    from pathlib import Path as _Path
+
+    params = params or {}
+    pr = params.get('place_rules', {}) or {}
+
+    # 現在のパラメータ
+    current = {
+        'confidence_high_p_place_min':   float(pr.get('confidence_high_p_place_min', 0.35)),
+        'confidence_medium_p_place_min': float(pr.get('confidence_medium_p_place_min', 0.32)),
+        'confidence_score_gap_min':      float(pr.get('confidence_score_gap_min', 3.0)),
+        'confidence_score_gap_medium':   float(pr.get('confidence_score_gap_medium', 1.5)),
+    }
+
+    # データ読み込み
+    df = _r41_load_results_df(result_dir)
+    n_races = len(df)
+
+    now_str = _dt.datetime.now().strftime('%Y-%m-%d %H:%M')
+    report = f'# STELLA v1.18 confidence 自動チューニングレポート (R42)\n\n'
+    report += f'- 生成日時: {now_str}\n'
+    report += f'- 読込ディレクトリ: `{result_dir}`\n'
+    report += f'- 総レース数: {n_races}件\n\n'
+
+    if n_races < min_high_n:
+        report += f'> ⚠️ レース数が少なすぎます（{n_races}件）。最低 {min_high_n}件以上必要です。\n'
+        report += f'> `--result_dir` で保存したJSONが {min_high_n}件以上になってから実行してください。\n'
+        result = dict(
+            best_params=current, best_score=None,
+            top_results=[], n_races=n_races,
+            report_md=report, current_params=current,
+        )
+        if out_json:
+            try:
+                _Path(out_json).write_text(
+                    __import__('json').dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+            except Exception:
+                pass
+        return result
+
+    # p_place_est の補完（_pct から計算）
+    if 'p_place_est' not in df.columns or df['p_place_est'].isna().all():
+        if 'p_place_est_pct' in df.columns:
+            df['p_place_est'] = df['p_place_est_pct'].apply(
+                lambda v: float(v) / 100.0 if pd.notna(v) else None)
+
+    # グリッドサーチ
+    top_results = _r42_grid_search(
+        df, grid_config=grid_config,
+        min_high_n=min_high_n,
+        w_high_hit=w_high_hit,
+        w_roi=w_roi,
+        w_low_skip=w_low_skip,
+        stake_per=stake_per,
+        verbose=verbose,
+    )
+
+    if not top_results:
+        report += '> ⚠️ 有効なパラメータ組み合わせが見つかりませんでした。\n'
+        report += f'> min_high_n={min_high_n} を下げて再試行してください。\n'
+        result = dict(
+            best_params=current, best_score=None,
+            top_results=[], n_races=n_races,
+            report_md=report, current_params=current,
+        )
+        if out_json:
+            try:
+                _Path(out_json).write_text(
+                    __import__('json').dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+            except Exception:
+                pass
+        return result
+
+    best = top_results[0]
+    best_params = best['params']
+
+    # — レポート生成 —
+    report += '## 現在のパラメータ\n\n'
+    report += '| パラメータ | 現在値 |\n|---|---:|\n'
+    report += f"| confidence_high_p_place_min | {current['confidence_high_p_place_min']:.2f} |\n"
+    report += f"| confidence_medium_p_place_min | {current['confidence_medium_p_place_min']:.2f} |\n"
+    report += f"| confidence_score_gap_min | {current['confidence_score_gap_min']:.1f} |\n"
+    report += f"| confidence_score_gap_medium | {current['confidence_score_gap_medium']:.1f} |\n\n"
+
+    report += '## 最適パラメータ（グリッドサーチ結果）\n\n'
+    report += '| パラメータ | 推奨値 | 変化 |\n|---|---:|---:|\n'
+    for k, v in best_params.items():
+        cur_v = current.get(k, 0.0)
+        delta = v - cur_v
+        delta_str = f'+{delta:.2f}' if delta >= 0 else f'{delta:.2f}'
+        arrow = '⬆️' if delta > 0.005 else ('⬇️' if delta < -0.005 else '→')
+        report += f'| {k} | **{v}** | {arrow} {delta_str} |\n'
+    report += '\n'
+
+    report += '## 評価指標\n\n'
+    report += f"- 複合スコア: **{best['composite_score']:.4f}**\n"
+    report += f"- HIGH件数: {best['high_n']}件（実績 {best.get('high_n_actual', '-')}件）\n"
+    report += f"- HIGH的中率: **{best['high_hit_rate']:.1f}%**\n"
+    report += f"- HIGH ROI: {best['high_roi_pct']:+.1f}%\n"
+    report += f"- LOWだが購入済み: {best.get('low_buy_n', 0)}件 ({best.get('low_buy_rate', 0):.1f}%)\n\n"
+
+    report += '## 上位10件の評価結果\n\n'
+    report += '| # | high_p | med_p | gap_H | gap_M | HIGH的中率 | HIGH ROI | 複合スコア |\n'
+    report += '|---|---:|---:|---:|---:|---:|---:|---:|\n'
+    for i, r in enumerate(top_results[:10], 1):
+        rp = r.get('params', {})
+        report += (f"| {i} "
+                   f"| {rp.get('confidence_high_p_place_min', '-'):.2f} "
+                   f"| {rp.get('confidence_medium_p_place_min', '-'):.2f} "
+                   f"| {rp.get('confidence_score_gap_min', '-'):.1f} "
+                   f"| {rp.get('confidence_score_gap_medium', '-'):.1f} "
+                   f"| {r.get('high_hit_rate', '-'):.1f}% "
+                   f"| {r.get('high_roi_pct', 0):+.1f}% "
+                   f"| {r['composite_score']:.4f} |\n")
+    report += '\n'
+
+    # params.json への適用方法
+    report += '## params.json への適用\n\n'
+    report += '```json\n'
+    report += '"place_rules": {\n'
+    for k, v in best_params.items():
+        report += f'  "{k}": {v},\n'
+    report += '}\n```\n\n'
+
+    report += '---\n'
+    report += f'- version: STELLA v1.18 confidence自動チューニング (R42)\n'
+    report += f'- source: `tune_confidence_params("{result_dir}")`\n'
+
+    if verbose:
+        print(report)
+
+    result = dict(
+        best_params=best_params,
+        best_score=best['composite_score'],
+        top_results=top_results[:10],
+        n_races=n_races,
+        report_md=report,
+        current_params=current,
+    )
+
+    # JSON保存
+    if out_json:
+        try:
+            import json as _json
+            _Path(out_json).write_text(
+                _json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+            if verbose:
+                print(f'[R42] tuning result saved -> {out_json}')
+        except Exception as _e:
+            if verbose:
+                print(f'[R42] save failed: {_e}')
+
+    return result
+
+
+
+# =========================
+# R43: ワイドROI最適化 (v1.19)
+# =========================
+
+def _r43_wide_roi_stats(
+    df: "pd.DataFrame",
+    stake_wide_per: float = 100.0,
+) -> dict:
+    """ワイドROI統計を計算する (R43)。
+
+    n_points別、confidence_level別、pace別の3軸でROIを集計する。
+
+    Parameters
+    ----------
+    df : DataFrame
+        _r41_load_results_df() の出力。place_ok==True のレースを対象とする。
+    stake_wide_per : float
+        1点あたりの賭け金（円）。デフォルト100円。
+    """
+    if df.empty:
+        return dict(by_npoints=[], by_confidence=[], by_pace=[], overall={})
+
+    sub = df[df['place_ok'] == True].copy()
+    if sub.empty:
+        return dict(by_npoints=[], by_confidence=[], by_pace=[], overall={})
+
+    def _compute_roi(rows, stake):
+        n = len(rows)
+        if n == 0:
+            return dict(n_races=0, n_hit=0, hit_rate_pct=0.0,
+                        invest=0.0, return_total=0.0, roi_pct=0.0,
+                        avg_payout=0.0, avg_npoints=0.0)
+        avg_npoints = float(rows['wide_num_count'].replace(0, 4).mean()) \
+            if 'wide_num_count' in rows.columns else 4.0
+        invest = n * avg_npoints * stake
+        wh = rows['wide_hit_count'].infer_objects(copy=False).fillna(0).astype(float)
+        hit_rows = (wh > 0)
+        n_hit = int(hit_rows.sum())
+        hit_rate = n_hit / n * 100.0 if n > 0 else 0.0
+        payouts = rows['payout_wide_max'].infer_objects(copy=False).fillna(0.0).astype(float)
+        ret_total = float((wh * payouts * (stake / 100.0)).sum())
+        roi = (ret_total - invest) / invest * 100.0 if invest > 0 else 0.0
+        avg_pay = payouts[hit_rows].mean() if n_hit > 0 else 0.0
+        return dict(
+            n_races=n, n_hit=n_hit,
+            hit_rate_pct=round(hit_rate, 1),
+            invest=round(invest, 0),
+            return_total=round(ret_total, 0),
+            roi_pct=round(roi, 1),
+            avg_payout=round(float(avg_pay), 0),
+            avg_npoints=round(avg_npoints, 1),
+        )
+
+    by_npoints = []
+    for np_val in sorted(sub['wide_num_count'].dropna().unique()):
+        grp = sub[sub['wide_num_count'] == np_val]
+        row = _compute_roi(grp, stake_wide_per)
+        row['wide_num_count'] = int(np_val)
+        by_npoints.append(row)
+
+    by_confidence = []
+    for cl in ['HIGH', 'MEDIUM', 'LOW', '']:
+        grp = sub[sub['confidence_level'] == cl] if cl != '' else sub[sub['confidence_level'].isin(['', None])]
+        if len(grp) == 0:
+            continue
+        row = _compute_roi(grp, stake_wide_per)
+        row['confidence_level'] = cl if cl else '(未設定)'
+        by_confidence.append(row)
+
+    by_pace = []
+    for pc in ['H', 'M', 'S', '']:
+        grp = sub[sub['pace'] == pc]
+        if len(grp) == 0:
+            continue
+        row = _compute_roi(grp, stake_wide_per)
+        row['pace'] = pc if pc else '(不明)'
+        by_pace.append(row)
+
+    overall = _compute_roi(sub, stake_wide_per)
+    return dict(by_npoints=by_npoints, by_confidence=by_confidence,
+                by_pace=by_pace, overall=overall)
+
+
+def _r43_simulate_wide_by_score(
+    scores_list: list,
+    anchor_num: str,
+    n: int = 4,
+    rank_by: str = 'AnchorScore',
+) -> list:
+    """スコアリストから仮想ワイドN点を選択する (R43)。
+
+    anchor_num を除いた馬を rank_by 降順でソートし、上位 n 頭を返す。
+    """
+    if not scores_list:
+        return []
+    try:
+        pool = [s for s in scores_list if str(s.get('num', '')) != str(anchor_num)]
+        key = rank_by if pool and rank_by in pool[0] else 'AnchorScore'
+        pool_sorted = sorted(pool, key=lambda s: float(s.get(key, 0) or 0), reverse=True)
+        return [str(s.get('num', '')) for s in pool_sorted[:n]]
+    except Exception:
+        return []
+
+
+def _r43_wide_strategy_grid(
+    df: "pd.DataFrame",
+    n_range: tuple = (2, 3, 4, 5, 6),
+    stake_per: float = 100.0,
+) -> list:
+    """n_points = 2〜6 それぞれの場合の仮想ROIを比較するグリッドを返す (R43)。"""
+    if df.empty or 'place_ok' not in df.columns:
+        return []
+    sub = df[df['place_ok'] == True].copy()
+    if sub.empty:
+        return []
+    results = []
+    for n in n_range:
+        n_races = len(sub)
+        invest = n_races * n * stake_per
+        wh = _pd52.to_numeric(sub['wide_hit_count'], errors='coerce').fillna(0.0)
+        payouts = _pd52.to_numeric(sub['payout_wide_max'], errors='coerce').fillna(0.0)
+        ret_total = float((wh * payouts * (stake_per / 100.0)).sum())
+        n_hit = int((wh > 0).sum())
+        roi = (ret_total - invest) / invest * 100.0 if invest > 0 else 0.0
+        hit_rate = n_hit / n_races * 100.0 if n_races > 0 else 0.0
+        results.append(dict(
+            n_points=n, n_races=n_races, n_hit=n_hit,
+            hit_rate_pct=round(hit_rate, 1),
+            invest=round(invest, 0),
+            return_total=round(ret_total, 0),
+            roi_pct=round(roi, 1),
+        ))
+    return results
+
+
+def _r43_wide_rank_optimize(
+    result_dir: str,
+    n_range: tuple = (2, 3, 4, 5, 6),
+    stake_per: float = 100.0,
+    rank_by: str = 'AnchorScore',
+) -> dict:
+    """スコアベースの仮想ワイド選択で最適ランクカットオフを分析する (R43)。"""
+    import json as _json
+    from pathlib import Path
+
+    try:
+        p = Path(result_dir)
+        files = sorted(p.glob('*.json')) if p.is_dir() else []
+    except Exception:
+        files = []
+
+    sim_records = []
+    for fp in files:
+        try:
+            obj = _json.loads(fp.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        pred = obj.get('prediction', {}) or {}
+        actual = obj.get('actual', {}) or {}
+        payouts = actual.get('payouts', {}) or {}
+        if not pred.get('place_ok', False):
+            continue
+        anchor_num = str(pred.get('anchor_num', '') or '')
+        scores_list = obj.get('scores', []) or []
+        wide_entries = payouts.get('wide', []) or []
+        wide_hit_pairs = set()
+        payout_by_pair = {}
+        for we in wide_entries:
+            nums_str = str(we.get('nums', we.get('num', '')) or '')
+            pay = float(we.get('payout', 0) or 0)
+            if nums_str:
+                wide_hit_pairs.add(nums_str)
+                payout_by_pair[nums_str] = pay
+        pay_max = max(payout_by_pair.values()) if payout_by_pair else 0.0
+        sim_records.append(dict(
+            anchor_num=anchor_num,
+            scores_list=scores_list,
+            wide_hit_pairs=wide_hit_pairs,
+            payout_wide_max=pay_max,
+            has_actual=(len(wide_entries) > 0 or bool(actual.get('rank_1st', ''))),
+        ))
+
+    if not sim_records:
+        return dict(by_npoints=[], rank_by=rank_by, n_races_loaded=0)
+
+    n_races_loaded = len(sim_records)
+    by_npoints = []
+    for n in n_range:
+        n_races = 0
+        n_hit = 0
+        invest = 0.0
+        ret_total = 0.0
+        for rec in sim_records:
+            sim_nums = _r43_simulate_wide_by_score(
+                rec['scores_list'], rec['anchor_num'], n=n, rank_by=rank_by)
+            if not sim_nums or not rec['anchor_num']:
+                continue
+            n_races += 1
+            invest += n * stake_per
+            anchor = rec['anchor_num']
+            sim_hit_count = 0
+            for opp in sim_nums:
+                pair_a = '{}-{}'.format(min(anchor, opp), max(anchor, opp))
+                pair_b = '{}-{}'.format(max(anchor, opp), min(anchor, opp))
+                if pair_a in rec['wide_hit_pairs'] or pair_b in rec['wide_hit_pairs']:
+                    sim_hit_count += 1
+            if sim_hit_count > 0:
+                n_hit += 1
+                ret_total += rec['payout_wide_max'] * (stake_per / 100.0)
+        roi = (ret_total - invest) / invest * 100.0 if invest > 0 else 0.0
+        hit_rate = n_hit / n_races * 100.0 if n_races > 0 else 0.0
+        by_npoints.append(dict(
+            n_points=n, n_races=n_races, n_hit=n_hit,
+            hit_rate_pct=round(hit_rate, 1),
+            invest=round(invest, 0),
+            return_total=round(ret_total, 0),
+            roi_pct=round(roi, 1),
+            rank_by=rank_by,
+        ))
+    return dict(by_npoints=by_npoints, rank_by=rank_by, n_races_loaded=n_races_loaded)
+
+
+def analyze_wide_roi(
+    result_dir: str,
+    params: Optional[dict] = None,
+    stake_wide_per: float = 100.0,
+    out_md: Optional[str] = None,
+    verbose: bool = False,
+) -> dict:
+    """ワイドROI最適化分析のメインドライバー（R43）。
+
+    result_dir の JSON を読み込み、以下の分析を実行してMarkdownレポートを生成する:
+      1. 実績ワイドROI統計（n_points別 / confidence別 / pace別）
+      2. n_points戦略グリッド（2〜6点の試算比較）
+      3. スコアベース仮想選択のROI（AnchorScore / SAS / p_place_est_pctで比較）
+      4. 最適推奨設定の提案
+    """
+    _params = params or {}
+    df = _r41_load_results_df(result_dir)
+    n_total = len(df)
+    n_place_ok = int((df['place_ok'] == True).sum()) if not df.empty else 0
+    if verbose:
+        print('[R43] ロード: {}レース, place_ok={}'.format(n_total, n_place_ok))
+
+    roi_stats = _r43_wide_roi_stats(df, stake_wide_per=stake_wide_per)
+    strategy_grid = _r43_wide_strategy_grid(df, n_range=(2, 3, 4, 5, 6), stake_per=stake_wide_per)
+    rank_opt_anchor = _r43_wide_rank_optimize(
+        result_dir, n_range=(2, 3, 4, 5, 6), stake_per=stake_wide_per, rank_by='AnchorScore')
+    rank_opt_sas = _r43_wide_rank_optimize(
+        result_dir, n_range=(2, 3, 4, 5, 6), stake_per=stake_wide_per, rank_by='SAS')
+    rank_opt_pplace = _r43_wide_rank_optimize(
+        result_dir, n_range=(2, 3, 4, 5, 6), stake_per=stake_wide_per, rank_by='p_place_est_pct')
+
+    best_n_points = 4
+    best_rank_by = 'AnchorScore'
+    best_grid_row = {}
+
+    valid_grid = [r for r in strategy_grid if r.get('n_races', 0) >= 3]
+    if valid_grid:
+        best_grid_row = max(valid_grid, key=lambda r: r.get('roi_pct', -999))
+        best_n_points = best_grid_row.get('n_points', 4)
+
+    def _best_roi_for_opt(opt_result, n):
+        for row in opt_result.get('by_npoints', []):
+            if row.get('n_points') == n and row.get('n_races', 0) >= 3:
+                return row.get('roi_pct', -999)
+        return -999.0
+
+    roi_anchor = _best_roi_for_opt(rank_opt_anchor, best_n_points)
+    roi_sas = _best_roi_for_opt(rank_opt_sas, best_n_points)
+    roi_pplace = _best_roi_for_opt(rank_opt_pplace, best_n_points)
+    rank_compare = [('AnchorScore', roi_anchor), ('SAS', roi_sas), ('p_place_est_pct', roi_pplace)]
+    best_rank_by = max(rank_compare, key=lambda x: x[1])[0]
+
+    # --- Markdownレポート生成 ---
+    NL = '\n'
+    NL2 = '\n\n'
+    lines_md = []
+    lines_md.append('# STELLA v1.19 ワイドROI最適化レポート (R43)' + NL2)
+    lines_md.append('- 対象ディレクトリ: `{}``'.format(result_dir) + NL)
+    lines_md.append('- 総レース数: {} (place_ok={})'.format(n_total, n_place_ok) + NL)
+    lines_md.append('- 1点あたり賭け金: {}円'.format(int(stake_wide_per)) + NL2)
+
+    # セクション1: 全体ROI
+    ov = roi_stats.get('overall', {})
+    lines_md.append('## 1. 実績ワイド ROI サマリー' + NL2)
+    if ov:
+        lines_md.append('| 項目 | 値 |' + NL)
+        lines_md.append('|---|---|' + NL)
+        lines_md.append('| 対象レース数 | {} |'.format(ov.get('n_races', 0)) + NL)
+        lines_md.append('| ヒットレース数 | {} |'.format(ov.get('n_hit', 0)) + NL)
+        lines_md.append('| ヒット率 | {}% |'.format(ov.get('hit_rate_pct', 0.0)) + NL)
+        lines_md.append('| 平均点数 | {} |'.format(ov.get('avg_npoints', 0.0)) + NL)
+        lines_md.append('| 投資額合計 | {}円 |'.format(int(ov.get('invest', 0))) + NL)
+        lines_md.append('| 回収額合計 | {}円 |'.format(int(ov.get('return_total', 0))) + NL)
+        lines_md.append('| ROI | **{}%** |'.format(ov.get('roi_pct', 0.0)) + NL)
+        lines_md.append('| 平均払戻（ヒット時） | {}円 |'.format(int(ov.get('avg_payout', 0))) + NL2)
+    else:
+        lines_md.append('_データなし_' + NL2)
+
+    # セクション2: confidence_level別
+    lines_md.append('## 2. 信頼度別ワイドROI' + NL2)
+    bc = roi_stats.get('by_confidence', [])
+    if bc:
+        lines_md.append('| 信頼度 | レース数 | ヒット率 | ROI | 平均払戻 |' + NL)
+        lines_md.append('|---|---|---|---|---|' + NL)
+        for row in bc:
+            lines_md.append('| {} | {} | {}% | {}% | {}円 |'.format(
+                row.get('confidence_level', '?'),
+                row.get('n_races', 0),
+                row.get('hit_rate_pct', 0.0),
+                row.get('roi_pct', 0.0),
+                int(row.get('avg_payout', 0)),
+            ) + NL)
+        lines_md.append(NL)
+    else:
+        lines_md.append('_データなし_' + NL2)
+
+    # セクション3: pace別
+    lines_md.append('## 3. ペース別ワイドROI' + NL2)
+    bp = roi_stats.get('by_pace', [])
+    if bp:
+        lines_md.append('| ペース | レース数 | ヒット率 | ROI |' + NL)
+        lines_md.append('|---|---|---|---|' + NL)
+        for row in bp:
+            lines_md.append('| {} | {} | {}% | {}% |'.format(
+                row.get('pace', '?'),
+                row.get('n_races', 0),
+                row.get('hit_rate_pct', 0.0),
+                row.get('roi_pct', 0.0),
+            ) + NL)
+        lines_md.append(NL)
+    else:
+        lines_md.append('_データなし_' + NL2)
+
+    # セクション4: n_points戦略グリッド
+    lines_md.append('## 4. n_points 戦略グリッド（2〜6点試算）' + NL2)
+    lines_md.append('_実際の的中データを使い、仮に N 点買っていた場合のROIを試算。_' + NL2)
+    if strategy_grid:
+        lines_md.append('| n点 | レース数 | ヒット数 | ヒット率 | 投資額 | 回収額 | ROI |' + NL)
+        lines_md.append('|---|---|---|---|---|---|---|' + NL)
+        for row in strategy_grid:
+            best_mark = ' ★' if row.get('n_points') == best_n_points else ''
+            lines_md.append('| {}{} | {} | {} | {}% | {}円 | {}円 | {}% |'.format(
+                row.get('n_points', 0), best_mark,
+                row.get('n_races', 0),
+                row.get('n_hit', 0),
+                row.get('hit_rate_pct', 0.0),
+                int(row.get('invest', 0)),
+                int(row.get('return_total', 0)),
+                row.get('roi_pct', 0.0),
+            ) + NL)
+        lines_md.append(NL)
+        lines_md.append('★ = 推奨 n_points: **{}点**'.format(best_n_points) + NL2)
+    else:
+        lines_md.append('_データなし_' + NL2)
+
+    # セクション5: スコア別仮想選択ROI比較
+    lines_md.append('## 5. スコア別仮想選択 ROI 比較' + NL2)
+    lines_md.append('_スコアリストから仮想N点を選択し、ワイド払戻と照合した試算。_' + NL2)
+
+    def _opt_table(opt, label):
+        rows = opt.get('by_npoints', [])
+        if not rows:
+            return '**{}**: データなし'.format(label) + NL2
+        t = '**{}** (ロード={}レース)'.format(label, opt.get('n_races_loaded', 0)) + NL2
+        t += '| n点 | レース数 | ヒット数 | ヒット率 | ROI |' + NL
+        t += '|---|---|---|---|---|' + NL
+        for row in rows:
+            best_mark = ' ★' if (row.get('n_points') == best_n_points and label == best_rank_by) else ''
+            t += '| {}{} | {} | {} | {}% | {}% |'.format(
+                row.get('n_points', 0), best_mark,
+                row.get('n_races', 0),
+                row.get('n_hit', 0),
+                row.get('hit_rate_pct', 0.0),
+                row.get('roi_pct', 0.0),
+            ) + NL
+        t += NL
+        return t
+
+    lines_md.append(_opt_table(rank_opt_anchor, 'AnchorScore'))
+    lines_md.append(_opt_table(rank_opt_sas, 'SAS'))
+    lines_md.append(_opt_table(rank_opt_pplace, 'p_place_est_pct'))
+
+    # セクション6: 推奨設定
+    lines_md.append('## 6. 推奨設定' + NL2)
+    lines_md.append('| 設定項目 | 推奨値 | 理由 |' + NL)
+    lines_md.append('|---|---|---|' + NL)
+    best_grid_roi = best_grid_row.get('roi_pct', 0.0) if valid_grid else 'N/A'
+    lines_md.append('| ワイド点数 (n_points) | **{}点** | 戦略グリッドで最高ROI ({}%) |'.format(
+        best_n_points, best_grid_roi) + NL)
+    lines_md.append('| 馬選択スコア (rank_by) | **{}** | 仮想選択ROIで最高 ({:.1f}%) |'.format(
+        best_rank_by, max(roi_anchor, roi_sas, roi_pplace)) + NL2)
+
+    lines_md.append('---' + NL)
+    lines_md.append('- version: STELLA v1.19 ワイドROI最適化 (R43)' + NL)
+    lines_md.append('- source: `analyze_wide_roi("{}")`'.format(result_dir) + NL)
+
+    md = ''.join(lines_md)
+
+    if verbose:
+        print(md)
+
+    if out_md:
+        try:
+            from pathlib import Path as _Path43
+            _Path43(out_md).parent.mkdir(parents=True, exist_ok=True)
+            _Path43(out_md).write_text(md, encoding='utf-8')
+            if verbose:
+                print('[R43] saved -> {}'.format(out_md))
+        except Exception as _e:
+            if verbose:
+                print('[R43] save failed: {}'.format(_e))
+
+    return dict(
+        report_md=md,
+        roi_stats=roi_stats,
+        strategy_grid=strategy_grid,
+        rank_optimize=rank_opt_anchor,
+        n_races=n_place_ok,
+        best_n_points=best_n_points,
+        best_rank_by=best_rank_by,
+    )
+
+
+
+# =========================
+# R44: 三連複ROI最適化 (v1.20)
+# =========================
+# =========================
+# R44: 三連複ROI最適化 (v1.20)
+# =========================
+
+def _r44_trio_roi_stats(
+    df: "pd.DataFrame",
+    stake_trio_per: float = 100.0,
+) -> dict:
+    """三連複ROI統計を計算する (R44)。
+
+    confidence_level別、pace別、trio_form_points帯別の3軸で集計する。
+    """
+    if df.empty or 'trio_hit' not in df.columns:
+        return dict(by_confidence=[], by_pace=[], by_points_band=[], overall={})
+
+    if 'place_ok' not in df.columns:
+        return dict(by_confidence=[], by_pace=[], by_points_band=[], overall={})
+
+    sub = df[df['place_ok'] == True].copy()
+    if sub.empty:
+        return dict(by_confidence=[], by_pace=[], by_points_band=[], overall={})
+
+    def _roi(rows, stake):
+        n = len(rows)
+        if n == 0:
+            return dict(n_races=0, n_hit=0, hit_rate_pct=0.0,
+                        invest=0.0, return_total=0.0, roi_pct=0.0,
+                        avg_payout=0.0, avg_points=0.0)
+        pts_col = rows['trio_form_points'].fillna(0) if 'trio_form_points' in rows.columns else pd.Series([10]*n)
+        avg_pts = float(pts_col.replace(0, 10).mean())
+        invest = n * avg_pts * stake
+        hit_mask = rows['trio_hit'].infer_objects(copy=False).fillna(False).astype(bool)
+        n_hit = int(hit_mask.sum())
+        hit_rate = n_hit / n * 100.0
+        payouts = rows['payout_sanrenpuku'].infer_objects(copy=False).fillna(0.0).astype(float) if 'payout_sanrenpuku' in rows.columns else pd.Series([0.0]*n)
+        ret_total = float((payouts * hit_mask.astype(float) * (stake / 100.0)).sum())
+        roi = (ret_total - invest) / invest * 100.0 if invest > 0 else 0.0
+        avg_pay = float(payouts[hit_mask].mean()) if n_hit > 0 else 0.0
+        return dict(
+            n_races=n, n_hit=n_hit,
+            hit_rate_pct=round(hit_rate, 1),
+            invest=round(invest, 0),
+            return_total=round(ret_total, 0),
+            roi_pct=round(roi, 1),
+            avg_payout=round(avg_pay, 0),
+            avg_points=round(avg_pts, 1),
+        )
+
+    by_confidence = []
+    for cl in ['HIGH', 'MEDIUM', 'LOW', '']:
+        grp = sub[sub['confidence_level'] == cl] if cl else sub[sub['confidence_level'].isin(['', None])]
+        if len(grp) == 0:
+            continue
+        row = _roi(grp, stake_trio_per)
+        row['confidence_level'] = cl if cl else '(未設定)'
+        by_confidence.append(row)
+
+    by_pace = []
+    for pc in ['H', 'M', 'S', '']:
+        grp = sub[sub['pace'] == pc]
+        if len(grp) == 0:
+            continue
+        row = _roi(grp, stake_trio_per)
+        row['pace'] = pc if pc else '(不明)'
+        by_pace.append(row)
+
+    by_points_band = []
+    bands = [('3〜10点', 3, 10), ('11〜20点', 11, 20), ('21〜30点', 21, 30)]
+    for label, lo, hi in bands:
+        if 'trio_form_points' not in sub.columns:
+            break
+        pts = sub['trio_form_points'].infer_objects(copy=False).fillna(0).astype(int)
+        grp = sub[(pts >= lo) & (pts <= hi)]
+        if len(grp) == 0:
+            continue
+        row = _roi(grp, stake_trio_per)
+        row['points_band'] = label
+        by_points_band.append(row)
+
+    overall = _roi(sub, stake_trio_per)
+    return dict(
+        by_confidence=by_confidence,
+        by_pace=by_pace,
+        by_points_band=by_points_band,
+        overall=overall,
+    )
+
+
+def _r44_trio_points_grid(
+    df: "pd.DataFrame",
+    stake_per: float = 100.0,
+) -> list:
+    """点数上限 X 点以下のレースのみ購入した場合のROI試算グリッド (R44)。"""
+    if df.empty or 'place_ok' not in df.columns:
+        return []
+    sub = df[df['place_ok'] == True].copy()
+    if sub.empty or 'trio_form_points' not in sub.columns:
+        return []
+
+    results = []
+    for max_pts in [5, 8, 10, 12, 15, 18, 20, 25, 30, 9999]:
+        label = '{}点以下'.format(max_pts) if max_pts < 9999 else '制限なし'
+        pts = sub['trio_form_points'].infer_objects(copy=False).fillna(0).astype(int)
+        grp = sub[pts <= max_pts]
+        n = len(grp)
+        if n == 0:
+            continue
+        avg_pts = float(grp['trio_form_points'].fillna(10).replace(0, 10).mean())
+        invest = n * avg_pts * stake_per
+        hit_mask = grp['trio_hit'].infer_objects(copy=False).fillna(False).astype(bool) if 'trio_hit' in grp.columns else pd.Series([False]*n)
+        n_hit = int(hit_mask.sum())
+        payouts = grp['payout_sanrenpuku'].infer_objects(copy=False).fillna(0.0).astype(float) if 'payout_sanrenpuku' in grp.columns else pd.Series([0.0]*n)
+        ret_total = float((payouts * hit_mask.astype(float) * (stake_per / 100.0)).sum())
+        roi = (ret_total - invest) / invest * 100.0 if invest > 0 else 0.0
+        hit_rate = n_hit / n * 100.0
+        results.append(dict(
+            max_points=max_pts,
+            label=label,
+            n_races=n,
+            n_hit=n_hit,
+            hit_rate_pct=round(hit_rate, 1),
+            avg_points=round(avg_pts, 1),
+            invest=round(invest, 0),
+            return_total=round(ret_total, 0),
+            roi_pct=round(roi, 1),
+        ))
+    return results
+
+
+def _r44_trio_hit_analysis(result_dir: str) -> dict:
+    """三連複の的中パターンを詳細分析する (R44)。
+
+    JSONを直接読み込み、アンカー着順別的中率・払戻分布を集計する。
+    """
+    import json as _json
+    from pathlib import Path
+
+    try:
+        files = sorted(Path(result_dir).glob('*.json')) if Path(result_dir).is_dir() else []
+    except Exception:
+        files = []
+
+    anchor_rank_hits = {1: 0, 2: 0, 3: 0, 'out': 0}
+    anchor_rank_races = {1: 0, 2: 0, 3: 0, 'out': 0}
+    payout_buckets = {
+        '〜1000': 0, '1001〜2000': 0, '2001〜5000': 0,
+        '5001〜10000': 0, '10001〜': 0,
+    }
+    n_loaded = 0
+    n_place_ok = 0
+    n_trio_hit = 0
+
+    for fp in files:
+        try:
+            obj = _json.loads(fp.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        pred = obj.get('prediction', {}) or {}
+        actual = obj.get('actual', {}) or {}
+        if not pred.get('place_ok', False):
+            continue
+        n_loaded += 1
+        n_place_ok += 1
+
+        try:
+            ar = int(actual.get('anchor_rank', 0) or 0)
+        except Exception:
+            ar = 0
+        rank_key = ar if ar in (1, 2, 3) else 'out'
+
+        trio_hit = bool(actual.get('trio_hit', False) or False)
+        if trio_hit:
+            n_trio_hit += 1
+            sren = (actual.get('payouts', {}) or {}).get('sanrenpuku', []) or []
+            pay = 0.0
+            if sren:
+                try:
+                    pay = float(sren[0].get('payout', 0) or 0)
+                except Exception:
+                    pay = 0.0
+            if pay <= 1000:
+                payout_buckets['〜1000'] += 1
+            elif pay <= 2000:
+                payout_buckets['1001〜2000'] += 1
+            elif pay <= 5000:
+                payout_buckets['2001〜5000'] += 1
+            elif pay <= 10000:
+                payout_buckets['5001〜10000'] += 1
+            else:
+                payout_buckets['10001〜'] += 1
+
+        if rank_key in anchor_rank_races:
+            anchor_rank_races[rank_key] += 1
+            if trio_hit:
+                anchor_rank_hits[rank_key] += 1
+
+    hit_rate_by_rank = []
+    rank_labels = {1: '1着', 2: '2着', 3: '3着', 'out': '圏外'}
+    for rk, label in rank_labels.items():
+        n_r = anchor_rank_races.get(rk, 0)
+        n_h = anchor_rank_hits.get(rk, 0)
+        if n_r == 0:
+            continue
+        hit_rate_by_rank.append(dict(
+            anchor_rank=label,
+            n_races=n_r,
+            n_hit=n_h,
+            hit_rate_pct=round(n_h / n_r * 100.0, 1),
+        ))
+
+    payout_dist = [dict(band=k, n_hit=v) for k, v in payout_buckets.items() if v > 0]
+
+    return dict(
+        hit_rate_by_anchor_rank=hit_rate_by_rank,
+        payout_dist=payout_dist,
+        n_races_loaded=n_loaded,
+        n_trio_hit=n_trio_hit,
+        overall_hit_rate_pct=round(n_trio_hit / n_place_ok * 100.0, 1) if n_place_ok > 0 else 0.0,
+    )
+
+
+def _r44_trio_cost_benefit(
+    df: "pd.DataFrame",
+    stake_per: float = 100.0,
+) -> dict:
+    """三連複の損益分岐点 (BEP) 分析 (R44)。"""
+    if df.empty or 'place_ok' not in df.columns:
+        return dict(n_races=0, current_roi_pct=0.0, break_even_payout=0.0,
+                    current_avg_payout=0.0, recommendation='データなし',
+                    max_points_for_bep=0, hit_rate_pct=0.0, avg_points=0.0)
+
+    sub = df[df['place_ok'] == True].copy()
+    if sub.empty or 'trio_hit' not in sub.columns:
+        return dict(n_races=0, current_roi_pct=0.0, break_even_payout=0.0,
+                    current_avg_payout=0.0, recommendation='データなし',
+                    max_points_for_bep=0, hit_rate_pct=0.0, avg_points=0.0)
+
+    n = len(sub)
+    pts_col = sub['trio_form_points'].fillna(0) if 'trio_form_points' in sub.columns else pd.Series([10]*n)
+    avg_pts = float(pts_col.replace(0, 10).mean())
+    invest_per_race = avg_pts * stake_per
+    invest_total = n * invest_per_race
+
+    hit_mask = sub['trio_hit'].map(lambda _x: bool(_x) if _x is not None else False)
+    n_hit = int(hit_mask.sum())
+    hit_rate = n_hit / n if n > 0 else 0.0
+
+    payouts = _pd52.to_numeric(sub['payout_sanrenpuku'], errors='coerce').fillna(0.0) if 'payout_sanrenpuku' in sub.columns else pd.Series([0.0]*n)
+    ret_total = float((payouts * hit_mask.astype(float) * (stake_per / 100.0)).sum())
+    roi = (ret_total - invest_total) / invest_total * 100.0 if invest_total > 0 else 0.0
+    avg_pay = float(payouts[hit_mask].mean()) if n_hit > 0 else 0.0
+
+    bep_pay = (invest_per_race / hit_rate / (stake_per / 100.0)) if hit_rate > 0 else 0.0
+    max_pts_bep = int(avg_pay * hit_rate / 100.0) if hit_rate > 0 and avg_pay > 0 else 0
+
+    if roi >= 0:
+        rec = 'ROI正: 現在の設定は収益見込みあり。高信頼度レースに絞るとさらに改善の余地。'
+    elif roi >= -30:
+        rec = 'ROI微損: 点数削減（HIGH + 少点数）で損益分岐達成の可能性あり。'
+    else:
+        rec = 'ROI大損: 三連複の点数・対象レースを大幅に絞り込む必要あり。HIGH限定推奨。'
+
+    return dict(
+        n_races=n, n_hit=n_hit,
+        hit_rate_pct=round(hit_rate * 100.0, 1),
+        current_roi_pct=round(roi, 1),
+        break_even_payout=round(bep_pay, 0),
+        current_avg_payout=round(avg_pay, 0),
+        avg_points=round(avg_pts, 1),
+        max_points_for_bep=max_pts_bep,
+        recommendation=rec,
+    )
+
+
+def analyze_trio_roi(
+    result_dir: str,
+    params: Optional[dict] = None,
+    stake_trio_per: float = 100.0,
+    out_md: Optional[str] = None,
+    verbose: bool = False,
+) -> dict:
+    """三連複ROI最適化分析のメインドライバー (R44)。
+
+    7セクションのMarkdownレポートを生成する:
+      1. 三連複実績ROIサマリー
+      2. 信頼度別ROI
+      3. ペース別ROI
+      4. 点数帯別ROI（3〜10/11〜20/21〜30点）
+      5. 点数上限フィルター試算グリッド
+      6. 的中パターン分析（アンカー着順・配当帯分布）
+      7. コスト・損益分岐点分析 + 推奨設定
+    """
+    _params = params or {}
+    df = _r41_load_results_df(result_dir)
+    n_total = len(df)
+    n_place_ok = int((df['place_ok'] == True).sum()) if not df.empty else 0
+
+    if verbose:
+        print('[R44] ロード: {}レース, place_ok={}'.format(n_total, n_place_ok))
+
+    roi_stats = _r44_trio_roi_stats(df, stake_trio_per=stake_trio_per)
+    points_grid = _r44_trio_points_grid(df, stake_per=stake_trio_per)
+    hit_analysis = _r44_trio_hit_analysis(result_dir)
+    cost_benefit = _r44_trio_cost_benefit(df, stake_per=stake_trio_per)
+
+    best_max_points = 10
+    valid_grid = [r for r in points_grid if r.get('n_races', 0) >= 3]
+    if valid_grid:
+        best_row = max(valid_grid, key=lambda r: r.get('roi_pct', -999))
+        best_max_points = best_row.get('max_points', 10)
+
+    NL = '\n'
+    NL2 = '\n\n'
+    md = []
+    md.append('# STELLA v1.33 三連複ROI最適化レポート (R44)' + NL2)
+    md.append('- 対象ディレクトリ: `{}`'.format(result_dir) + NL)
+    md.append('- 総レース数: {} (place_ok={})'.format(n_total, n_place_ok) + NL)
+    md.append('- 1点あたり賭け金: {}円'.format(int(stake_trio_per)) + NL2)
+
+    ov = roi_stats.get('overall', {})
+    md.append('## 1. 三連複 実績ROI サマリー' + NL2)
+    if ov and ov.get('n_races', 0) > 0:
+        md.append('| 項目 | 値 |' + NL)
+        md.append('|---|---|' + NL)
+        md.append('| 対象レース数 | {} |'.format(ov.get('n_races', 0)) + NL)
+        md.append('| 的中レース数 | {} |'.format(ov.get('n_hit', 0)) + NL)
+        md.append('| 的中率 | {}% |'.format(ov.get('hit_rate_pct', 0.0)) + NL)
+        md.append('| 平均点数 | {} |'.format(ov.get('avg_points', 0.0)) + NL)
+        md.append('| 投資額合計 | {}円 |'.format(int(ov.get('invest', 0))) + NL)
+        md.append('| 回収額合計 | {}円 |'.format(int(ov.get('return_total', 0))) + NL)
+        md.append('| ROI | **{}%** |'.format(ov.get('roi_pct', 0.0)) + NL)
+        md.append('| 平均払戻（的中時） | {}円 |'.format(int(ov.get('avg_payout', 0))) + NL2)
+    else:
+        md.append('_データなし（三連複結果が記録されていません）_' + NL2)
+
+    md.append('## 2. 信頼度別 三連複ROI' + NL2)
+    bc = roi_stats.get('by_confidence', [])
+    if bc:
+        md.append('| 信頼度 | レース数 | 的中数 | 的中率 | 平均点数 | ROI |' + NL)
+        md.append('|---|---|---|---|---|---|' + NL)
+        for row in bc:
+            md.append('| {} | {} | {} | {}% | {} | {}% |'.format(
+                row.get('confidence_level', '?'), row.get('n_races', 0),
+                row.get('n_hit', 0), row.get('hit_rate_pct', 0.0),
+                row.get('avg_points', 0.0), row.get('roi_pct', 0.0),
+            ) + NL)
+        md.append(NL)
+    else:
+        md.append('_データなし_' + NL2)
+
+    md.append('## 3. ペース別 三連複ROI' + NL2)
+    bp = roi_stats.get('by_pace', [])
+    if bp:
+        md.append('| ペース | レース数 | 的中率 | ROI |' + NL)
+        md.append('|---|---|---|---|' + NL)
+        for row in bp:
+            md.append('| {} | {} | {}% | {}% |'.format(
+                row.get('pace', '?'), row.get('n_races', 0),
+                row.get('hit_rate_pct', 0.0), row.get('roi_pct', 0.0),
+            ) + NL)
+        md.append(NL)
+    else:
+        md.append('_データなし_' + NL2)
+
+    md.append('## 4. 点数帯別 三連複ROI' + NL2)
+    bpb = roi_stats.get('by_points_band', [])
+    if bpb:
+        md.append('| 点数帯 | レース数 | 的中率 | ROI |' + NL)
+        md.append('|---|---|---|---|' + NL)
+        for row in bpb:
+            md.append('| {} | {} | {}% | {}% |'.format(
+                row.get('points_band', '?'), row.get('n_races', 0),
+                row.get('hit_rate_pct', 0.0), row.get('roi_pct', 0.0),
+            ) + NL)
+        md.append(NL)
+    else:
+        md.append('_データなし_' + NL2)
+
+    md.append('## 5. 点数上限フィルター試算グリッド' + NL2)
+    md.append('_X 点以下のレースのみ購入した場合の試算。_' + NL2)
+    if points_grid:
+        md.append('| 上限点数 | レース数 | 的中数 | 的中率 | 平均点数 | ROI |' + NL)
+        md.append('|---|---|---|---|---|---|' + NL)
+        for row in points_grid:
+            best_mark = ' ★' if row.get('max_points') == best_max_points else ''
+            md.append('| {}{} | {} | {} | {}% | {} | {}% |'.format(
+                row.get('label', '?'), best_mark,
+                row.get('n_races', 0), row.get('n_hit', 0),
+                row.get('hit_rate_pct', 0.0), row.get('avg_points', 0.0),
+                row.get('roi_pct', 0.0),
+            ) + NL)
+        md.append(NL)
+        best_label = '{}点以下'.format(best_max_points) if best_max_points < 9999 else '制限なし'
+        md.append('★ = 推奨上限点数: **{}**'.format(best_label) + NL2)
+    else:
+        md.append('_データなし_' + NL2)
+
+    md.append('## 6. 的中パターン分析' + NL2)
+    ha = hit_analysis
+    if ha.get('n_races_loaded', 0) > 0:
+        rr = ha.get('hit_rate_by_anchor_rank', [])
+        if rr:
+            md.append('**アンカー着順別 的中率**' + NL2)
+            md.append('| アンカー着順 | レース数 | 的中数 | 的中率 |' + NL)
+            md.append('|---|---|---|---|' + NL)
+            for row in rr:
+                md.append('| {} | {} | {} | {}% |'.format(
+                    row.get('anchor_rank', '?'), row.get('n_races', 0),
+                    row.get('n_hit', 0), row.get('hit_rate_pct', 0.0),
+                ) + NL)
+            md.append(NL)
+        pd_rows = ha.get('payout_dist', [])
+        if pd_rows:
+            md.append('**三連複払戻帯域分布（的中レースのみ）**' + NL2)
+            md.append('| 払戻帯域 | 件数 |' + NL)
+            md.append('|---|---|' + NL)
+            for row in pd_rows:
+                md.append('| {}円 | {} |'.format(row.get('band', '?'), row.get('n_hit', 0)) + NL)
+            md.append(NL)
+    else:
+        md.append('_データなし_' + NL2)
+
+    md.append('## 7. 損益分岐点分析 & 推奨設定' + NL2)
+    cb = cost_benefit
+    if cb.get('n_races', 0) > 0:
+        md.append('| 分析項目 | 値 |' + NL)
+        md.append('|---|---|' + NL)
+        md.append('| 現在のROI | {}% |'.format(cb.get('current_roi_pct', 0.0)) + NL)
+        md.append('| 現在の的中率 | {}% |'.format(cb.get('hit_rate_pct', 0.0)) + NL)
+        md.append('| 平均払戻（的中時） | {}円 |'.format(int(cb.get('current_avg_payout', 0))) + NL)
+        md.append('| 平均点数 | {} |'.format(cb.get('avg_points', 0.0)) + NL)
+        md.append('| 損益分岐点 払戻 | {}円 |'.format(int(cb.get('break_even_payout', 0))) + NL)
+        md.append('| 損益分岐 max_points（理論） | {}点 |'.format(cb.get('max_points_for_bep', 0)) + NL2)
+        md.append('**推奨**: {}'.format(cb.get('recommendation', '')) + NL2)
+        best_label = '{}点以下'.format(best_max_points) if best_max_points < 9999 else '制限なし'
+        md.append('| 推奨設定 | 値 |' + NL)
+        md.append('|---|---|' + NL)
+        md.append('| trio_formation_max_points | **{}** |'.format(best_label) + NL)
+        md.append('| 対象 confidence_level | **HIGH優先** |' + NL2)
+    else:
+        md.append('_データなし_' + NL2)
+
+    md.append('---' + NL)
+    md.append('- version: STELLA v1.33 三連複ROI最適化 (R44)' + NL)
+    md.append('- source: `analyze_trio_roi("{}")`'.format(result_dir) + NL)
+
+    report_md = ''.join(md)
+    if verbose:
+        print(report_md)
+
+    if out_md:
+        try:
+            from pathlib import Path as _Path44
+            _Path44(out_md).parent.mkdir(parents=True, exist_ok=True)
+            _Path44(out_md).write_text(report_md, encoding='utf-8')
+            if verbose:
+                print('[R44] saved -> {}'.format(out_md))
+        except Exception as _e:
+            if verbose:
+                print('[R44] save failed: {}'.format(_e))
+
+    return dict(
+        report_md=report_md,
+        roi_stats=roi_stats,
+        points_grid=points_grid,
+        hit_analysis=hit_analysis,
+        cost_benefit=cost_benefit,
+        n_races=n_place_ok,
+        best_max_points=best_max_points,
+    )
+
+
+
+# =========================
+# R45: 総合ダッシュボードレポート (v1.21)
+# =========================
+
+def _r45_exec_all_analyses(result_dir: str, params: dict,
+                           stake_place: float = 1000.0,
+                           stake_wide: float = 100.0,
+                           stake_trio: float = 100.0,
+                           verbose: bool = False) -> dict:
+    """R41/R42/R43/R44を順次実行し結果をまとめて返す。"""
+    results = {}
+
+    # --- R41: 事後分析 ---
+    try:
+        r41 = analyze_race_results(
+            result_dir=result_dir,
+            params=params,
+            stake_place=stake_place,
+            out_md=None,
+            verbose=False,
+        )
+        results['r41'] = {'report_md': r41, 'ok': True}
+        if verbose:
+            print('[R45] R41 analyze_race_results: OK')
+    except Exception as e:
+        results['r41'] = {'ok': False, 'error': str(e)}
+        if verbose:
+            print('[R45] R41 failed: {}'.format(e))
+
+    # --- R42: Confidenceチューニング ---
+    try:
+        r42 = tune_confidence_params(
+            result_dir=result_dir,
+            params=params,
+            min_high_n=3,
+            out_json=None,
+            verbose=False,
+        )
+        results['r42'] = {'data': r42, 'ok': True}
+        if verbose:
+            print('[R45] R42 tune_confidence_params: OK')
+    except Exception as e:
+        results['r42'] = {'ok': False, 'error': str(e)}
+        if verbose:
+            print('[R45] R42 failed: {}'.format(e))
+
+    # --- R43: ワイドROI最適化 ---
+    try:
+        r43 = analyze_wide_roi(
+            result_dir=result_dir,
+            params=params,
+            stake_wide_per=stake_wide,
+            out_md=None,
+            verbose=False,
+        )
+        results['r43'] = {'data': r43, 'ok': True}
+        if verbose:
+            print('[R45] R43 analyze_wide_roi: OK')
+    except Exception as e:
+        results['r43'] = {'ok': False, 'error': str(e)}
+        if verbose:
+            print('[R45] R43 failed: {}'.format(e))
+
+    # --- R44: 三連複ROI最適化 ---
+    try:
+        r44 = analyze_trio_roi(
+            result_dir=result_dir,
+            params=params,
+            stake_trio_per=stake_trio,
+            out_md=None,
+            verbose=False,
+        )
+        results['r44'] = {'data': r44, 'ok': True}
+        if verbose:
+            print('[R45] R44 analyze_trio_roi: OK')
+    except Exception as e:
+        results['r44'] = {'ok': False, 'error': str(e)}
+        if verbose:
+            print('[R45] R44 failed: {}'.format(e))
+
+    return results
+
+
+def _r45_health_score(results: dict) -> dict:
+    """各分析から健全性スコア(0-100)を算出する。"""
+    scores = {}
+    details = {}
+
+    # R41: 複勝命中率から基本健全性
+    r41_ok = results.get('r41', {}).get('ok', False)
+    if r41_ok:
+        md = results['r41'].get('report_md', '') or ''
+        # 命中率を抽出（例: "| 命中率 | 72.5% |" or "place_hit_rate: 0.725"）
+        import re
+        m = re.search(r'命中率[^\d]*(\d+\.?\d*)%', md)
+        if m:
+            hit = float(m.group(1))
+            s = min(100, int(hit * 1.2))
+            scores['place_hit'] = s
+            details['place_hit'] = '{}%'.format(round(hit, 1))
+        else:
+            scores['place_hit'] = 50
+            details['place_hit'] = 'N/A'
+    else:
+        scores['place_hit'] = 0
+        details['place_hit'] = 'エラー'
+
+    # R43: ワイドROI
+    r43_ok = results.get('r43', {}).get('ok', False)
+    if r43_ok:
+        r43d = results['r43'].get('data', {}) or {}
+        roi_stats = r43d.get('roi_stats', {}) or {}
+        overall = roi_stats.get('overall', {}) or {}
+        roi_val = overall.get('roi', None)
+        if roi_val is not None:
+            try:
+                roi_f = float(roi_val)
+                # ROI >= 0 で 50点、+20%で100点、-50%で0点
+                s = max(0, min(100, int(50 + roi_f * 1.0)))
+                scores['wide_roi'] = s
+                details['wide_roi'] = '{:+.1f}%'.format(roi_f)
+            except Exception:
+                scores['wide_roi'] = 50
+                details['wide_roi'] = 'N/A'
+        else:
+            scores['wide_roi'] = 50
+            details['wide_roi'] = 'N/A'
+    else:
+        scores['wide_roi'] = 0
+        details['wide_roi'] = 'エラー'
+
+    # R44: 三連複ROI
+    r44_ok = results.get('r44', {}).get('ok', False)
+    if r44_ok:
+        r44d = results['r44'].get('data', {}) or {}
+        roi_stats = r44d.get('roi_stats', {}) or {}
+        overall = roi_stats.get('overall', {}) or {}
+        roi_val = overall.get('roi', None)
+        if roi_val is not None:
+            try:
+                roi_f = float(roi_val)
+                s = max(0, min(100, int(50 + roi_f * 0.5)))
+                scores['trio_roi'] = s
+                details['trio_roi'] = '{:+.1f}%'.format(roi_f)
+            except Exception:
+                scores['trio_roi'] = 50
+                details['trio_roi'] = 'N/A'
+        else:
+            scores['trio_roi'] = 50
+            details['trio_roi'] = 'N/A'
+    else:
+        scores['trio_roi'] = 0
+        details['trio_roi'] = 'エラー'
+
+    # R42: チューニング改善度
+    r42_ok = results.get('r42', {}).get('ok', False)
+    if r42_ok:
+        r42d = results['r42'].get('data', {}) or {}
+        best_score = r42d.get('best_score', None)
+        if best_score is not None:
+            try:
+                bf = float(best_score)
+                s = max(0, min(100, int(bf * 100)))
+                scores['confidence'] = s
+                details['confidence'] = '{:.1f}%'.format(bf * 100)
+            except Exception:
+                scores['confidence'] = 50
+                details['confidence'] = 'N/A'
+        else:
+            scores['confidence'] = 50
+            details['confidence'] = 'N/A'
+    else:
+        scores['confidence'] = 0
+        details['confidence'] = 'エラー'
+
+    # 総合スコア（重み付き平均）
+    w = {'place_hit': 3, 'wide_roi': 3, 'trio_roi': 2, 'confidence': 2}
+    total_w = sum(w.values())
+    composite = sum(scores.get(k, 50) * w[k] for k in w) / total_w
+    scores['composite'] = round(composite, 1)
+
+    return {'scores': scores, 'details': details}
+
+
+def _r45_grade(score: float) -> str:
+    """スコアからグレード文字列を返す。"""
+    if score >= 80:
+        return 'A (優秀)'
+    elif score >= 65:
+        return 'B (良好)'
+    elif score >= 50:
+        return 'C (普通)'
+    elif score >= 35:
+        return 'D (要改善)'
+    else:
+        return 'F (危険)'
+
+
+def _r45_extract_r41_summary(r41_md: str) -> dict:
+    """R41レポートから主要指標を抽出する。"""
+    import re
+    info = {}
+
+    # 総レース数
+    m = re.search(r'総レース数[^\d]*(\d+)', r41_md)
+    if m:
+        info['n_races'] = int(m.group(1))
+
+    # 命中率
+    m = re.search(r'命中率[^\d]*(\d+\.?\d*)%', r41_md)
+    if m:
+        info['hit_rate'] = float(m.group(1))
+
+    # ROI
+    m = re.search(r'ROI[^\d\-+]*([+\-]?\d+\.?\d*)%', r41_md)
+    if m:
+        info['roi'] = float(m.group(1))
+
+    return info
+
+
+def _r45_build_dashboard_md(
+        results: dict,
+        health: dict,
+        result_dir: str,
+        stake_place: float,
+        stake_wide: float,
+        stake_trio: float,
+) -> str:
+    """総合ダッシュボードMarkdownを生成する。"""
+    NL = '\n'
+    lines = []
+    A = lines.append
+
+    scores = health.get('scores', {})
+    details = health.get('details', {})
+    composite = scores.get('composite', 50.0)
+    grade = _r45_grade(composite)
+
+    # ヘッダー
+    A('# STELLA v1.33 総合ダッシュボードレポート (R45)')
+    A('')
+    A('> **このレポートはR41〜R44の分析を統合した総合ダッシュボードです**')
+    A('')
+    A('---')
+    A('')
+    A('## 0. エグゼクティブサマリー')
+    A('')
+    A('| 項目 | 値 |')
+    A('|---|---|')
+    A('| 対象ディレクトリ | `{}` |'.format(result_dir))
+    A('| 総合スコア | **{:.1f}/100** |'.format(composite))
+    A('| 総合グレード | **{}** |'.format(grade))
+    A('| 複勝命中スコア | {} / {}  |'.format(scores.get('place_hit', 0), details.get('place_hit', 'N/A')))
+    A('| ワイドROIスコア | {} / {}  |'.format(scores.get('wide_roi', 0), details.get('wide_roi', 'N/A')))
+    A('| 三連複ROIスコア | {} / {}  |'.format(scores.get('trio_roi', 0), details.get('trio_roi', 'N/A')))
+    A('| 信頼度スコア | {} / {}  |'.format(scores.get('confidence', 0), details.get('confidence', 'N/A')))
+    A('')
+
+    # スコアバー
+    def bar(v, width=20):
+        filled = max(0, min(width, int(round(v / 100 * width))))
+        return '[' + '█' * filled + '░' * (width - filled) + ']'
+
+    A('### スコアビジュアル')
+    A('')
+    A('```')
+    A('総合    {} {:.1f}pt'.format(bar(composite), composite))
+    A('複勝    {} {}pt'.format(bar(scores.get('place_hit', 0)), scores.get('place_hit', 0)))
+    A('ワイド  {} {}pt'.format(bar(scores.get('wide_roi', 0)), scores.get('wide_roi', 0)))
+    A('三連複  {} {}pt'.format(bar(scores.get('trio_roi', 0)), scores.get('trio_roi', 0)))
+    A('信頼度  {} {}pt'.format(bar(scores.get('confidence', 0)), scores.get('confidence', 0)))
+    A('```')
+    A('')
+    A('---')
+    A('')
+
+    # R41セクション
+    A('## 1. 事後分析サマリー (R41)')
+    A('')
+    r41_ok = results.get('r41', {}).get('ok', False)
+    if r41_ok:
+        r41_md = results['r41'].get('report_md', '') or ''
+        r41_info = _r45_extract_r41_summary(r41_md)
+        A('| 指標 | 値 |')
+        A('|---|---|')
+        if 'n_races' in r41_info:
+            A('| 総レース数 | {} |'.format(r41_info['n_races']))
+        if 'hit_rate' in r41_info:
+            A('| 複勝命中率 | {:.1f}% |'.format(r41_info['hit_rate']))
+        if 'roi' in r41_info:
+            A('| ROI | {:+.1f}% |'.format(r41_info['roi']))
+        A('| 掛け金/レース | {}円 |'.format(int(stake_place)))
+        A('')
+        A('<details><summary>R41詳細レポート（クリックで展開）</summary>')
+        A('')
+        A(r41_md[:3000] + ('...(省略)' if len(r41_md) > 3000 else ''))
+        A('')
+        A('</details>')
+    else:
+        err = results.get('r41', {}).get('error', '不明')
+        A('> ⚠️ R41分析でエラーが発生しました: `{}`'.format(err))
+    A('')
+    A('---')
+    A('')
+
+    # R42セクション
+    A('## 2. 信頼度チューニング (R42)')
+    A('')
+    r42_ok = results.get('r42', {}).get('ok', False)
+    if r42_ok:
+        r42d = results['r42'].get('data', {}) or {}
+        best_params = r42d.get('best_params', {}) or {}
+        best_score = r42d.get('best_score', None)
+        report_md = r42d.get('report', '') or ''
+        A('| パラメータ | 推奨値 |')
+        A('|---|---|')
+        for pk, pv in best_params.items():
+            A('| `{}` | {} |'.format(pk, pv))
+        if best_score is not None:
+            A('| ベストスコア | {:.4f} |'.format(float(best_score)))
+        A('')
+        if report_md:
+            A('<details><summary>R42詳細レポート（クリックで展開）</summary>')
+            A('')
+            A(report_md[:2000] + ('...(省略)' if len(report_md) > 2000 else ''))
+            A('')
+            A('</details>')
+    else:
+        err = results.get('r42', {}).get('error', '不明')
+        A('> ⚠️ R42分析でエラーが発生しました: `{}`'.format(err))
+    A('')
+    A('---')
+    A('')
+
+    # R43セクション
+    A('## 3. ワイドROI最適化 (R43)')
+    A('')
+    r43_ok = results.get('r43', {}).get('ok', False)
+    if r43_ok:
+        r43d = results['r43'].get('data', {}) or {}
+        best_n = r43d.get('best_n_points', None)
+        best_rank = r43d.get('best_rank_by', None)
+        n_races = r43d.get('n_races', 0)
+        roi_stats = r43d.get('roi_stats', {}) or {}
+        overall = roi_stats.get('overall', {}) or {}
+        A('| 項目 | 値 |')
+        A('|---|---|')
+        A('| 分析レース数 | {} |'.format(n_races))
+        if best_n is not None:
+            A('| 推奨点数 | {}点 |'.format(best_n))
+        if best_rank is not None:
+            A('| 推奨スコア軸 | `{}` |'.format(best_rank))
+        if overall.get('roi') is not None:
+            A('| 全体ROI | {:+.1f}% |'.format(float(overall['roi'])))
+        A('| 1点あたり掛け金 | {}円 |'.format(int(stake_wide)))
+        A('')
+        # 信頼度別ROI
+        conf_roi = roi_stats.get('by_confidence', {}) or {}
+        if conf_roi:
+            A('**信頼度別ROI:**')
+            A('')
+            A('| 信頼度 | レース数 | ROI |')
+            A('|---|---|---|')
+            for lv in ['HIGH', 'MEDIUM', 'LOW']:
+                cr = conf_roi.get(lv, {}) or {}
+                if cr.get('n', 0) > 0:
+                    A('| {} | {} | {:+.1f}% |'.format(
+                        lv, cr.get('n', 0), float(cr.get('roi', 0))))
+            A('')
+        report_md_r43 = r43d.get('report_md', '') or ''
+        if report_md_r43:
+            A('<details><summary>R43詳細レポート（クリックで展開）</summary>')
+            A('')
+            A(report_md_r43[:2000] + ('...(省略)' if len(report_md_r43) > 2000 else ''))
+            A('')
+            A('</details>')
+    else:
+        err = results.get('r43', {}).get('error', '不明')
+        A('> ⚠️ R43分析でエラーが発生しました: `{}`'.format(err))
+    A('')
+    A('---')
+    A('')
+
+    # R44セクション
+    A('## 4. 三連複ROI最適化 (R44)')
+    A('')
+    r44_ok = results.get('r44', {}).get('ok', False)
+    if r44_ok:
+        r44d = results['r44'].get('data', {}) or {}
+        best_mp = r44d.get('best_max_points', None)
+        n_races_r44 = r44d.get('n_races', 0)
+        roi_stats_r44 = r44d.get('roi_stats', {}) or {}
+        overall_r44 = roi_stats_r44.get('overall', {}) or {}
+        cost_benefit = r44d.get('cost_benefit', {}) or {}
+        A('| 項目 | 値 |')
+        A('|---|---|')
+        A('| 分析レース数 | {} |'.format(n_races_r44))
+        if best_mp is not None:
+            A('| 推奨最大点数 | {}点 |'.format(best_mp))
+        if overall_r44.get('roi') is not None:
+            A('| 全体ROI | {:+.1f}% |'.format(float(overall_r44['roi'])))
+        A('| 1点あたり掛け金 | {}円 |'.format(int(stake_trio)))
+        A('')
+        # 損益分岐点
+        if cost_benefit:
+            bep = cost_benefit.get('break_even_payout', None)
+            if bep is not None:
+                A('**損益分岐点:** 平均払戻 ≥ **{:.0f}円** が必要'.format(float(bep)))
+                A('')
+        report_md_r44 = r44d.get('report_md', '') or ''
+        if report_md_r44:
+            A('<details><summary>R44詳細レポート（クリックで展開）</summary>')
+            A('')
+            A(report_md_r44[:2000] + ('...(省略)' if len(report_md_r44) > 2000 else ''))
+            A('')
+            A('</details>')
+    else:
+        err = results.get('r44', {}).get('error', '不明')
+        A('> ⚠️ R44分析でエラーが発生しました: `{}`'.format(err))
+    A('')
+    A('---')
+    A('')
+
+    # セクション5: 総合推奨設定
+    A('## 5. 総合推奨設定')
+    A('')
+    A('以下の設定を推奨します（各分析の最適値を統合）:')
+    A('')
+    A('```json')
+    import json as _json
+    recommend = {}
+
+    # R42からconfidence推奨パラメータ
+    if r42_ok:
+        r42d = results['r42'].get('data', {}) or {}
+        bp = r42d.get('best_params', {}) or {}
+        if bp:
+            recommend['confidence_params'] = bp
+
+    # R43から推奨n_points/rank_by
+    if r43_ok:
+        r43d = results['r43'].get('data', {}) or {}
+        bn = r43d.get('best_n_points', None)
+        br = r43d.get('best_rank_by', None)
+        if bn is not None:
+            recommend['wide_n_points'] = bn
+        if br is not None:
+            recommend['wide_rank_by'] = br
+
+    # R44から推奨max_points
+    if r44_ok:
+        r44d = results['r44'].get('data', {}) or {}
+        bm = r44d.get('best_max_points', None)
+        if bm is not None:
+            recommend['trio_max_points'] = bm
+
+    A(_json.dumps(recommend, ensure_ascii=False, indent=2))
+    A('```')
+    A('')
+    A('---')
+    A('')
+
+    # セクション6: 次アクション
+    A('## 6. 次アクション提案')
+    A('')
+    actions = []
+
+    if composite < 35:
+        actions.append('🚨 **総合スコアが低危険域です** — データ量の増加（50レース以上）を優先してください')
+    elif composite < 50:
+        actions.append('⚠️ **総合スコアが改善域です** — R42チューニング結果を適用してconfidenceパラメータを更新してください')
+    elif composite >= 80:
+        actions.append('✅ **総合スコアが優秀域です** — 現在の設定を維持し、より多くのデータで定期実行してください')
+
+    if r42_ok:
+        r42d = results['r42'].get('data', {}) or {}
+        bp = r42d.get('best_params', {}) or {}
+        if bp:
+            actions.append('📌 **R42推奨パラメータをparams.jsonに反映** — confidence閾値の調整で命中率改善が見込めます')
+
+    if r43_ok:
+        r43d = results['r43'].get('data', {}) or {}
+        bn = r43d.get('best_n_points', 4)
+        br = r43d.get('best_rank_by', 'AnchorScore')
+        actions.append('🎯 **ワイド: {}点購入 / スコア軸={}** を実運用に設定してください'.format(bn, br))
+
+    if r44_ok:
+        r44d = results['r44'].get('data', {}) or {}
+        bm = r44d.get('best_max_points', 10)
+        actions.append('🏆 **三連複: 最大{}点** が推奨上限です（コスト管理）'.format(bm))
+
+    if not actions:
+        actions.append('📊 データを蓄積してから再分析を実施してください（推奨: 30レース以上）')
+
+    for act in actions:
+        A('- ' + act)
+
+    A('')
+    A('---')
+    A('')
+
+    # フッター
+    import datetime as _dt
+    A('*Generated by STELLA v1.33 Dashboard (R45) — {}*'.format(
+        _dt.datetime.now().strftime('%Y-%m-%d %H:%M')))
+    A('')
+
+    return NL.join(lines)
+
+
+def analyze_dashboard(
+        result_dir: str,
+        params: dict,
+        stake_place: float = 1000.0,
+        stake_wide: float = 100.0,
+        stake_trio: float = 100.0,
+        out_md: str = None,
+        verbose: bool = True,
+) -> dict:
+    """R45: R41〜R44を統合した総合ダッシュボードレポートを生成する。
+
+    Args:
+        result_dir: 分析対象のJSONディレクトリ
+        params: STELLAパラメータ辞書
+        stake_place: 複勝掛け金/レース (R41用)
+        stake_wide: ワイド1点あたり掛け金 (R43用)
+        stake_trio: 三連複1点あたり掛け金 (R44用)
+        out_md: 出力Markdownファイルパス (Noneの場合はresult_dir/dashboard_report.md)
+        verbose: 進捗ログ表示
+
+    Returns:
+        dict: {report_md, health, results, composite_score}
+    """
+    import os as _os45
+
+    if verbose:
+        print('[R45] 総合ダッシュボード分析開始: {}'.format(result_dir))
+
+    # 全分析実行
+    results = _r45_exec_all_analyses(
+        result_dir=result_dir,
+        params=params,
+        stake_place=stake_place,
+        stake_wide=stake_wide,
+        stake_trio=stake_trio,
+        verbose=verbose,
+    )
+
+    # 健全性スコア計算
+    health = _r45_health_score(results)
+
+    if verbose:
+        scores = health.get('scores', {})
+        print('[R45] 総合スコア: {:.1f}/100 ({})'.format(
+            scores.get('composite', 0), _r45_grade(scores.get('composite', 0))))
+
+    # ダッシュボードMarkdown生成
+    report_md = _r45_build_dashboard_md(
+        results=results,
+        health=health,
+        result_dir=result_dir,
+        stake_place=stake_place,
+        stake_wide=stake_wide,
+        stake_trio=stake_trio,
+    )
+
+    # 保存
+    _out = out_md or (_os45.path.join(result_dir.rstrip('/'), 'dashboard_report.md'))
+    try:
+        from pathlib import Path as _Path45
+        _Path45(_out).parent.mkdir(parents=True, exist_ok=True)
+        _Path45(_out).write_text(report_md, encoding='utf-8')
+        if verbose:
+            print('[R45] ダッシュボードレポート保存 -> {}'.format(_out))
+    except Exception as _e:
+        if verbose:
+            print('[R45] 保存失敗: {}'.format(_e))
+
+    composite_score = health.get('scores', {}).get('composite', 0.0)
+
+    return dict(
+        report_md=report_md,
+        health=health,
+        results=results,
+        composite_score=composite_score,
+        out_md=_out,
+    )
+
+
+
+# =========================
+# R46: レースカテゴリー別最適化 (v1.22)
+# =========================
+
+# 中央主要開催場
+_R46_MAJOR_VENUES = {'東京', '阪神', '中山', '京都', '中京', '新潟', '福島', '小倉', '札幌', '函館'}
+
+
+def _r46_classify_race_no(race_str: str) -> int:
+    """race フィールド文字列からレース番号(1-12)を抽出。不明は0。"""
+    import re
+    if not race_str:
+        return 0
+    m = re.search(r'(\d{1,2})\s*[Rr]', str(race_str))
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 12:
+            return n
+    m = re.search(r'^(\d{1,2})$', str(race_str).strip())
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 12:
+            return n
+    return 0
+
+
+def _r46_estimate_distance(lap_times_str: str, avg_halon_str: str) -> int:
+    """ラップタイム文字列から推定距離(m)を返す。不明は0。
+    lap_times例: '11.9-10.6-11.3-12.1-12.4-12.4' → 6ハロン → 1200m
+    """
+    if lap_times_str:
+        import re
+        laps = re.split(r'[-,]', str(lap_times_str).strip())
+        laps = [x for x in laps if re.match(r'^\d+\.?\d*$', x.strip())]
+        if laps:
+            return len(laps) * 200
+    # avg_halonのみの場合は推定不可
+    return 0
+
+
+def _r46_dist_category(dist_m: int) -> str:
+    """推定距離(m)から距離帯カテゴリーを返す。"""
+    if dist_m <= 0:
+        return '不明'
+    elif dist_m <= 1400:
+        return '短距離(〜1400m)'
+    elif dist_m <= 1800:
+        return 'マイル(1401〜1800m)'
+    elif dist_m <= 2200:
+        return '中距離(1801〜2200m)'
+    else:
+        return '長距離(2201m〜)'
+
+
+def _r46_venue_category(venue: str) -> str:
+    """venue文字列から開催場カテゴリーを返す。"""
+    v = str(venue or '').strip()
+    if not v or v in ('不明', 'UNKNOWN', ''):
+        return '不明'
+    # 完全一致チェック（東京競馬場 → 東京）
+    for mv in _R46_MAJOR_VENUES:
+        if mv in v:
+            return mv
+    return 'その他'
+
+
+def _r46_race_slot(race_no: int) -> str:
+    """レース番号からレース時間帯カテゴリーを返す。"""
+    if race_no <= 0:
+        return '不明'
+    elif race_no <= 5:
+        return '早場(1〜5R)'
+    elif race_no <= 8:
+        return '中盤(6〜8R)'
+    else:
+        return 'メイン(9〜12R)'
+
+
+def _r46_enrich_df(df):
+    """DataFrameにR46分類列を追加したコピーを返す。
+    追加列: venue_cat, race_no, race_slot, dist_m, dist_cat
+    """
+    import pandas as pd
+
+    if df is None or len(df) == 0:
+        return df
+
+    df = df.copy()
+
+    venue_cats = []
+    race_nos = []
+    race_slots = []
+    dist_ms = []
+    dist_cats = []
+
+    for _, row in df.iterrows():
+        # venue category
+        venue_cats.append(_r46_venue_category(str(row.get('venue', '') or '')))
+
+        # race number & slot (from 'race' column)
+        rno = _r46_classify_race_no(str(row.get('race', '') or ''))
+        race_nos.append(rno)
+        race_slots.append(_r46_race_slot(rno))
+
+        # distance from race_id (race_id may embed distance in some formats)
+        # or from additional meta stored in JSON - try lap_times if available
+        lap_str = str(row.get('lap_times', '') or '')
+        avg_str = str(row.get('avg_halon', '') or '')
+        dm = _r46_estimate_distance(lap_str, avg_str)
+        dist_ms.append(dm)
+        dist_cats.append(_r46_dist_category(dm))
+
+    df['venue_cat'] = venue_cats
+    df['race_no'] = race_nos
+    df['race_slot'] = race_slots
+    df['dist_m'] = dist_ms
+    df['dist_cat'] = dist_cats
+
+    return df
+
+
+def _r46_load_enriched_df(result_dir: str) -> object:
+    """_r41_load_results_dfをR46拡張して返す。
+    metaフィールド(lap_times, avg_halon)をJSONから追加読み込みする。
+    """
+    import json
+    import pandas as pd
+    from pathlib import Path as _P
+
+    # まず標準のDFをロード
+    df = _r41_load_results_df(result_dir)
+
+    # lap_times / avg_halon を追加読み込み
+    if df is None or len(df) == 0:
+        return _r46_enrich_df(pd.DataFrame())
+
+    extra = {}  # race_id -> {lap_times, avg_halon}
+    for fp in sorted(_P(result_dir).glob('*.json')):
+        try:
+            obj = json.loads(fp.read_text(encoding='utf-8'))
+            rid = str(obj.get('race_id', '') or fp.stem)
+            meta = obj.get('meta', {}) or {}
+            extra[rid] = {
+                'lap_times': str(meta.get('lap_times', '') or ''),
+                'avg_halon': str(meta.get('avg_halon', '') or ''),
+            }
+        except Exception:
+            pass
+
+    if extra:
+        df['lap_times'] = df['race_id'].map(lambda rid: extra.get(rid, {}).get('lap_times', ''))
+        df['avg_halon'] = df['race_id'].map(lambda rid: extra.get(rid, {}).get('avg_halon', ''))
+    else:
+        df['lap_times'] = ''
+        df['avg_halon'] = ''
+
+    return _r46_enrich_df(df)
+
+
+def _r46_category_roi_stats(df, stake_per: float, category_col: str,
+                             bet_type: str = 'place') -> list:
+    """カテゴリー別ROI統計を計算する。
+    bet_type: 'place' / 'wide' / 'trio'
+    Returns: list of dicts {category, n, n_hit, roi, hit_rate, avg_payout}
+    """
+    import numpy as np
+
+    results = []
+    if df is None or len(df) == 0:
+        return results
+    if category_col not in df.columns:
+        return results
+
+    place_ok_df = df[df['place_ok'].infer_objects(copy=False).fillna(False).astype(bool)]
+    if len(place_ok_df) == 0:
+        return results
+
+    for cat in sorted(place_ok_df[category_col].unique()):
+        rows = place_ok_df[place_ok_df[category_col] == cat]
+        n = len(rows)
+        if n == 0:
+            continue
+
+        if bet_type == 'place':
+            # 複勝
+            hits = rows['place_hit'].infer_objects(copy=False).fillna(False).astype(bool).sum()
+            payouts = rows['payout_fukusho_max'].fillna(0.0)
+            investment = n * stake_per
+            payout_per_100 = stake_per / 100.0
+            ret = float((payouts * payout_per_100).sum())
+            roi = (ret - investment) / investment * 100.0 if investment > 0 else 0.0
+            avg_pay = float(payouts[payouts > 0].mean()) if (payouts > 0).any() else 0.0
+            hit_rate = hits / n * 100.0 if n > 0 else 0.0
+
+        elif bet_type == 'wide':
+            hits = rows['wide_hit_count'].infer_objects(copy=False).fillna(0).astype(float).sum()
+            payouts = rows['payout_wide_max'].infer_objects(copy=False).fillna(0.0).astype(float)
+            # wide: assume 4-wide default; use wide_num_count column if available
+            n_points = float(rows.get('wide_num_count', 4) if isinstance(
+                rows.get('wide_num_count'), float) else 4)
+            investment = n * 4 * stake_per  # 4点購入として計算
+            payout_per_100 = stake_per / 100.0
+            ret = float((rows['wide_hit_count'].infer_objects(copy=False).fillna(0).astype(float) *
+                         payouts * payout_per_100).sum())
+            roi = (ret - investment) / investment * 100.0 if investment > 0 else 0.0
+            avg_pay = float(payouts[payouts > 0].mean()) if (payouts > 0).any() else 0.0
+            hit_rate = (rows['wide_hit_count'].infer_objects(copy=False).fillna(0).astype(float) > 0).sum() / n * 100.0
+
+        elif bet_type == 'trio':
+            hits = rows['trio_hit'].infer_objects(copy=False).fillna(False).astype(bool).sum()
+            payouts = rows['payout_sanrenpuku'].infer_objects(copy=False).fillna(0.0).astype(float)
+            pts = rows['trio_form_points'].fillna(10).astype(float)
+            investment = float((pts * stake_per).sum())
+            payout_per_100 = stake_per / 100.0
+            ret = float((rows['trio_hit'].infer_objects(copy=False).fillna(False).astype(bool).astype(float) *
+                         payouts * payout_per_100).sum())
+            roi = (ret - investment) / investment * 100.0 if investment > 0 else 0.0
+            avg_pay = float(payouts[payouts > 0].mean()) if (payouts > 0).any() else 0.0
+            hit_rate = float(hits) / n * 100.0 if n > 0 else 0.0
+
+        else:
+            continue
+
+        results.append({
+            'category': str(cat),
+            'n': int(n),
+            'n_hit': int(hits) if bet_type != 'wide' else int(
+                (rows['wide_hit_count'].infer_objects(copy=False).fillna(0).astype(float) > 0).sum()),
+            'roi': round(roi, 2),
+            'hit_rate': round(hit_rate, 1),
+            'avg_payout': round(avg_pay, 0),
+        })
+
+    # ROI降順ソート
+    results.sort(key=lambda x: x['roi'], reverse=True)
+    return results
+
+
+def _r46_cross_analysis(df, stake_per: float) -> list:
+    """venue_cat × pace のクロス集計（複勝ROI）。"""
+    results = []
+    if df is None or len(df) == 0:
+        return results
+    if 'venue_cat' not in df.columns or 'pace' not in df.columns:
+        return results
+
+    place_ok_df = df[df['place_ok'].infer_objects(copy=False).fillna(False).astype(bool)]
+    if len(place_ok_df) == 0:
+        return results
+
+    for venue in sorted(place_ok_df['venue_cat'].unique()):
+        for pace in ['H', 'M', 'S']:
+            rows = place_ok_df[
+                (place_ok_df['venue_cat'] == venue) &
+                (place_ok_df['pace'] == pace)
+            ]
+            n = len(rows)
+            if n < 3:
+                continue
+            hits = rows['place_hit'].infer_objects(copy=False).fillna(False).astype(bool).sum()
+            payouts = rows['payout_fukusho_max'].fillna(0.0)
+            investment = n * stake_per
+            ret = float((payouts * stake_per / 100.0).sum())
+            roi = (ret - investment) / investment * 100.0 if investment > 0 else 0.0
+            hit_rate = hits / n * 100.0
+            results.append({
+                'venue_cat': venue,
+                'pace': pace,
+                'n': int(n),
+                'roi': round(roi, 2),
+                'hit_rate': round(hit_rate, 1),
+            })
+
+    results.sort(key=lambda x: x['roi'], reverse=True)
+    return results
+
+
+def _r46_build_category_md(
+        df,
+        venue_place: list, venue_wide: list, venue_trio: list,
+        slot_place: list, slot_wide: list, slot_trio: list,
+        dist_place: list, dist_wide: list,
+        cross: list,
+        result_dir: str,
+        stake_per: float,
+) -> str:
+    """R46カテゴリーROIレポートMarkdownを生成する。"""
+    NL = '\n'
+    lines = []
+    A = lines.append
+
+    def roi_table(stats_list, label: str):
+        if not stats_list:
+            A('> データなし（{} ≥3レースのカテゴリーがありません）'.format(label))
+            return
+        A('| {} | レース数 | 命中率 | ROI | 平均払戻 |'.format(label))
+        A('|---|---|---|---|---|')
+        for s in stats_list:
+            roi_str = '{:+.1f}%'.format(s['roi'])
+            A('| {} | {} | {:.1f}% | {} | {:.0f}円 |'.format(
+                s['category'], s['n'], s['hit_rate'], roi_str, s['avg_payout']))
+
+    A('# STELLA v1.33 レースカテゴリー別ROIレポート (R46)')
+    A('')
+    A('---')
+    A('')
+    A('## 0. 概要')
+    A('')
+    n_total = len(df) if df is not None else 0
+    n_ok = int(df['place_ok'].infer_objects(copy=False).fillna(False).astype(bool).sum()) if df is not None and len(df) > 0 else 0
+    A('| 項目 | 値 |')
+    A('|---|---|')
+    A('| 対象ディレクトリ | `{}` |'.format(result_dir))
+    A('| 総レース数 | {} |'.format(n_total))
+    A('| 購入対象レース数 (place_ok) | {} |'.format(n_ok))
+    A('| 1点あたり掛け金 | {}円 |'.format(int(stake_per)))
+    A('')
+    A('---')
+    A('')
+
+    # セクション1: 開催場別
+    A('## 1. 開催場別ROI')
+    A('')
+    A('### 1-1. 複勝 (place)')
+    A('')
+    roi_table(venue_place, '開催場')
+    A('')
+    A('### 1-2. ワイド (wide, 4点購入換算)')
+    A('')
+    roi_table(venue_wide, '開催場')
+    A('')
+    A('### 1-3. 三連複 (trio)')
+    A('')
+    roi_table(venue_trio, '開催場')
+    A('')
+    A('---')
+    A('')
+
+    # セクション2: レース時間帯別
+    A('## 2. レース時間帯別ROI (race番号ベース)')
+    A('')
+    A('### 2-1. 複勝')
+    A('')
+    roi_table(slot_place, 'レース時間帯')
+    A('')
+    A('### 2-2. ワイド')
+    A('')
+    roi_table(slot_wide, 'レース時間帯')
+    A('')
+    A('### 2-3. 三連複')
+    A('')
+    roi_table(slot_trio, 'レース時間帯')
+    A('')
+    A('---')
+    A('')
+
+    # セクション3: 推定距離帯別
+    A('## 3. 推定距離帯別ROI (ラップタイム推定)')
+    A('')
+    A('> ラップタイム本数 × 200m で距離を推定しています。')
+    A('')
+    A('### 3-1. 複勝')
+    A('')
+    roi_table(dist_place, '距離帯')
+    A('')
+    A('### 3-2. ワイド')
+    A('')
+    roi_table(dist_wide, '距離帯')
+    A('')
+    A('---')
+    A('')
+
+    # セクション4: クロス集計
+    A('## 4. 開催場 × ペース クロス集計（複勝ROI）')
+    A('')
+    if cross:
+        A('| 開催場 | ペース | レース数 | 命中率 | ROI |')
+        A('|---|---|---|---|---|')
+        for c in cross:
+            pace_map = {'H': 'ハイ(H)', 'M': 'ミドル(M)', 'S': 'スロー(S)'}
+            p = pace_map.get(c['pace'], c['pace'])
+            A('| {} | {} | {} | {:.1f}% | {:+.1f}% |'.format(
+                c['venue_cat'], p, c['n'], c['hit_rate'], c['roi']))
+    else:
+        A('> データなし（各組み合わせで3レース以上のデータが必要です）')
+    A('')
+    A('---')
+    A('')
+
+    # セクション5: 推奨設定
+    A('## 5. 推奨カテゴリー設定')
+    A('')
+    best_venue = venue_place[0]['category'] if venue_place else '不明'
+    best_slot = slot_place[0]['category'] if slot_place else '不明'
+    best_dist = dist_place[0]['category'] if dist_place else '不明'
+
+    A('| 軸 | 推奨カテゴリー | 根拠 |')
+    A('|---|---|---|')
+    A('| 開催場 | **{}** | 複勝ROI最高 |'.format(best_venue))
+    A('| 時間帯 | **{}** | 複勝ROI最高 |'.format(best_slot))
+    A('| 距離帯 | **{}** | 複勝ROI最高 |'.format(best_dist))
+    A('')
+    A('### 推奨フィルター設定（JSON）')
+    A('')
+    A('```json')
+    import json as _json
+    rec = {
+        'preferred_venue': best_venue,
+        'preferred_race_slot': best_slot,
+        'preferred_dist_cat': best_dist,
+        'note': 'カテゴリーROI分析(R46)に基づく推奨値'
+    }
+    A(_json.dumps(rec, ensure_ascii=False, indent=2))
+    A('```')
+    A('')
+    A('---')
+    A('')
+
+    import datetime as _dt
+    A('*Generated by STELLA v1.33 Category ROI (R46) — {}*'.format(
+        _dt.datetime.now().strftime('%Y-%m-%d %H:%M')))
+    A('')
+
+    return NL.join(lines)
+
+
+def analyze_category_roi(
+        result_dir: str,
+        params: dict,
+        stake_per: float = 1000.0,
+        out_md: str = None,
+        verbose: bool = True,
+) -> dict:
+    """R46: レースカテゴリー別ROI最適化レポートを生成する。
+
+    分類軸:
+      - venue_cat: 開催場（東京/阪神/中山/京都/その他/不明）
+      - race_slot: 時間帯（早場1-5R/中盤6-8R/メイン9-12R）
+      - dist_cat:  推定距離帯（短距離/マイル/中距離/長距離）
+      - cross:     venue_cat × pace クロス集計
+
+    Args:
+        result_dir: JSONデータディレクトリ
+        params:     STELLAパラメータ辞書
+        stake_per:  掛け金/点 (デフォルト: 1000円)
+        out_md:     出力Markdownファイルパス
+        verbose:    進捗ログ表示
+
+    Returns:
+        dict: {report_md, venue_stats, slot_stats, dist_stats, cross_stats,
+               best_venue, best_slot, best_dist, n_races}
+    """
+    import os as _os46
+
+    if verbose:
+        print('[R46] カテゴリー別ROI分析開始: {}'.format(result_dir))
+
+    # データ読み込み＋エンリッチ
+    df = _r46_load_enriched_df(result_dir)
+    n_total = len(df) if df is not None else 0
+
+    if verbose:
+        print('[R46] ロード: {}レース'.format(n_total))
+
+    if n_total == 0:
+        report_md = '# STELLA v1.33 レースカテゴリー別ROIレポート (R46)\n\nデータなし\n'
+        _out = out_md or _os46.path.join(result_dir.rstrip('/'), 'category_roi_report.md')
+        try:
+            from pathlib import Path as _Path46
+            _Path46(_out).parent.mkdir(parents=True, exist_ok=True)
+            _Path46(_out).write_text(report_md, encoding='utf-8')
+        except Exception:
+            pass
+        return dict(report_md=report_md, venue_stats=[], slot_stats=[], dist_stats=[],
+                    cross_stats=[], best_venue='不明', best_slot='不明', best_dist='不明',
+                    n_races=0, out_md=_out)
+
+    # カテゴリー別ROI計算
+    venue_place = _r46_category_roi_stats(df, stake_per, 'venue_cat', 'place')
+    venue_wide  = _r46_category_roi_stats(df, stake_per, 'venue_cat', 'wide')
+    venue_trio  = _r46_category_roi_stats(df, stake_per, 'venue_cat', 'trio')
+
+    slot_place  = _r46_category_roi_stats(df, stake_per, 'race_slot', 'place')
+    slot_wide   = _r46_category_roi_stats(df, stake_per, 'race_slot', 'wide')
+    slot_trio   = _r46_category_roi_stats(df, stake_per, 'race_slot', 'trio')
+
+    dist_place  = _r46_category_roi_stats(df, stake_per, 'dist_cat', 'place')
+    dist_wide   = _r46_category_roi_stats(df, stake_per, 'dist_cat', 'wide')
+
+    cross       = _r46_cross_analysis(df, stake_per)
+
+    if verbose:
+        print('[R46] venue_stats: {}カテゴリー, slot_stats: {}カテゴリー'.format(
+            len(venue_place), len(slot_place)))
+
+    # レポートMarkdown生成
+    report_md = _r46_build_category_md(
+        df=df,
+        venue_place=venue_place, venue_wide=venue_wide, venue_trio=venue_trio,
+        slot_place=slot_place, slot_wide=slot_wide, slot_trio=slot_trio,
+        dist_place=dist_place, dist_wide=dist_wide,
+        cross=cross,
+        result_dir=result_dir,
+        stake_per=stake_per,
+    )
+
+    # 保存
+    _out = out_md or _os46.path.join(result_dir.rstrip('/'), 'category_roi_report.md')
+    try:
+        from pathlib import Path as _Path46b
+        _Path46b(_out).parent.mkdir(parents=True, exist_ok=True)
+        _Path46b(_out).write_text(report_md, encoding='utf-8')
+        if verbose:
+            print('[R46] レポート保存 -> {}'.format(_out))
+    except Exception as _e:
+        if verbose:
+            print('[R46] 保存失敗: {}'.format(_e))
+
+    best_venue = venue_place[0]['category'] if venue_place else '不明'
+    best_slot  = slot_place[0]['category']  if slot_place  else '不明'
+    best_dist  = dist_place[0]['category']  if dist_place  else '不明'
+
+    return dict(
+        report_md=report_md,
+        venue_stats=venue_place,
+        slot_stats=slot_place,
+        dist_stats=dist_place,
+        cross_stats=cross,
+        best_venue=best_venue,
+        best_slot=best_slot,
+        best_dist=best_dist,
+        n_races=n_total,
+        out_md=_out,
+    )
+
+
+
+# =========================
+# R47: アンカースコア精度分析 (v1.23)
+# =========================
+
+def _r47_score_bands(anchor_score: float) -> str:
+    """AnchorScoreを10点刻みのバンドに分類する。"""
+    if anchor_score is None or anchor_score != anchor_score:  # NaN check
+        return '不明'
+    s = float(anchor_score)
+    if s < 40:
+        return '<40'
+    elif s < 50:
+        return '40-49'
+    elif s < 60:
+        return '50-59'
+    elif s < 70:
+        return '60-69'
+    elif s < 80:
+        return '70-79'
+    elif s < 90:
+        return '80-89'
+    else:
+        return '90+'
+
+
+def _r47_pplace_bands(p_place_est_pct: float) -> str:
+    """p_place_est_pct を 10%刻みのバンドに分類する。"""
+    if p_place_est_pct is None or p_place_est_pct != p_place_est_pct:
+        return '不明'
+    p = float(p_place_est_pct)
+    if p < 30:
+        return '<30%'
+    elif p < 40:
+        return '30-39%'
+    elif p < 50:
+        return '40-49%'
+    elif p < 60:
+        return '50-59%'
+    elif p < 70:
+        return '60-69%'
+    elif p < 80:
+        return '70-79%'
+    else:
+        return '80%+'
+
+
+def _r47_rank_category(anchor_rank) -> str:
+    """anchor_rank（着順）をカテゴリーに分類する。"""
+    if anchor_rank is None:
+        return '不明'
+    try:
+        r = int(anchor_rank)
+    except (TypeError, ValueError):
+        return '不明'
+    if r == 1:
+        return '1着'
+    elif r == 2:
+        return '2着'
+    elif r == 3:
+        return '3着'
+    elif r <= 5:
+        return '4-5着'
+    elif r <= 8:
+        return '6-8着'
+    else:
+        return '9着以下'
+
+
+def _r47_score_rank_correlation(df) -> dict:
+    """AnchorScore と anchor_rank の相関・分布を計算する。"""
+    import numpy as np
+
+    result = {
+        'pearson_r': None,
+        'spearman_r': None,
+        'n': 0,
+        'mean_score_placed': None,   # 3着以内のスコア平均
+        'mean_score_unplaced': None, # 4着以下のスコア平均
+        'score_diff': None,          # 差
+    }
+
+    if df is None or len(df) == 0:
+        return result
+
+    valid = df.dropna(subset=['anchor_score', 'anchor_rank'])
+    valid = valid[valid['anchor_rank'].apply(lambda x: x is not None)]
+    if len(valid) < 3:
+        return result
+
+    try:
+        scores = valid['anchor_score'].astype(float).values
+        ranks  = valid['anchor_rank'].astype(float).values
+        n = len(scores)
+        result['n'] = int(n)
+
+        # ピアソン相関
+        if n >= 3:
+            corr_matrix = np.corrcoef(scores, ranks)
+            result['pearson_r'] = round(float(corr_matrix[0, 1]), 4)
+
+        # スピアマン相関
+        if n >= 3:
+            from scipy.stats import spearmanr
+            sr, _ = spearmanr(scores, ranks)
+            result['spearman_r'] = round(float(sr), 4)
+
+    except Exception:
+        pass
+
+    # 3着以内 vs 4着以下 のスコア差
+    try:
+        placed   = valid[valid['anchor_rank'].astype(float) <= 3]['anchor_score'].astype(float)
+        unplaced = valid[valid['anchor_rank'].astype(float) > 3]['anchor_score'].astype(float)
+        if len(placed) > 0:
+            result['mean_score_placed'] = round(float(placed.mean()), 2)
+        if len(unplaced) > 0:
+            result['mean_score_unplaced'] = round(float(unplaced.mean()), 2)
+        if result['mean_score_placed'] is not None and result['mean_score_unplaced'] is not None:
+            result['score_diff'] = round(
+                result['mean_score_placed'] - result['mean_score_unplaced'], 2)
+    except Exception:
+        pass
+
+    return result
+
+
+def _r47_score_band_stats(df) -> list:
+    """AnchorScoreバンド別の命中率・ROI統計を返す。"""
+    results = []
+    if df is None or len(df) == 0:
+        return results
+
+    ok = df[df['place_ok'].infer_objects(copy=False).fillna(False).astype(bool)].copy()
+    if len(ok) == 0:
+        return results
+
+    ok['_sband'] = ok['anchor_score'].apply(_r47_score_bands)
+
+    band_order = ['<40', '40-49', '50-59', '60-69', '70-79', '80-89', '90+', '不明']
+    for band in band_order:
+        rows = ok[ok['_sband'] == band]
+        n = len(rows)
+        if n == 0:
+            continue
+
+        hits = int(rows['place_hit'].infer_objects(copy=False).fillna(False).astype(bool).sum())
+        hit_rate = hits / n * 100.0
+
+        # 複勝ROI
+        payouts = rows['payout_fukusho_max'].infer_objects(copy=False).fillna(0.0).astype(float)
+        investment = n * 1000.0  # 1000円基準
+        ret = float((payouts * 10.0).sum())  # 1000円 = 10口×100円
+        roi = (ret - investment) / investment * 100.0 if investment > 0 else 0.0
+
+        avg_score = float(rows['anchor_score'].astype(float).mean()) if n > 0 else 0.0
+        avg_rank  = float(rows['anchor_rank'].dropna().astype(float).mean()) if rows['anchor_rank'].notna().any() else 0.0
+
+        results.append({
+            'band': band,
+            'n': int(n),
+            'n_hit': int(hits),
+            'hit_rate': round(hit_rate, 1),
+            'roi': round(roi, 2),
+            'avg_score': round(avg_score, 1),
+            'avg_anchor_rank': round(avg_rank, 2),
+        })
+
+    return results
+
+
+def _r47_pplace_band_stats(df) -> list:
+    """p_place_est_pctバンド別の命中率・ROI統計を返す。"""
+    results = []
+    if df is None or len(df) == 0:
+        return results
+
+    ok = df[df['place_ok'].infer_objects(copy=False).fillna(False).astype(bool)].copy()
+    if len(ok) == 0:
+        return results
+
+    ok['_pband'] = ok['p_place_est_pct'].apply(_r47_pplace_bands)
+
+    band_order = ['<30%', '30-39%', '40-49%', '50-59%', '60-69%', '70-79%', '80%+', '不明']
+    for band in band_order:
+        rows = ok[ok['_pband'] == band]
+        n = len(rows)
+        if n == 0:
+            continue
+
+        hits = int(rows['place_hit'].infer_objects(copy=False).fillna(False).astype(bool).sum())
+        hit_rate = hits / n * 100.0
+
+        payouts = rows['payout_fukusho_max'].infer_objects(copy=False).fillna(0.0).astype(float)
+        investment = n * 1000.0
+        ret = float((payouts * 10.0).sum())
+        roi = (ret - investment) / investment * 100.0 if investment > 0 else 0.0
+
+        avg_pct = float(rows['p_place_est_pct'].astype(float).mean()) if n > 0 else 0.0
+
+        results.append({
+            'band': band,
+            'n': int(n),
+            'n_hit': int(hits),
+            'hit_rate': round(hit_rate, 1),
+            'roi': round(roi, 2),
+            'avg_p_place_pct': round(avg_pct, 1),
+            'calibration_diff': round(hit_rate - avg_pct, 1),  # 実際命中率 - 予測値
+        })
+
+    return results
+
+
+def _r47_rank_distribution(df) -> list:
+    """anchor_rank の分布を返す（place_ok のみ）。"""
+    results = []
+    if df is None or len(df) == 0:
+        return results
+
+    ok = df[df['place_ok'].infer_objects(copy=False).fillna(False).astype(bool)].copy()
+    if len(ok) == 0:
+        return results
+
+    ok['_rcat'] = ok['anchor_rank'].apply(_r47_rank_category)
+
+    cat_order = ['1着', '2着', '3着', '4-5着', '6-8着', '9着以下', '不明']
+    n_total = len(ok)
+    for cat in cat_order:
+        n = int((ok['_rcat'] == cat).sum())
+        if n == 0:
+            continue
+        pct = n / n_total * 100.0
+        results.append({
+            'rank_cat': cat,
+            'n': n,
+            'pct': round(pct, 1),
+        })
+
+    return results
+
+
+def _r47_score_vs_rank_buckets(df, n_buckets: int = 5) -> list:
+    """AnchorScoreをn_buckets等分してバケット別の平均着順を計算する。"""
+    import numpy as np
+
+    results = []
+    if df is None or len(df) == 0:
+        return results
+
+    valid = df.dropna(subset=['anchor_score', 'anchor_rank']).copy()
+    valid['anchor_score'] = valid['anchor_score'].astype(float)
+    valid['anchor_rank']  = valid['anchor_rank'].astype(float)
+    if len(valid) < n_buckets:
+        return results
+
+    try:
+        valid['_bucket'] = (
+            (valid['anchor_score'].rank(pct=True) * n_buckets).clip(1, n_buckets).astype(int)
+        )
+        for b in range(1, n_buckets + 1):
+            rows = valid[valid['_bucket'] == b]
+            if len(rows) == 0:
+                continue
+            score_min = float(rows['anchor_score'].min())
+            score_max = float(rows['anchor_score'].max())
+            avg_rank  = float(rows['anchor_rank'].mean())
+            place_rate = float(
+                (rows['anchor_rank'] <= 3).sum() / len(rows) * 100.0)
+            results.append({
+                'bucket': int(b),
+                'score_range': '{:.1f}-{:.1f}'.format(score_min, score_max),
+                'n': int(len(rows)),
+                'avg_rank': round(avg_rank, 2),
+                'place_rate': round(place_rate, 1),
+            })
+    except Exception:
+        pass
+
+    return results
+
+
+def _r47_calibration_summary(pplace_stats: list) -> dict:
+    """p_place_est_pct vs 実際命中率のキャリブレーション評価。"""
+    if not pplace_stats:
+        return {'mean_abs_error': None, 'bias': None, 'quality': '不明'}
+
+    diffs = [abs(s['calibration_diff']) for s in pplace_stats if s['n'] >= 3]
+    biases = [s['calibration_diff'] for s in pplace_stats if s['n'] >= 3]
+
+    if not diffs:
+        return {'mean_abs_error': None, 'bias': None, 'quality': '不明'}
+
+    mae = sum(diffs) / len(diffs)
+    bias = sum(biases) / len(biases)
+
+    if mae < 5.0:
+        quality = '優秀（誤差<5%）'
+    elif mae < 10.0:
+        quality = '良好（誤差<10%）'
+    elif mae < 20.0:
+        quality = '普通（誤差<20%）'
+    else:
+        quality = '要改善（誤差≥20%）'
+
+    return {
+        'mean_abs_error': round(mae, 2),
+        'bias': round(bias, 2),
+        'quality': quality,
+    }
+
+
+def _r47_build_accuracy_md(
+        df,
+        corr: dict,
+        score_bands: list,
+        pplace_bands: list,
+        rank_dist: list,
+        buckets: list,
+        calibration: dict,
+        result_dir: str,
+) -> str:
+    """R47精度分析レポートMarkdownを生成する。"""
+    NL = '\n'
+    lines = []
+    A = lines.append
+
+    n_total = len(df) if df is not None else 0
+    n_ok = int(df['place_ok'].infer_objects(copy=False).fillna(False).astype(bool).sum()) if df is not None and len(df) > 0 else 0
+
+    A('# STELLA v1.33 アンカースコア精度分析レポート (R47)')
+    A('')
+    A('---')
+    A('')
+
+    # セクション0: 概要
+    A('## 0. 概要')
+    A('')
+    A('| 項目 | 値 |')
+    A('|---|---|')
+    A('| 対象ディレクトリ | `{}` |'.format(result_dir))
+    A('| 総レース数 | {} |'.format(n_total))
+    A('| 購入対象レース数 (place_ok) | {} |'.format(n_ok))
+    A('')
+    A('---')
+    A('')
+
+    # セクション1: スコア vs 着順 相関
+    A('## 1. AnchorScore ↔ 実際着順 相関分析')
+    A('')
+    A('| 指標 | 値 | 解釈 |')
+    A('|---|---|---|')
+
+    pr = corr.get('pearson_r')
+    sr = corr.get('spearman_r')
+    n_corr = corr.get('n', 0)
+
+    def corr_interp(r):
+        if r is None:
+            return 'N/A'
+        r = float(r)
+        if r < -0.5:
+            return '強い負の相関（高スコア→低着順）✅'
+        elif r < -0.3:
+            return '中程度の負の相関 ✅'
+        elif r < -0.1:
+            return '弱い負の相関'
+        elif r < 0.1:
+            return 'ほぼ無相関'
+        else:
+            return '正の相関（要確認）⚠️'
+
+    A('| ピアソン相関係数 | {} | {} |'.format(
+        '{:.4f}'.format(pr) if pr is not None else 'N/A', corr_interp(pr)))
+    A('| スピアマン相関係数 | {} | {} |'.format(
+        '{:.4f}'.format(sr) if sr is not None else 'N/A', corr_interp(sr)))
+    A('| 有効サンプル数 | {} | |'.format(n_corr))
+
+    ms_p = corr.get('mean_score_placed')
+    ms_u = corr.get('mean_score_unplaced')
+    diff  = corr.get('score_diff')
+    if ms_p is not None:
+        A('| 3着以内 平均スコア | {:.2f} | |'.format(ms_p))
+    if ms_u is not None:
+        A('| 4着以下 平均スコア | {:.2f} | |'.format(ms_u))
+    if diff is not None:
+        tag = '✅ 分別力あり' if diff > 2.0 else '⚠️ 分別力弱い' if diff > 0 else '❌ 逆転'
+        A('| スコア差（3着以内 - 4着以下） | {:+.2f} | {} |'.format(diff, tag))
+    A('')
+    A('---')
+    A('')
+
+    # セクション2: スコアバンド別命中率
+    A('## 2. AnchorScoreバンド別 命中率・ROI')
+    A('')
+    if score_bands:
+        A('| スコア帯 | レース数 | 命中数 | 命中率 | ROI | 平均着順 |')
+        A('|---|---|---|---|---|---|')
+        for sb in score_bands:
+            roi_str = '{:+.1f}%'.format(sb['roi'])
+            A('| {} | {} | {} | {:.1f}% | {} | {:.2f} |'.format(
+                sb['band'], sb['n'], sb['n_hit'],
+                sb['hit_rate'], roi_str, sb['avg_anchor_rank']))
+
+        # 最高命中率バンドと最高ROIバンドをハイライト
+        best_hit = max(score_bands, key=lambda x: x['hit_rate'])
+        best_roi = max(score_bands, key=lambda x: x['roi'])
+        A('')
+        A('> 💡 **最高命中率バンド**: `{}` — {:.1f}%'.format(
+            best_hit['band'], best_hit['hit_rate']))
+        A('> 💡 **最高ROIバンド**: `{}` — {:+.1f}%'.format(
+            best_roi['band'], best_roi['roi']))
+    else:
+        A('> データなし')
+    A('')
+    A('---')
+    A('')
+
+    # セクション3: p_place_est_pctバンド別
+    A('## 3. p_place_est_pct バンド別 命中率・キャリブレーション')
+    A('')
+    A('> キャリブレーション差 = 実際命中率 − 予測値。負なら過大予測、正なら過小予測。')
+    A('')
+    if pplace_bands:
+        A('| 予測帯 | レース数 | 命中率 | 予測値 | キャリブ差 | ROI |')
+        A('|---|---|---|---|---|---|')
+        for pb in pplace_bands:
+            roi_str = '{:+.1f}%'.format(pb['roi'])
+            diff_str = '{:+.1f}%'.format(pb['calibration_diff'])
+            A('| {} | {} | {:.1f}% | {:.1f}% | {} | {} |'.format(
+                pb['band'], pb['n'], pb['hit_rate'],
+                pb['avg_p_place_pct'], diff_str, roi_str))
+        A('')
+        # キャリブレーションサマリー
+        A('**キャリブレーション評価**:')
+        A('')
+        A('| 指標 | 値 |')
+        A('|---|---|')
+        A('| 平均絶対誤差 | {} |'.format(
+            '{:.2f}%'.format(calibration['mean_abs_error'])
+            if calibration.get('mean_abs_error') is not None else 'N/A'))
+        A('| バイアス（平均差） | {} |'.format(
+            '{:+.2f}%'.format(calibration['bias'])
+            if calibration.get('bias') is not None else 'N/A'))
+        A('| 品質評価 | {} |'.format(calibration.get('quality', '不明')))
+    else:
+        A('> データなし')
+    A('')
+    A('---')
+    A('')
+
+    # セクション4: 着順分布
+    A('## 4. アンカー着順分布（purchase_ok レース）')
+    A('')
+    if rank_dist:
+        A('| 着順カテゴリー | 件数 | 割合 |')
+        A('|---|---|---|')
+        for rd in rank_dist:
+            bar_w = int(rd['pct'] / 5)
+            bar = '█' * bar_w + '░' * (20 - bar_w)
+            A('| {} | {} | {:.1f}% `{}` |'.format(
+                rd['rank_cat'], rd['n'], rd['pct'], bar))
+    else:
+        A('> データなし')
+    A('')
+    A('---')
+    A('')
+
+    # セクション5: スコア5分位バケット
+    A('## 5. スコア5分位別 平均着順・複勝率')
+    A('')
+    A('> スコア低(Q1) → 高(Q5) の順に並べます。')
+    A('')
+    if buckets:
+        A('| 分位 | スコア範囲 | レース数 | 平均着順 | 複勝率 |')
+        A('|---|---|---|---|---|')
+        for bk in buckets:
+            A('| Q{} | {} | {} | {:.2f} | {:.1f}% |'.format(
+                bk['bucket'], bk['score_range'],
+                bk['n'], bk['avg_rank'], bk['place_rate']))
+
+        # モノトニック確認
+        ranks = [bk['avg_rank'] for bk in buckets]
+        is_mono = all(ranks[i] >= ranks[i+1] for i in range(len(ranks)-1))
+        rates   = [bk['place_rate'] for bk in buckets]
+        is_mono_rate = all(rates[i] <= rates[i+1] for i in range(len(rates)-1))
+        A('')
+        if is_mono:
+            A('> ✅ **スコアが高いほど着順が良い（モノトニック）** — スコアは単調な分別力を持ちます')
+        else:
+            A('> ⚠️ スコアと着順の関係が単調でない区間があります（データ量不足の可能性）')
+        if is_mono_rate:
+            A('> ✅ **スコアが高いほど複勝率も高い（モノトニック）**')
+        else:
+            A('> ⚠️ 複勝率のモノトニック性に例外があります')
+    else:
+        A('> データなし（5件以上のデータが必要です）')
+    A('')
+    A('---')
+    A('')
+
+    # セクション6: 総合評価
+    A('## 6. 総合精度評価')
+    A('')
+    scores_eval = []
+
+    # 相関評価
+    if pr is not None:
+        if pr < -0.4:
+            scores_eval.append(('スコア相関', '✅ 強い（r={:.3f}）'.format(pr), 3))
+        elif pr < -0.2:
+            scores_eval.append(('スコア相関', '🟡 中程度（r={:.3f}）'.format(pr), 2))
+        else:
+            scores_eval.append(('スコア相関', '❌ 弱い（r={:.3f}）'.format(pr), 1))
+
+    # スコア分別力評価
+    if diff is not None:
+        if diff > 5.0:
+            scores_eval.append(('分別力', '✅ 高い（差={:+.2f}点）'.format(diff), 3))
+        elif diff > 2.0:
+            scores_eval.append(('分別力', '🟡 中程度（差={:+.2f}点）'.format(diff), 2))
+        else:
+            scores_eval.append(('分別力', '❌ 低い（差={:+.2f}点）'.format(diff), 1))
+
+    # キャリブレーション評価
+    mae = calibration.get('mean_abs_error')
+    if mae is not None:
+        if mae < 5.0:
+            scores_eval.append(('キャリブレーション', '✅ 優秀（MAE={:.1f}%）'.format(mae), 3))
+        elif mae < 10.0:
+            scores_eval.append(('キャリブレーション', '🟡 良好（MAE={:.1f}%）'.format(mae), 2))
+        else:
+            scores_eval.append(('キャリブレーション', '❌ 要改善（MAE={:.1f}%）'.format(mae), 1))
+
+    if scores_eval:
+        A('| 評価軸 | 結果 |')
+        A('|---|---|')
+        for axis, result_str, _ in scores_eval:
+            A('| {} | {} |'.format(axis, result_str))
+
+        # 総合点
+        total_pts = sum(p for _, _, p in scores_eval)
+        max_pts   = len(scores_eval) * 3
+        grade_pct = total_pts / max_pts * 100 if max_pts > 0 else 0
+        if grade_pct >= 80:
+            overall = '**A: スコアは高精度** — 現在の設定を維持してください'
+        elif grade_pct >= 60:
+            overall = '**B: 概ね良好** — 細かいチューニングで改善の余地があります'
+        elif grade_pct >= 40:
+            overall = '**C: 改善余地あり** — R42チューニングと合わせて調整を推奨します'
+        else:
+            overall = '**D: 精度に課題** — パラメータ・データ収集方法の見直しを推奨します'
+        A('')
+        A('**総合評価**: {}'.format(overall))
+    else:
+        A('> データ不足のため評価できません（最低5レース以上必要）')
+    A('')
+    A('---')
+    A('')
+
+    import datetime as _dt
+    A('*Generated by STELLA v1.33 Anchor Accuracy (R47) — {}*'.format(
+        _dt.datetime.now().strftime('%Y-%m-%d %H:%M')))
+    A('')
+
+    return NL.join(lines)
+
+
+def analyze_anchor_accuracy(
+        result_dir: str,
+        params: dict,
+        out_md: str = None,
+        verbose: bool = True,
+) -> dict:
+    """R47: アンカースコア精度分析レポートを生成する。
+
+    分析内容:
+      - AnchorScore vs anchor_rank の相関（ピアソン・スピアマン）
+      - スコアバンド別（10点刻み）命中率・ROI
+      - p_place_est_pct バンド別キャリブレーション
+      - 着順分布（1着/2着/3着/4-5着/6-8着/9着以下）
+      - スコア5分位別の平均着順・複勝率
+
+    Args:
+        result_dir: JSONデータディレクトリ
+        params:     STELLAパラメータ辞書
+        out_md:     出力Markdownファイルパス
+        verbose:    進捗ログ表示
+
+    Returns:
+        dict: {report_md, correlation, score_bands, pplace_bands,
+               rank_dist, buckets, calibration, n_races}
+    """
+    import os as _os47
+
+    if verbose:
+        print('[R47] アンカースコア精度分析開始: {}'.format(result_dir))
+
+    df = _r41_load_results_df(result_dir)
+    n_total = len(df) if df is not None else 0
+
+    if verbose:
+        print('[R47] ロード: {}レース'.format(n_total))
+
+    _out = out_md or _os47.path.join(result_dir.rstrip('/'), 'anchor_accuracy_report.md')
+
+    if n_total == 0:
+        report_md = '# STELLA v1.33 アンカースコア精度分析レポート (R47)\n\nデータなし\n'
+        try:
+            from pathlib import Path as _P47
+            _P47(_out).parent.mkdir(parents=True, exist_ok=True)
+            _P47(_out).write_text(report_md, encoding='utf-8')
+        except Exception:
+            pass
+        return dict(report_md=report_md, correlation={}, score_bands=[],
+                    pplace_bands=[], rank_dist=[], buckets=[], calibration={},
+                    n_races=0, out_md=_out)
+
+    # 各分析実行
+    corr        = _r47_score_rank_correlation(df)
+    score_bands = _r47_score_band_stats(df)
+    pplace_bands = _r47_pplace_band_stats(df)
+    rank_dist   = _r47_rank_distribution(df)
+    buckets     = _r47_score_vs_rank_buckets(df, n_buckets=5)
+    calibration = _r47_calibration_summary(pplace_bands)
+
+    if verbose:
+        pr = corr.get('pearson_r')
+        print('[R47] 相関係数 (Pearson): {}'.format(
+            '{:.4f}'.format(pr) if pr is not None else 'N/A'))
+        q = calibration.get('quality', '不明')
+        print('[R47] キャリブレーション品質: {}'.format(q))
+
+    # Markdown生成
+    report_md = _r47_build_accuracy_md(
+        df=df,
+        corr=corr,
+        score_bands=score_bands,
+        pplace_bands=pplace_bands,
+        rank_dist=rank_dist,
+        buckets=buckets,
+        calibration=calibration,
+        result_dir=result_dir,
+    )
+
+    # 保存
+    try:
+        from pathlib import Path as _P47b
+        _P47b(_out).parent.mkdir(parents=True, exist_ok=True)
+        _P47b(_out).write_text(report_md, encoding='utf-8')
+        if verbose:
+            print('[R47] レポート保存 -> {}'.format(_out))
+    except Exception as _e:
+        if verbose:
+            print('[R47] 保存失敗: {}'.format(_e))
+
+    return dict(
+        report_md=report_md,
+        correlation=corr,
+        score_bands=score_bands,
+        pplace_bands=pplace_bands,
+        rank_dist=rank_dist,
+        buckets=buckets,
+        calibration=calibration,
+        n_races=n_total,
+        out_md=_out,
+    )
+
+
+# =========================
+
+
+# =========================
+# R48: 全分析統合レポート (v1.24)
+# =========================
+# Purpose: --full_analysis で R41-R47 の全分析を一括実行し
+#          統合Markdownレポートを生成する
+# =========================
+
+import datetime as _dt48
+import json as _json48
+
+# ---------------------------------------------------------------------------
+# ユーティリティ
+# ---------------------------------------------------------------------------
+
+def _r48_safe_run(name, fn, **kwargs):
+    """関数を安全に実行し (result, error_str) を返す"""
+    try:
+        r = fn(**kwargs)
+        return r, None
+    except Exception as _e48:
+        return None, str(_e48)
+
+
+def _r48_fmt_pct(v, decimals=1):
+    """数値をパーセント文字列に変換"""
+    if v is None:
+        return 'N/A'
+    try:
+        return '{:.{}f}%'.format(float(v) * 100, decimals)
+    except Exception:
+        return str(v)
+
+
+def _r48_fmt_float(v, decimals=2, suffix=''):
+    """数値を文字列に変換"""
+    if v is None:
+        return 'N/A'
+    try:
+        return '{:.{}f}{}'.format(float(v), decimals, suffix)
+    except Exception:
+        return str(v)
+
+
+def _r48_status_icon(error):
+    """エラーの有無でアイコンを返す"""
+    return '[OK]' if error is None else '[NG]'
+
+
+# ---------------------------------------------------------------------------
+# 全分析一括実行
+# ---------------------------------------------------------------------------
+
+def _r48_run_all_analyses(result_dir, params, stakes, verbose=True):
+    """R41-R47 の全分析を順番に実行し結果辞書を返す"""
+    NL = '\n'
+    all_results = {}
+
+    MODULES = [
+        ('r41', 'R41 事後分析',        'analyze_race_results',
+         dict(result_dir=result_dir, params=params,
+              stake_place=stakes.get('place', 1000.0))),
+        ('r42', 'R42 信頼度チューニング', 'tune_confidence_params',
+         dict(result_dir=result_dir, params=params)),
+        ('r43', 'R43 ワイドROI',        'analyze_wide_roi',
+         dict(result_dir=result_dir, params=params,
+              stake_wide_per=stakes.get('wide', 100.0))),
+        ('r44', 'R44 三連複ROI',        'analyze_trio_roi',
+         dict(result_dir=result_dir, params=params,
+              stake_trio_per=stakes.get('trio', 100.0))),
+        ('r45', 'R45 総合ダッシュボード', 'analyze_dashboard',
+         dict(result_dir=result_dir, params=params,
+              stake_place=stakes.get('place', 1000.0),
+              stake_wide=stakes.get('wide', 100.0),
+              stake_trio=stakes.get('trio', 100.0))),
+        ('r46', 'R46 カテゴリーROI',    'analyze_category_roi',
+         dict(result_dir=result_dir, params=params,
+              stake_per=stakes.get('place', 1000.0))),
+        ('r47', 'R47 アンカースコア精度', 'analyze_anchor_accuracy',
+         dict(result_dir=result_dir, params=params)),
+    ]
+
+    _fn_map48 = {
+        'analyze_race_results':   analyze_race_results,
+        'tune_confidence_params': tune_confidence_params,
+        'analyze_wide_roi':       analyze_wide_roi,
+        'analyze_trio_roi':       analyze_trio_roi,
+        'analyze_dashboard':      analyze_dashboard,
+        'analyze_category_roi':   analyze_category_roi,
+        'analyze_anchor_accuracy': analyze_anchor_accuracy,
+    }
+
+    for key, label, fn_name, kwargs in MODULES:
+        if verbose:
+            print('[R48] 実行中: {}...'.format(label))
+        fn48 = _fn_map48.get(fn_name)
+        if fn48 is None:
+            all_results[key] = {'result': None, 'error': 'function not found: ' + fn_name,
+                                 'label': label}
+            continue
+        result48, err48 = _r48_safe_run(fn_name, fn48, **kwargs)
+        all_results[key] = {'result': result48, 'error': err48, 'label': label}
+        if verbose:
+            icon48 = _r48_status_icon(err48)
+            print('[R48] {} {} {}'.format(icon48, label,
+                  ('=> ' + str(err48)[:80]) if err48 else ''))
+
+    return all_results
+
+
+# ---------------------------------------------------------------------------
+# 主要KPI抽出
+# ---------------------------------------------------------------------------
+
+def _r48_extract_kpis(all_results):
+    """各分析結果から主要KPIを抽出して辞書を返す"""
+    kpis = {}
+
+    # R41
+    r41 = (all_results.get('r41') or {}).get('result')
+    if isinstance(r41, dict):
+        kpis['place_hit_rate'] = r41.get('place_hit_rate')
+        kpis['place_roi']      = r41.get('place_roi')
+        kpis['n_races']        = r41.get('n_races')
+    elif isinstance(r41, str):
+        # analyze_race_results が文字列を返す場合は parse しない
+        kpis['r41_report_str'] = True
+
+    # R42
+    r42 = (all_results.get('r42') or {}).get('result')
+    if isinstance(r42, dict):
+        best42 = r42.get('best_params') or {}
+        kpis['tuned_min_p_place'] = best42.get('min_p_place_est')
+        kpis['tuned_high_conf']   = best42.get('high_conf_threshold')
+        kpis['r42_n_eval']        = r42.get('n_evaluated')
+
+    # R43
+    r43 = (all_results.get('r43') or {}).get('result')
+    if isinstance(r43, dict):
+        kpis['wide_best_n_points'] = r43.get('best_n_points')
+        kpis['wide_best_rank_by']  = r43.get('best_rank_by')
+        kpis['wide_roi']           = r43.get('best_roi')
+        kpis['wide_n_races']       = r43.get('n_races')
+
+    # R44
+    r44 = (all_results.get('r44') or {}).get('result')
+    if isinstance(r44, dict):
+        kpis['trio_best_max_points'] = r44.get('best_max_points')
+        kpis['trio_roi']             = r44.get('best_roi')
+        kpis['trio_n_races']         = r44.get('n_races')
+
+    # R45
+    r45 = (all_results.get('r45') or {}).get('result')
+    if isinstance(r45, dict):
+        kpis['composite_score'] = r45.get('composite_score')
+        kpis['composite_grade'] = r45.get('composite_grade')
+
+    # R46
+    r46 = (all_results.get('r46') or {}).get('result')
+    if isinstance(r46, dict):
+        kpis['best_venue']    = r46.get('best_venue')
+        kpis['best_slot']     = r46.get('best_slot')
+        kpis['best_dist_cat'] = r46.get('best_dist_cat')
+
+    # R47
+    r47 = (all_results.get('r47') or {}).get('result')
+    if isinstance(r47, dict):
+        corr47 = r47.get('correlation') or {}
+        kpis['pearson_r']  = corr47.get('pearson_r')
+        kpis['spearman_r'] = corr47.get('spearman_r')
+        cal47 = r47.get('calibration') or {}
+        kpis['cal_mae']    = cal47.get('mae')
+
+    return kpis
+
+
+# ---------------------------------------------------------------------------
+# Markdownレポートビルダー
+# ---------------------------------------------------------------------------
+
+def _r48_bar(value, max_val=100, width=20, char='#'):
+    """ASCII バー生成"""
+    if value is None or max_val == 0:
+        return '[' + ' ' * width + '] N/A'
+    frac = min(max(float(value) / float(max_val), 0.0), 1.0)
+    filled = int(round(frac * width))
+    return '[' + char * filled + ' ' * (width - filled) + '] {:.1f}'.format(float(value))
+
+
+def _r48_build_full_md(all_results, kpis, meta, stakes):
+    """全分析統合Markdownレポートを生成する"""
+    NL = '\n'
+    SEP = '---'
+    lines = []
+
+    ts48   = meta.get('timestamp', '')
+    rdir48 = meta.get('result_dir', '')
+    sp48   = stakes.get('place', 1000.0)
+    sw48   = stakes.get('wide',  100.0)
+    st48   = stakes.get('trio',  100.0)
+
+    # ヘッダー
+    lines += [
+        '# STELLA v1.32  全分析統合レポート (R48)',
+        '',
+        '| 項目 | 値 |',
+        '|------|-----|',
+        '| 生成日時 | ' + ts48 + ' |',
+        '| 対象ディレクトリ | ' + rdir48 + ' |',
+        '| 複勝賭け金 | ' + '{:,.0f}円'.format(sp48) + ' |',
+        '| ワイド賭け金 | ' + '{:,.0f}円/点'.format(sw48) + ' |',
+        '| 三連複賭け金 | ' + '{:,.0f}円/点'.format(st48) + ' |',
+        '',
+        SEP,
+    ]
+
+    # ─────────────────────────────────────
+    # セクション0: 実行サマリー
+    # ─────────────────────────────────────
+    LABELS48 = {
+        'r41': 'R41 事後分析',
+        'r42': 'R42 信頼度チューニング',
+        'r43': 'R43 ワイドROI最適化',
+        'r44': 'R44 三連複ROI最適化',
+        'r45': 'R45 総合ダッシュボード',
+        'r46': 'R46 カテゴリーROI',
+        'r47': 'R47 アンカースコア精度',
+    }
+    ok_count48 = sum(1 for k in LABELS48 if (all_results.get(k) or {}).get('error') is None)
+    total48 = len(LABELS48)
+
+    lines += [
+        '## セクション0: 実行サマリー',
+        '',
+        '成功: {}/{} モジュール'.format(ok_count48, total48),
+        '',
+        '| モジュール | ステータス | 備考 |',
+        '|-----------|-----------|------|',
+    ]
+    for key48, lbl48 in LABELS48.items():
+        info48 = all_results.get(key48) or {}
+        err48  = info48.get('error')
+        icon48 = 'OK' if err48 is None else 'NG'
+        note48 = '' if err48 is None else str(err48)[:60]
+        lines.append('| ' + lbl48 + ' | ' + icon48 + ' | ' + note48 + ' |')
+    lines += ['', SEP]
+
+    # ─────────────────────────────────────
+    # セクション1: 主要KPI一覧
+    # ─────────────────────────────────────
+    lines += [
+        '## セクション1: 主要KPI一覧',
+        '',
+        '| KPI | 値 |',
+        '|-----|-----|',
+        '| 複勝命中率 | ' + _r48_fmt_pct(kpis.get('place_hit_rate')) + ' |',
+        '| 複勝ROI | ' + _r48_fmt_float(kpis.get('place_roi'), 3) + ' |',
+        '| レース数 (R41) | ' + str(kpis.get('n_races', 'N/A')) + ' |',
+        '| ワイドROI (最適) | ' + _r48_fmt_float(kpis.get('wide_roi'), 3) + ' |',
+        '| 三連複ROI (最適) | ' + _r48_fmt_float(kpis.get('trio_roi'), 3) + ' |',
+        '| 総合スコア (R45) | ' + _r48_fmt_float(kpis.get('composite_score'), 1) + '/100 |',
+        '| 総合グレード (R45) | ' + str(kpis.get('composite_grade', 'N/A')) + ' |',
+        '| AnchorScore Pearson r | ' + _r48_fmt_float(kpis.get('pearson_r'), 4) + ' |',
+        '| AnchorScore Spearman r | ' + _r48_fmt_float(kpis.get('spearman_r'), 4) + ' |',
+        '| p_place_est MAE | ' + _r48_fmt_float(kpis.get('cal_mae'), 4) + ' |',
+    ]
+
+    # 総合スコアバー
+    cs48 = kpis.get('composite_score')
+    if cs48 is not None:
+        lines += [
+            '',
+            '総合スコア: ' + _r48_bar(cs48, 100, 20),
+        ]
+    lines += ['', SEP]
+
+    # ─────────────────────────────────────
+    # セクション2: R41 事後分析サマリー
+    # ─────────────────────────────────────
+    lines += ['## セクション2: R41 事後分析サマリー', '']
+    r41_info = all_results.get('r41') or {}
+    r41_err  = r41_info.get('error')
+    if r41_err:
+        lines += ['> エラー: ' + r41_err, '']
+    else:
+        r41_res = r41_info.get('result')
+        if isinstance(r41_res, str):
+            # 文字列レポートの場合、最初の40行だけ抜粋
+            r41_lines48 = r41_res.splitlines()[:40]
+            lines += ['```', NL.join(r41_lines48), '```', '']
+        elif isinstance(r41_res, dict):
+            lines += [
+                '- レース数: ' + str(r41_res.get('n_races', 'N/A')),
+                '- 複勝命中率: ' + _r48_fmt_pct(r41_res.get('place_hit_rate')),
+                '- 複勝ROI: ' + _r48_fmt_float(r41_res.get('place_roi'), 3),
+                '',
+            ]
+        else:
+            lines += ['> データなし', '']
+    lines += [SEP]
+
+    # ─────────────────────────────────────
+    # セクション3: R42 信頼度チューニング
+    # ─────────────────────────────────────
+    lines += ['## セクション3: R42 信頼度チューニング結果', '']
+    r42_info = all_results.get('r42') or {}
+    r42_err  = r42_info.get('error')
+    if r42_err:
+        lines += ['> エラー: ' + r42_err, '']
+    else:
+        r42_res = r42_info.get('result') or {}
+        if isinstance(r42_res, dict):
+            bp42 = r42_res.get('best_params') or {}
+            lines += [
+                '| パラメータ | 推奨値 |',
+                '|-----------|--------|',
+                '| min_p_place_est | ' + str(bp42.get('min_p_place_est', 'N/A')) + ' |',
+                '| high_conf_threshold | ' + str(bp42.get('high_conf_threshold', 'N/A')) + ' |',
+                '| low_conf_threshold | ' + str(bp42.get('low_conf_threshold', 'N/A')) + ' |',
+                '| evaluated | ' + str(r42_res.get('n_evaluated', 'N/A')) + ' 組 |',
+                '',
+            ]
+        else:
+            lines += ['> データなし', '']
+    lines += [SEP]
+
+    # ─────────────────────────────────────
+    # セクション4: R43 ワイドROI最適化
+    # ─────────────────────────────────────
+    lines += ['## セクション4: R43 ワイドROI最適化', '']
+    r43_info = all_results.get('r43') or {}
+    r43_err  = r43_info.get('error')
+    if r43_err:
+        lines += ['> エラー: ' + r43_err, '']
+    else:
+        r43_res = r43_info.get('result') or {}
+        if isinstance(r43_res, dict):
+            lines += [
+                '| 項目 | 値 |',
+                '|-----|-----|',
+                '| 推奨 n_points | ' + str(r43_res.get('best_n_points', 'N/A')) + ' |',
+                '| 推奨 rank_by | ' + str(r43_res.get('best_rank_by', 'N/A')) + ' |',
+                '| 最適ROI | ' + _r48_fmt_float(r43_res.get('best_roi'), 3) + ' |',
+                '| 対象レース数 | ' + str(r43_res.get('n_races', 'N/A')) + ' |',
+                '',
+            ]
+        else:
+            lines += ['> データなし', '']
+    lines += [SEP]
+
+    # ─────────────────────────────────────
+    # セクション5: R44 三連複ROI最適化
+    # ─────────────────────────────────────
+    lines += ['## セクション5: R44 三連複ROI最適化', '']
+    r44_info = all_results.get('r44') or {}
+    r44_err  = r44_info.get('error')
+    if r44_err:
+        lines += ['> エラー: ' + r44_err, '']
+    else:
+        r44_res = r44_info.get('result') or {}
+        if isinstance(r44_res, dict):
+            lines += [
+                '| 項目 | 値 |',
+                '|-----|-----|',
+                '| 推奨 max_points | ' + str(r44_res.get('best_max_points', 'N/A')) + ' |',
+                '| 最適ROI | ' + _r48_fmt_float(r44_res.get('best_roi'), 3) + ' |',
+                '| 対象レース数 | ' + str(r44_res.get('n_races', 'N/A')) + ' |',
+                '',
+            ]
+        else:
+            lines += ['> データなし', '']
+    lines += [SEP]
+
+    # ─────────────────────────────────────
+    # セクション6: R46 カテゴリーROI
+    # ─────────────────────────────────────
+    lines += ['## セクション6: R46 カテゴリーROI分析', '']
+    r46_info = all_results.get('r46') or {}
+    r46_err  = r46_info.get('error')
+    if r46_err:
+        lines += ['> エラー: ' + r46_err, '']
+    else:
+        r46_res = r46_info.get('result') or {}
+        if isinstance(r46_res, dict):
+            lines += [
+                '| 項目 | 値 |',
+                '|-----|-----|',
+                '| 推奨会場 | ' + str(r46_res.get('best_venue', 'N/A')) + ' |',
+                '| 推奨時間帯 | ' + str(r46_res.get('best_slot', 'N/A')) + ' |',
+                '| 推奨距離区分 | ' + str(r46_res.get('best_dist_cat', 'N/A')) + ' |',
+                '| 対象レース数 | ' + str(r46_res.get('n_races', 'N/A')) + ' |',
+                '',
+            ]
+        else:
+            lines += ['> データなし', '']
+    lines += [SEP]
+
+    # ─────────────────────────────────────
+    # セクション7: R47 アンカースコア精度
+    # ─────────────────────────────────────
+    lines += ['## セクション7: R47 アンカースコア精度分析', '']
+    r47_info = all_results.get('r47') or {}
+    r47_err  = r47_info.get('error')
+    if r47_err:
+        lines += ['> エラー: ' + r47_err, '']
+    else:
+        r47_res = r47_info.get('result') or {}
+        if isinstance(r47_res, dict):
+            corr47 = r47_res.get('correlation') or {}
+            cal47  = r47_res.get('calibration') or {}
+            lines += [
+                '| 指標 | 値 |',
+                '|-----|-----|',
+                '| Pearson r (スコア vs 着順) | ' + _r48_fmt_float(corr47.get('pearson_r'), 4) + ' |',
+                '| Spearman r | ' + _r48_fmt_float(corr47.get('spearman_r'), 4) + ' |',
+                '| p_place_est MAE | ' + _r48_fmt_float(cal47.get('mae'), 4) + ' |',
+                '| p_place_est バイアス | ' + _r48_fmt_float(cal47.get('bias'), 4) + ' |',
+                '| 対象レース数 | ' + str(r47_res.get('n_races', 'N/A')) + ' |',
+                '',
+            ]
+        else:
+            lines += ['> データなし', '']
+    lines += [SEP]
+
+    # ─────────────────────────────────────
+    # セクション8: R45 総合ダッシュボード
+    # ─────────────────────────────────────
+    lines += ['## セクション8: R45 総合ダッシュボード', '']
+    r45_info = all_results.get('r45') or {}
+    r45_err  = r45_info.get('error')
+    if r45_err:
+        lines += ['> エラー: ' + r45_err, '']
+    else:
+        r45_res = r45_info.get('result') or {}
+        if isinstance(r45_res, dict):
+            cs45  = r45_res.get('composite_score')
+            grd45 = r45_res.get('composite_grade', 'N/A')
+            lines += [
+                '総合スコア: ' + _r48_fmt_float(cs45, 1, '/100') + '  グレード: ' + str(grd45),
+                '',
+                _r48_bar(cs45 or 0, 100, 30),
+                '',
+            ]
+        else:
+            lines += ['> データなし', '']
+    lines += [SEP]
+
+    # ─────────────────────────────────────
+    # セクション9: 総合推奨設定 (JSON)
+    # ─────────────────────────────────────
+    lines += ['## セクション9: 総合推奨設定', '']
+
+    rec48 = {}
+
+    r42_bp = ((all_results.get('r42') or {}).get('result') or {}).get('best_params') or {}
+    if r42_bp:
+        rec48['confidence'] = {
+            'min_p_place_est':    r42_bp.get('min_p_place_est'),
+            'high_conf_threshold': r42_bp.get('high_conf_threshold'),
+            'low_conf_threshold':  r42_bp.get('low_conf_threshold'),
+        }
+
+    r43_res2 = (all_results.get('r43') or {}).get('result') or {}
+    if r43_res2:
+        rec48['wide'] = {
+            'n_points': r43_res2.get('best_n_points'),
+            'rank_by':  r43_res2.get('best_rank_by'),
+        }
+
+    r44_res2 = (all_results.get('r44') or {}).get('result') or {}
+    if r44_res2:
+        rec48['trio'] = {
+            'max_points': r44_res2.get('best_max_points'),
+        }
+
+    r46_res2 = (all_results.get('r46') or {}).get('result') or {}
+    if r46_res2:
+        rec48['category'] = {
+            'venue':    r46_res2.get('best_venue'),
+            'slot':     r46_res2.get('best_slot'),
+            'dist_cat': r46_res2.get('best_dist_cat'),
+        }
+
+    lines += [
+        '```json',
+        _json48.dumps(rec48, ensure_ascii=False, indent=2),
+        '```',
+        '',
+        SEP,
+    ]
+
+    # ─────────────────────────────────────
+    # セクション10: 次アクション提案
+    # ─────────────────────────────────────
+    lines += ['## セクション10: 次アクション提案', '']
+
+    cs48_v = kpis.get('composite_score')
+    if cs48_v is None:
+        lines += ['> 総合スコアが計算できなかったため、具体的な提案を生成できません。', '']
+    else:
+        cs48_f = float(cs48_v)
+        if cs48_f >= 75:
+            lines += [
+                '**現状評価: 良好 (スコア >= 75)**',
+                '',
+                '1. 現在のパラメータを本番運用に適用してください。',
+                '2. R46 推奨会場・時間帯への集中投資を検討してください。',
+                '3. 月次トレンド分析 (R49候補) でパフォーマンスを継続監視してください。',
+                '',
+            ]
+        elif cs48_f >= 50:
+            lines += [
+                '**現状評価: 普通 (スコア 50-74)**',
+                '',
+                '1. R42 推奨パラメータをまず適用し、複勝命中率の改善を確認してください。',
+                '2. ワイド・三連複は推奨設定で試験運用し、収益を記録してください。',
+                '3. データが蓄積されたら再度全分析を実行してください。',
+                '',
+            ]
+        else:
+            lines += [
+                '**現状評価: 要改善 (スコア < 50)**',
+                '',
+                '1. まずはデータ収集期間を延長し、サンプル数を増やしてください。',
+                '2. AnchorScore の相関が低い場合はスコアリングモデルの見直しを検討してください。',
+                '3. 複勝命中率が 30% 未満の場合は p_place_est の閾値を下げてください。',
+                '',
+            ]
+
+    lines += [
+        '---',
+        '*Generated by STELLA v1.32 R48 Full Analysis Report*',
+    ]
+
+    return NL.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# メインドライバー
+# ---------------------------------------------------------------------------
+
+def analyze_full(
+    result_dir,
+    params=None,
+    stake_place=1000.0,
+    stake_wide=100.0,
+    stake_trio=100.0,
+    out_md=None,
+    verbose=True,
+):
+    """全分析統合レポート生成メインドライバー (R48)
+
+    Parameters
+    ----------
+    result_dir : str
+        結果JSONが格納されているディレクトリ
+    params : dict, optional
+        予測パラメータ辞書
+    stake_place : float
+        複勝1レースの賭け金 (円)
+    stake_wide : float
+        ワイド1点の賭け金 (円)
+    stake_trio : float
+        三連複1点の賭け金 (円)
+    out_md : str, optional
+        出力Markdownファイルパス
+    verbose : bool
+        進捗を表示するか
+
+    Returns
+    -------
+    dict
+        report_md, all_results, kpis, success_count, total_count
+    """
+    if params is None:
+        params = {}
+
+    stakes = {
+        'place': float(stake_place or 1000.0),
+        'wide':  float(stake_wide  or 100.0),
+        'trio':  float(stake_trio  or 100.0),
+    }
+
+    meta = {
+        'timestamp':  _dt48.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'result_dir': str(result_dir),
+    }
+
+    if verbose:
+        print('[R48] 全分析統合レポート開始 dir={}'.format(result_dir))
+
+    all_results = _r48_run_all_analyses(result_dir, params, stakes, verbose=verbose)
+    kpis        = _r48_extract_kpis(all_results)
+    report_md   = _r48_build_full_md(all_results, kpis, meta, stakes)
+
+    if out_md:
+        from pathlib import Path as _Path48
+        _Path48(out_md).parent.mkdir(parents=True, exist_ok=True)
+        _Path48(out_md).write_text(report_md, encoding='utf-8')
+        if verbose:
+            print('[R48] レポート保存 -> {}'.format(out_md))
+
+    ok_count = sum(
+        1 for k in ['r41', 'r42', 'r43', 'r44', 'r45', 'r46', 'r47']
+        if (all_results.get(k) or {}).get('error') is None
+    )
+
+    if verbose:
+        cs_v = kpis.get('composite_score')
+        print('[R48] 完了: 成功={}/7, composite_score={}'.format(
+            ok_count,
+            '{:.1f}'.format(float(cs_v)) if cs_v is not None else 'N/A',
+        ))
+
+    return {
+        'report_md':     report_md,
+        'all_results':   all_results,
+        'kpis':          kpis,
+        'success_count': ok_count,
+        'total_count':   7,
+    }
+
+
+
+
+
+# =========================
+# R49: 会場別ダッシュボード (v1.25)
+# =========================
+# Purpose: 東京・阪神・中山・京都など各開催場ごとに
+#          複勝/ワイド/三連複の成績を分析し、
+#          会場別Markdownダッシュボードを生成する
+# =========================
+
+import datetime as _dt49
+import json as _json49
+
+# ---------------------------------------------------------------------------
+# 定数
+# ---------------------------------------------------------------------------
+
+# 分析対象会場（順序固定）
+_R49_TARGET_VENUES = ['東京', '阪神', '中山', '京都', '中京', '新潟',
+                      '福島', '小倉', '札幌', '函館', 'その他', '不明']
+
+# 主要4場
+_R49_MAJOR4 = {'東京', '阪神', '中山', '京都'}
+
+
+# ---------------------------------------------------------------------------
+# ユーティリティ
+# ---------------------------------------------------------------------------
+
+def _r49_pct(v, denom, decimals=1):
+    """v/denom をパーセント文字列に変換"""
+    if denom == 0 or v is None:
+        return 'N/A'
+    return '{:.{}f}%'.format(float(v) / float(denom) * 100, decimals)
+
+
+def _r49_roi_str(roi, decimals=3):
+    """ROI float → 文字列（N/Aハンドリング付き）"""
+    if roi is None:
+        return 'N/A'
+    try:
+        return '{:.{}f}'.format(float(roi), decimals)
+    except Exception:
+        return str(roi)
+
+
+def _r49_trend_mark(roi):
+    """ROIから傾向マークを返す"""
+    if roi is None:
+        return '?'
+    try:
+        r = float(roi)
+        if r >= 1.10:
+            return '+++'
+        elif r >= 1.00:
+            return '++'
+        elif r >= 0.85:
+            return '+'
+        elif r >= 0.70:
+            return '-'
+        else:
+            return '--'
+    except Exception:
+        return '?'
+
+
+def _r49_ascii_bar(value, max_val=1.5, width=15, char='='):
+    """ROI用ASCIIバー（1.0基準線付き）"""
+    if value is None:
+        return '[' + ' ' * width + '] N/A'
+    try:
+        v = float(value)
+        frac = min(max(v / max(float(max_val), 0.001), 0.0), 1.0)
+        filled = int(round(frac * width))
+        bar = char * filled + ' ' * (width - filled)
+        return '[{}] {:.3f}'.format(bar, v)
+    except Exception:
+        return '[' + ' ' * width + '] N/A'
+
+
+# ---------------------------------------------------------------------------
+# データロード・集計
+# ---------------------------------------------------------------------------
+
+def _r49_load_df(result_dir, params=None):
+    """result_dir から _r46_load_enriched_df を利用してDataFrameをロード"""
+    try:
+        df = _r46_load_enriched_df(result_dir)
+        return df
+    except Exception as _e49:
+        return None
+
+
+def _r49_venue_stats_one(df, venue, stake_place, stake_wide, stake_trio):
+    """特定会場のKPI辞書を計算して返す"""
+    import pandas as _pd49
+    if df is None or len(df) == 0:
+        return {'venue': venue, 'n': 0}
+
+    vdf = df[df['venue_cat'] == venue].copy() if 'venue_cat' in df.columns else df.copy()
+    n = len(vdf)
+    if n == 0:
+        return {'venue': venue, 'n': 0}
+
+    # ── 複勝 ──
+    place_ok   = vdf['place_hit'].infer_objects(copy=False).fillna(False).astype(bool)
+    n_place_ok = int(place_ok.sum())
+    place_hit_rate = n_place_ok / n if n > 0 else 0.0
+
+    place_payouts = vdf['payout_fukusho_max'].infer_objects(copy=False).fillna(0.0).astype(float)
+    place_total_stake = float(stake_place) * n
+    place_total_return = float((place_ok.astype(float) * place_payouts).sum())
+    place_roi = place_total_return / place_total_stake if place_total_stake > 0 else None
+
+    # ── ワイド ──
+    wide_hit = vdf.get('wide_hit', _pd49.Series([False] * n, index=vdf.index))
+    wide_hit = wide_hit.infer_objects(copy=False).fillna(False).astype(bool)
+    n_wide   = int(wide_hit.sum())
+    wide_payout = vdf.get('payout_wide_max', _pd49.Series([0.0] * n, index=vdf.index))
+    wide_payout = wide_payout.infer_objects(copy=False).fillna(0.0).astype(float)
+    # ワイドのポイント数を推定（best_n_points=4 をデフォルト）
+    wide_n_pts = 4
+    wide_total_stake  = float(stake_wide) * wide_n_pts * n
+    wide_total_return = float((wide_hit.astype(float) * wide_payout).sum())
+    wide_roi = wide_total_return / wide_total_stake if wide_total_stake > 0 else None
+
+    # ── 三連複 ──
+    trio_hit = vdf.get('trio_hit', _pd49.Series([False] * n, index=vdf.index))
+    trio_hit = trio_hit.infer_objects(copy=False).fillna(False).astype(bool)
+    n_trio   = int(trio_hit.sum())
+    trio_payout = vdf.get('payout_sanrenpuku', _pd49.Series([0.0] * n, index=vdf.index))
+    trio_payout = trio_payout.infer_objects(copy=False).fillna(0.0).astype(float)
+    trio_n_pts = 10
+    trio_total_stake  = float(stake_trio) * trio_n_pts * n
+    trio_total_return = float((trio_hit.astype(float) * trio_payout).sum())
+    trio_roi = trio_total_return / trio_total_stake if trio_total_stake > 0 else None
+
+    # ── ペース分布 ──
+    pace_counts = {}
+    if 'pace' in vdf.columns:
+        for pc in ['ハイ', 'ミドル', 'スロー']:
+            pace_counts[pc] = int((vdf['pace'] == pc).sum())
+
+    # ── 距離区分 ──
+    dist_counts = {}
+    if 'dist_cat' in vdf.columns:
+        for dc in ['短距離', 'マイル', '中距離', '長距離', '不明']:
+            dist_counts[dc] = int((vdf['dist_cat'] == dc).sum())
+
+    # ── アンカースコア統計 ──
+    if 'anchor_score' in vdf.columns:
+        scores = vdf['anchor_score'].dropna().astype(float)
+        score_mean = float(scores.mean()) if len(scores) > 0 else None
+        score_std  = float(scores.std())  if len(scores) > 1 else None
+    else:
+        score_mean = score_std = None
+
+    # ── 信頼度別複勝率 ──
+    conf_stats = {}
+    if 'confidence_level' in vdf.columns:
+        for cl in ['High', 'Mid', 'Low']:
+            cdf = vdf[vdf['confidence_level'] == cl]
+            cn  = len(cdf)
+            if cn > 0:
+                ch = int(cdf['place_hit'].infer_objects(copy=False).fillna(False).astype(bool).sum())
+                conf_stats[cl] = {'n': cn, 'hit': ch,
+                                  'rate': ch / cn}
+            else:
+                conf_stats[cl] = {'n': 0, 'hit': 0, 'rate': None}
+
+    return {
+        'venue':        venue,
+        'n':            n,
+        'place_hit_rate': place_hit_rate,
+        'place_roi':    place_roi,
+        'n_place_ok':   n_place_ok,
+        'wide_roi':     wide_roi,
+        'n_wide':       n_wide,
+        'trio_roi':     trio_roi,
+        'n_trio':       n_trio,
+        'pace_counts':  pace_counts,
+        'dist_counts':  dist_counts,
+        'score_mean':   score_mean,
+        'score_std':    score_std,
+        'conf_stats':   conf_stats,
+    }
+
+
+def _r49_all_venue_stats(df, stake_place, stake_wide, stake_trio):
+    """全会場のKPI辞書リストを返す（n>0 のみ）"""
+    results = []
+    for venue in _R49_TARGET_VENUES:
+        s = _r49_venue_stats_one(df, venue, stake_place, stake_wide, stake_trio)
+        if s.get('n', 0) > 0:
+            results.append(s)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Markdownレポート生成
+# ---------------------------------------------------------------------------
+
+def _r49_build_venue_dashboard_md(venue_stats_list, df_total_n, meta, stakes):
+    """会場別ダッシュボードMarkdownを生成する"""
+    NL  = '\n'
+    SEP = '---'
+    lines = []
+
+    ts49   = meta.get('timestamp', '')
+    rdir49 = meta.get('result_dir', '')
+    sp49   = stakes.get('place', 1000.0)
+    sw49   = stakes.get('wide',  100.0)
+    st49   = stakes.get('trio',  100.0)
+
+    # ── ヘッダー ──
+    lines += [
+        '# STELLA v1.32  会場別ダッシュボード (R49)',
+        '',
+        '| 項目 | 値 |',
+        '|------|-----|',
+        '| 生成日時 | ' + ts49 + ' |',
+        '| 対象ディレクトリ | ' + rdir49 + ' |',
+        '| 総レース数 | {} レース |'.format(df_total_n),
+        '| 会場数 | {} 場 |'.format(len(venue_stats_list)),
+        '| 複勝賭け金 | {:,.0f}円 |'.format(sp49),
+        '| ワイド賭け金 | {:,.0f}円/点 |'.format(sw49),
+        '| 三連複賭け金 | {:,.0f}円/点 |'.format(st49),
+        '',
+        SEP,
+    ]
+
+    # ── セクション0: 会場別KPIサマリーテーブル ──
+    lines += [
+        '## セクション0: 会場別KPIサマリー',
+        '',
+        '| 開催場 | N | 複勝率 | 複勝ROI | ワイドROI | 三連複ROI | 傾向 |',
+        '|--------|---|--------|---------|-----------|-----------|------|',
+    ]
+    for s in venue_stats_list:
+        v      = s['venue']
+        n      = s['n']
+        hr     = _r49_pct(s['place_hit_rate'] * n, n) if s['place_hit_rate'] is not None else 'N/A'
+        p_roi  = _r49_roi_str(s['place_roi'])
+        w_roi  = _r49_roi_str(s['wide_roi'])
+        t_roi  = _r49_roi_str(s['trio_roi'])
+        trend  = _r49_trend_mark(s['place_roi'])
+        lines.append('| {} | {} | {} | {} | {} | {} | {} |'.format(
+            v, n, hr, p_roi, w_roi, t_roi, trend))
+    lines += ['', SEP]
+
+    # ── セクション1: 複勝ROI ランキング ──
+    lines += ['## セクション1: 複勝ROI ランキング', '']
+    sorted_place = sorted(
+        [s for s in venue_stats_list if s['place_roi'] is not None],
+        key=lambda x: x['place_roi'], reverse=True)
+    lines += [
+        '| 順位 | 開催場 | N | 複勝ROI | バー |',
+        '|------|--------|---|---------|------|',
+    ]
+    for rank, s in enumerate(sorted_place, 1):
+        bar = _r49_ascii_bar(s['place_roi'], max_val=1.5, width=12)
+        lines.append('| {} | {} | {} | {} | {} |'.format(
+            rank, s['venue'], s['n'], _r49_roi_str(s['place_roi']), bar))
+    lines += ['', SEP]
+
+    # ── セクション2: ワイドROI ランキング ──
+    lines += ['## セクション2: ワイドROI ランキング', '']
+    sorted_wide = sorted(
+        [s for s in venue_stats_list if s['wide_roi'] is not None],
+        key=lambda x: x['wide_roi'], reverse=True)
+    lines += [
+        '| 順位 | 開催場 | N | ワイドROI | バー |',
+        '|------|--------|---|-----------|------|',
+    ]
+    for rank, s in enumerate(sorted_wide, 1):
+        bar = _r49_ascii_bar(s['wide_roi'], max_val=1.5, width=12)
+        lines.append('| {} | {} | {} | {} | {} |'.format(
+            rank, s['venue'], s['n'], _r49_roi_str(s['wide_roi']), bar))
+    lines += ['', SEP]
+
+    # ── セクション3: 三連複ROI ランキング ──
+    lines += ['## セクション3: 三連複ROI ランキング', '']
+    sorted_trio = sorted(
+        [s for s in venue_stats_list if s['trio_roi'] is not None],
+        key=lambda x: x['trio_roi'], reverse=True)
+    lines += [
+        '| 順位 | 開催場 | N | 三連複ROI | バー |',
+        '|------|--------|---|-----------|------|',
+    ]
+    for rank, s in enumerate(sorted_trio, 1):
+        bar = _r49_ascii_bar(s['trio_roi'], max_val=2.0, width=12)
+        lines.append('| {} | {} | {} | {} | {} |'.format(
+            rank, s['venue'], s['n'], _r49_roi_str(s['trio_roi']), bar))
+    lines += ['', SEP]
+
+    # ── セクション4: 主要4場の詳細分析 ──
+    lines += ['## セクション4: 主要4場の詳細分析', '']
+    major4_stats = [s for s in venue_stats_list if s['venue'] in _R49_MAJOR4]
+    if not major4_stats:
+        lines += ['> データなし（主要4場のレース記録がありません）', '']
+    else:
+        for s in major4_stats:
+            v = s['venue']
+            lines += [
+                '### {} ({} レース)'.format(v, s['n']),
+                '',
+                '| 指標 | 値 |',
+                '|-----|-----|',
+                '| 複勝命中率 | ' + _r49_pct(s['place_hit_rate'] * s['n'], s['n']) + ' |',
+                '| 複勝ROI | ' + _r49_roi_str(s['place_roi']) + ' |',
+                '| ワイドROI | ' + _r49_roi_str(s['wide_roi']) + ' |',
+                '| 三連複ROI | ' + _r49_roi_str(s['trio_roi']) + ' |',
+                '| AnchorScore 平均 | ' + ('{:.2f}'.format(s['score_mean']) if s['score_mean'] is not None else 'N/A') + ' |',
+                '| AnchorScore 標準偏差 | ' + ('{:.2f}'.format(s['score_std']) if s['score_std'] is not None else 'N/A') + ' |',
+                '',
+            ]
+            # ペース分布
+            if s['pace_counts']:
+                lines.append('**ペース分布**')
+                lines.append('')
+                lines += [
+                    '| ペース | N | 比率 |',
+                    '|--------|---|------|',
+                ]
+                total_p = sum(s['pace_counts'].values())
+                for pc, cnt in s['pace_counts'].items():
+                    lines.append('| {} | {} | {} |'.format(pc, cnt, _r49_pct(cnt, total_p)))
+                lines.append('')
+
+            # 距離区分
+            if s['dist_counts']:
+                lines.append('**距離区分分布**')
+                lines.append('')
+                lines += [
+                    '| 距離区分 | N | 比率 |',
+                    '|----------|---|------|',
+                ]
+                total_d = sum(s['dist_counts'].values())
+                for dc, cnt in s['dist_counts'].items():
+                    if cnt > 0:
+                        lines.append('| {} | {} | {} |'.format(dc, cnt, _r49_pct(cnt, total_d)))
+                lines.append('')
+
+            # 信頼度別複勝率
+            if s['conf_stats']:
+                lines.append('**信頼度別複勝率**')
+                lines.append('')
+                lines += [
+                    '| 信頼度 | N | 命中 | 命中率 |',
+                    '|--------|---|------|--------|',
+                ]
+                for cl in ['High', 'Mid', 'Low']:
+                    cs = s['conf_stats'].get(cl, {})
+                    cn = cs.get('n', 0)
+                    ch = cs.get('hit', 0)
+                    cr = cs.get('rate')
+                    lines.append('| {} | {} | {} | {} |'.format(
+                        cl, cn, ch, _r49_pct(ch, cn) if cn > 0 else 'N/A'))
+                lines.append('')
+
+    lines.append(SEP)
+
+    # ── セクション5: 総合推奨設定 ──
+    lines += ['## セクション5: 総合推奨設定 (JSON)', '']
+
+    best_place_v = sorted_place[0]['venue']  if sorted_place else '不明'
+    best_place_r = sorted_place[0]['place_roi'] if sorted_place else None
+    best_wide_v  = sorted_wide[0]['venue']   if sorted_wide  else '不明'
+    best_wide_r  = sorted_wide[0]['wide_roi'] if sorted_wide  else None
+    best_trio_v  = sorted_trio[0]['venue']   if sorted_trio  else '不明'
+    best_trio_r  = sorted_trio[0]['trio_roi'] if sorted_trio  else None
+
+    rec49 = {
+        'best_venue_for_place': {
+            'venue': best_place_v,
+            'roi':   round(float(best_place_r), 4) if best_place_r is not None else None,
+        },
+        'best_venue_for_wide': {
+            'venue': best_wide_v,
+            'roi':   round(float(best_wide_r), 4) if best_wide_r is not None else None,
+        },
+        'best_venue_for_trio': {
+            'venue': best_trio_v,
+            'roi':   round(float(best_trio_r), 4) if best_trio_r is not None else None,
+        },
+        'suggestion': (
+            '{}で複勝、{}でワイドを重点的に狙うことを推奨します。'.format(
+                best_place_v, best_wide_v)
+        ),
+    }
+
+    lines += [
+        '```json',
+        _json49.dumps(rec49, ensure_ascii=False, indent=2),
+        '```',
+        '',
+        SEP,
+    ]
+
+    # ── セクション6: 次アクション提案 ──
+    lines += ['## セクション6: 次アクション提案', '']
+
+    lines += [
+        '1. **複勝集中投資**: {} (ROI {}) を重点会場として賭け金を増やす。'.format(
+            best_place_v, _r49_roi_str(best_place_r)),
+        '2. **ワイド投資**: {} (ROI {}) でワイドを試験運用する。'.format(
+            best_wide_v, _r49_roi_str(best_wide_r)),
+        '3. **回避検討**: ROI < 0.70 の会場は一時的に見送りを検討する。',
+        '4. **データ蓄積**: サンプル数 < 10 の会場は判断を保留し、データを蓄積する。',
+        '5. **月次モニタリング**: 各会場の成績を月次で `--full_analysis` により再チェックする。',
+        '',
+        '---',
+        '*Generated by STELLA v1.32 R49 Venue Dashboard*',
+    ]
+
+    return NL.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# メインドライバー
+# ---------------------------------------------------------------------------
+
+def analyze_venue_dashboard(
+    result_dir,
+    params=None,
+    stake_place=1000.0,
+    stake_wide=100.0,
+    stake_trio=100.0,
+    out_md=None,
+    verbose=True,
+):
+    """会場別ダッシュボードレポートを生成するメインドライバー (R49)
+
+    Parameters
+    ----------
+    result_dir : str
+        結果JSONが格納されているディレクトリ
+    params : dict, optional
+        予測パラメータ辞書
+    stake_place : float
+        複勝1レースの賭け金 (円)
+    stake_wide : float
+        ワイド1点の賭け金 (円)
+    stake_trio : float
+        三連複1点の賭け金 (円)
+    out_md : str, optional
+        出力Markdownファイルパス
+    verbose : bool
+        進捗を表示するか
+
+    Returns
+    -------
+    dict
+        report_md, venue_stats, best_venue_place, best_venue_wide,
+        best_venue_trio, n_venues, n_races
+    """
+    if params is None:
+        params = {}
+
+    stakes = {
+        'place': float(stake_place or 1000.0),
+        'wide':  float(stake_wide  or 100.0),
+        'trio':  float(stake_trio  or 100.0),
+    }
+
+    meta = {
+        'timestamp':  _dt49.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'result_dir': str(result_dir),
+    }
+
+    if verbose:
+        print('[R49] 会場別ダッシュボード開始 dir={}'.format(result_dir))
+
+    # データロード
+    df = _r49_load_df(result_dir, params)
+    n_total = len(df) if df is not None else 0
+
+    if verbose:
+        print('[R49] ロード完了: {} レース'.format(n_total))
+
+    # 全会場統計
+    venue_stats = _r49_all_venue_stats(
+        df, stakes['place'], stakes['wide'], stakes['trio'])
+
+    if verbose:
+        print('[R49] 集計完了: {} 会場'.format(len(venue_stats)))
+
+    # Markdown生成
+    report_md = _r49_build_venue_dashboard_md(venue_stats, n_total, meta, stakes)
+
+    # ファイル保存
+    if out_md:
+        from pathlib import Path as _Path49
+        _Path49(out_md).parent.mkdir(parents=True, exist_ok=True)
+        _Path49(out_md).write_text(report_md, encoding='utf-8')
+        if verbose:
+            print('[R49] レポート保存 -> {}'.format(out_md))
+
+    # ベスト会場の抽出
+    sorted_place49 = sorted(
+        [s for s in venue_stats if s.get('place_roi') is not None],
+        key=lambda x: x['place_roi'], reverse=True)
+    sorted_wide49 = sorted(
+        [s for s in venue_stats if s.get('wide_roi') is not None],
+        key=lambda x: x['wide_roi'], reverse=True)
+    sorted_trio49 = sorted(
+        [s for s in venue_stats if s.get('trio_roi') is not None],
+        key=lambda x: x['trio_roi'], reverse=True)
+
+    best_place49 = sorted_place49[0]['venue'] if sorted_place49 else '不明'
+    best_wide49  = sorted_wide49[0]['venue']  if sorted_wide49  else '不明'
+    best_trio49  = sorted_trio49[0]['venue']  if sorted_trio49  else '不明'
+
+    if verbose:
+        print('[R49] 完了: 複勝推奨={}, ワイド推奨={}, 三連複推奨={}'.format(
+            best_place49, best_wide49, best_trio49))
+
+    return {
+        'report_md':        report_md,
+        'venue_stats':      venue_stats,
+        'best_venue_place': best_place49,
+        'best_venue_wide':  best_wide49,
+        'best_venue_trio':  best_trio49,
+        'n_venues':         len(venue_stats),
+        'n_races':          n_total,
+    }
+
+
+
+
+
+# =========================
+# R50: 馬場状態補正分析 (v1.26)
+# =========================
+# Purpose: avg_halonをもとに仮想馬場状態を推定し、
+#          馬場状態別の複勝/ワイド/三連複ROIを分析。
+#          会場×馬場状態クロス集計とAnchorScore補正提案も生成する。
+# =========================
+
+import datetime as _dt50
+import json as _json50
+
+# ---------------------------------------------------------------------------
+# 定数
+# ---------------------------------------------------------------------------
+
+# 仮想馬場状態カテゴリー（avg_halon ベース）
+_R50_GOING_CATS = ['fast', 'normal', 'slow', 'heavy', 'unknown']
+
+# avg_halon 閾値（秒/ハロン）
+_R50_HALON_THRESHOLDS = {
+    'fast':    (None, 11.5),   # < 11.5  → 良相当（非常に速い）
+    'normal':  (11.5, 12.0),   # 11.5-12.0 → 良〜稍重相当
+    'slow':    (12.0, 12.5),   # 12.0-12.5 → 重相当
+    'heavy':   (12.5, None),   # >= 12.5  → 不良相当（非常に遅い）
+}
+
+# 日本語ラベル
+_R50_GOING_LABELS = {
+    'fast':    '良（速い）',
+    'normal':  '標準（良〜稍重）',
+    'slow':    '重相当',
+    'heavy':   '不良相当',
+    'unknown': '不明',
+}
+
+# 補正提案マップ（複勝ROI が low/high のときの推奨アクション）
+_R50_CORRECTION_ADVICE = {
+    'fast':   '速い馬場ではアンカースコアの信頼性が高い傾向。重点投資を検討。',
+    'normal': '標準馬場では通常の投資戦略を維持。',
+    'slow':   '重相当馬場では道悪適性馬を優先。p_place_est 閾値を +0.03 引き上げを推奨。',
+    'heavy':  '不良馬場は荒れやすい。賭け金を 70% 以下に抑えることを推奨。',
+    'unknown': '馬場状態が不明のため、標準戦略を適用。',
+}
+
+
+# ---------------------------------------------------------------------------
+# ユーティリティ
+# ---------------------------------------------------------------------------
+
+def _r50_estimate_going(avg_halon):
+    """avg_halon（秒/ハロン）から仮想馬場状態カテゴリーを返す。
+
+    Returns: 'fast' | 'normal' | 'slow' | 'heavy' | 'unknown'
+    """
+    if avg_halon is None:
+        return 'unknown'
+    try:
+        h = float(avg_halon)
+        if not (8.0 <= h <= 16.0):   # 異常値ガード
+            return 'unknown'
+        if h < 11.5:
+            return 'fast'
+        elif h < 12.0:
+            return 'normal'
+        elif h < 12.5:
+            return 'slow'
+        else:
+            return 'heavy'
+    except Exception:
+        return 'unknown'
+
+
+def _r50_going_label(going_cat):
+    """カテゴリーキーを日本語ラベルに変換"""
+    return _R50_GOING_LABELS.get(str(going_cat), str(going_cat))
+
+
+def _r50_pct(v, denom, decimals=1):
+    """割合をパーセント文字列に変換"""
+    if denom == 0 or v is None:
+        return 'N/A'
+    return '{:.{}f}%'.format(float(v) / float(denom) * 100, decimals)
+
+
+def _r50_roi_str(roi, decimals=3):
+    """ROI → 文字列"""
+    if roi is None:
+        return 'N/A'
+    try:
+        return '{:.{}f}'.format(float(roi), decimals)
+    except Exception:
+        return str(roi)
+
+
+def _r50_trend(roi):
+    """ROI傾向マーク"""
+    if roi is None:
+        return '?'
+    try:
+        r = float(roi)
+        if r >= 1.10:
+            return '+++'
+        elif r >= 1.00:
+            return '++'
+        elif r >= 0.85:
+            return '+'
+        elif r >= 0.70:
+            return '-'
+        else:
+            return '--'
+    except Exception:
+        return '?'
+
+
+def _r50_bar(value, max_val=1.5, width=14, char='='):
+    """ASCII バー（ROI用）"""
+    if value is None:
+        return '[' + ' ' * width + '] N/A'
+    try:
+        v    = float(value)
+        frac = min(max(v / max(float(max_val), 0.001), 0.0), 1.0)
+        filled = int(round(frac * width))
+        return '[{}{}] {:.3f}'.format(char * filled, ' ' * (width - filled), v)
+    except Exception:
+        return '[' + ' ' * width + '] N/A'
+
+
+# ---------------------------------------------------------------------------
+# DataFrame エンリッチ
+# ---------------------------------------------------------------------------
+
+def _r50_enrich_df(df):
+    """DataFrameに going_cat（仮想馬場状態）列を追加したコピーを返す。
+
+    avg_halon 列が存在しない場合は _r46_load_enriched_df のデータを利用。
+    """
+    import pandas as _pd50
+
+    if df is None or len(df) == 0:
+        return df
+
+    df = df.copy()
+
+    going_cats = []
+    for _, row in df.iterrows():
+        avg_h = row.get('avg_halon') if hasattr(row, 'get') else None
+        # 文字列として格納されている場合の変換
+        try:
+            avg_h = float(avg_h) if avg_h not in (None, '', 'nan') else None
+        except Exception:
+            avg_h = None
+        going_cats.append(_r50_estimate_going(avg_h))
+
+    df['going_cat'] = going_cats
+    return df
+
+
+def _r50_load_enriched_df(result_dir):
+    """result_dir から enriched DataFrame をロードし going_cat 列を追加して返す。"""
+    import json as _json_50
+    import pandas as _pd50
+    from pathlib import Path as _P50
+
+    # _r46_load_enriched_df でベースDFをロード（avg_halon 付き）
+    try:
+        base_df = _r46_load_enriched_df(result_dir)
+    except Exception:
+        base_df = None
+
+    if base_df is None or len(base_df) == 0:
+        return _r50_enrich_df(_pd50.DataFrame())
+
+    # avg_halon がない場合はJSONから追加読み込み
+    if 'avg_halon' not in base_df.columns:
+        extra = {}
+        for fp in sorted(_P50(result_dir).glob('*.json')):
+            try:
+                obj = _json_50.loads(fp.read_text(encoding='utf-8'))
+                rid  = str(obj.get('race_id', '') or fp.stem)
+                meta = obj.get('meta', {}) or {}
+                extra[rid] = str(meta.get('avg_halon', '') or '')
+            except Exception:
+                pass
+        if extra:
+            base_df['avg_halon'] = base_df['race_id'].map(
+                lambda rid: extra.get(rid, ''))
+
+    return _r50_enrich_df(base_df)
+
+
+# ---------------------------------------------------------------------------
+# 馬場状態別KPI集計
+# ---------------------------------------------------------------------------
+
+def _r50_going_stats_one(df, going_cat, stake_place, stake_wide, stake_trio):
+    """特定馬場状態カテゴリーのKPI辞書を計算して返す。"""
+    import pandas as _pd50
+
+    if df is None or len(df) == 0:
+        return {'going_cat': going_cat, 'n': 0}
+
+    gdf = df[df['going_cat'] == going_cat].copy() if 'going_cat' in df.columns else _pd50.DataFrame()
+    n = len(gdf)
+    if n == 0:
+        return {'going_cat': going_cat, 'n': 0}
+
+    # ── 平均 avg_halon ──
+    if 'avg_halon' in gdf.columns:
+        try:
+            halon_vals = gdf['avg_halon'].apply(
+                lambda x: float(x) if x not in (None, '', 'nan') else None
+            ).dropna()
+            avg_halon_mean = float(halon_vals.mean()) if len(halon_vals) > 0 else None
+        except Exception:
+            avg_halon_mean = None
+    else:
+        avg_halon_mean = None
+
+    # ── 複勝 ──
+    place_ok   = gdf['place_hit'].infer_objects(copy=False).fillna(False).astype(bool)
+    n_place_ok = int(place_ok.sum())
+    place_hit_rate = n_place_ok / n
+
+    place_payouts = gdf['payout_fukusho_max'].infer_objects(copy=False).fillna(0.0).astype(float)
+    place_total_stake  = float(stake_place) * n
+    place_total_return = float((place_ok.astype(float) * place_payouts).sum())
+    place_roi = place_total_return / place_total_stake if place_total_stake > 0 else None
+
+    # ── ワイド ──
+    wide_hit = gdf.get('wide_hit', _pd50.Series([False] * n, index=gdf.index))
+    wide_hit = wide_hit.infer_objects(copy=False).fillna(False).astype(bool) if hasattr(wide_hit, 'fillna') else _pd50.Series([False] * n)
+    n_wide   = int(wide_hit.sum())
+    wide_payout = gdf.get('payout_wide_max', _pd50.Series([0.0] * n, index=gdf.index))
+    if hasattr(wide_payout, 'fillna'):
+        wide_payout = wide_payout.infer_objects(copy=False).fillna(0.0).astype(float)
+    wide_n_pts = 4
+    wide_total_stake  = float(stake_wide) * wide_n_pts * n
+    wide_total_return = float((wide_hit.astype(float) * wide_payout).sum())
+    wide_roi = wide_total_return / wide_total_stake if wide_total_stake > 0 else None
+
+    # ── 三連複 ──
+    trio_hit = gdf.get('trio_hit', _pd50.Series([False] * n, index=gdf.index))
+    if hasattr(trio_hit, 'fillna'):
+        trio_hit = trio_hit.infer_objects(copy=False).fillna(False).astype(bool)
+    n_trio   = int(trio_hit.sum())
+    trio_payout = gdf.get('payout_sanrenpuku', _pd50.Series([0.0] * n, index=gdf.index))
+    if hasattr(trio_payout, 'fillna'):
+        trio_payout = trio_payout.infer_objects(copy=False).fillna(0.0).astype(float)
+    trio_n_pts = 10
+    trio_total_stake  = float(stake_trio) * trio_n_pts * n
+    trio_total_return = float((trio_hit.astype(float) * trio_payout).sum())
+    trio_roi = trio_total_return / trio_total_stake if trio_total_stake > 0 else None
+
+    # ── AnchorScore 統計 ──
+    score_mean = score_std = None
+    if 'anchor_score' in gdf.columns:
+        scores = gdf['anchor_score'].dropna().astype(float)
+        if len(scores) > 0:
+            score_mean = float(scores.mean())
+        if len(scores) > 1:
+            score_std = float(scores.std())
+
+    # ── p_place_est 統計 ──
+    pp_mean = pp_std = None
+    if 'p_place_est' in gdf.columns:
+        pp = gdf['p_place_est'].dropna().astype(float)
+        if len(pp) > 0:
+            pp_mean = float(pp.mean())
+        if len(pp) > 1:
+            pp_std = float(pp.std())
+
+    # ── ペース分布 ──
+    pace_counts = {}
+    if 'pace' in gdf.columns:
+        for pc in ['H', 'M', 'S', '']:
+            cnt = int((gdf['pace'] == pc).sum())
+            if cnt > 0:
+                pace_counts[pc if pc else '不明'] = cnt
+
+    return {
+        'going_cat':      going_cat,
+        'label':          _r50_going_label(going_cat),
+        'n':              n,
+        'avg_halon_mean': avg_halon_mean,
+        'place_hit_rate': place_hit_rate,
+        'n_place_ok':     n_place_ok,
+        'place_roi':      place_roi,
+        'wide_roi':       wide_roi,
+        'n_wide':         n_wide,
+        'trio_roi':       trio_roi,
+        'n_trio':         n_trio,
+        'score_mean':     score_mean,
+        'score_std':      score_std,
+        'pp_mean':        pp_mean,
+        'pp_std':         pp_std,
+        'pace_counts':    pace_counts,
+        'advice':         _R50_CORRECTION_ADVICE.get(going_cat, ''),
+    }
+
+
+def _r50_all_going_stats(df, stake_place, stake_wide, stake_trio):
+    """全馬場状態カテゴリーのKPI辞書リストを返す（n>0 のみ）。"""
+    results = []
+    for gcat in _R50_GOING_CATS:
+        s = _r50_going_stats_one(df, gcat, stake_place, stake_wide, stake_trio)
+        if s.get('n', 0) > 0:
+            results.append(s)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 会場×馬場状態 クロス集計
+# ---------------------------------------------------------------------------
+
+def _r50_venue_going_cross(df, stake_place):
+    """venue_cat × going_cat のクロス集計（複勝ROI）を返す。
+
+    Returns: list of dict {venue, going_cat, n, place_hit_rate, place_roi}
+    """
+    import pandas as _pd50
+
+    if df is None or len(df) == 0:
+        return []
+    if 'venue_cat' not in df.columns or 'going_cat' not in df.columns:
+        return []
+
+    results = []
+    for venue in sorted(df['venue_cat'].dropna().unique()):
+        for gcat in _R50_GOING_CATS:
+            vg_df = df[(df['venue_cat'] == venue) & (df['going_cat'] == gcat)]
+            n = len(vg_df)
+            if n == 0:
+                continue
+            place_ok = vg_df['place_hit'].infer_objects(copy=False).fillna(False).astype(bool)
+            n_hit    = int(place_ok.sum())
+            hit_rate = n_hit / n
+            payouts  = vg_df['payout_fukusho_max'].infer_objects(copy=False).fillna(0.0).astype(float)
+            total_stake  = float(stake_place) * n
+            total_return = float((place_ok.astype(float) * payouts).sum())
+            roi = total_return / total_stake if total_stake > 0 else None
+            results.append({
+                'venue':          str(venue),
+                'going_cat':      gcat,
+                'going_label':    _r50_going_label(gcat),
+                'n':              n,
+                'place_hit_rate': hit_rate,
+                'place_roi':      roi,
+            })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Markdownレポート生成
+# ---------------------------------------------------------------------------
+
+def _r50_build_going_md(going_stats, cross_data, df_total_n, meta, stakes):
+    """馬場状態補正分析のMarkdownレポートを生成する。"""
+    NL  = '\n'
+    SEP = '---'
+    lines = []
+
+    ts50   = meta.get('timestamp', '')
+    rdir50 = meta.get('result_dir', '')
+    sp50   = stakes.get('place', 1000.0)
+    sw50   = stakes.get('wide',  100.0)
+    st50   = stakes.get('trio',  100.0)
+
+    # ── ヘッダー ──
+    lines += [
+        '# STELLA v1.32  馬場状態補正分析レポート (R50)',
+        '',
+        '> **注意**: avg_halon（平均ハロンタイム）をもとに仮想馬場状態を推定しています。',
+        '> 実際の馬場状態（良/稍重/重/不良）とは異なる場合があります。',
+        '',
+        '| 項目 | 値 |',
+        '|------|-----|',
+        '| 生成日時 | ' + ts50 + ' |',
+        '| 対象ディレクトリ | ' + rdir50 + ' |',
+        '| 総レース数 | {} レース |'.format(df_total_n),
+        '| 複勝賭け金 | {:,.0f}円 |'.format(sp50),
+        '| ワイド賭け金 | {:,.0f}円/点 |'.format(sw50),
+        '| 三連複賭け金 | {:,.0f}円/点 |'.format(st50),
+        '',
+        SEP,
+    ]
+
+    # ── セクション0: 馬場状態分類定義 ──
+    lines += [
+        '## セクション0: 馬場状態分類定義',
+        '',
+        '| カテゴリー | 日本語 | avg_halon 基準 |',
+        '|-----------|--------|--------------|',
+        '| fast | 良（速い） | < 11.5 秒/ハロン |',
+        '| normal | 標準（良〜稍重） | 11.5〜12.0 秒/ハロン |',
+        '| slow | 重相当 | 12.0〜12.5 秒/ハロン |',
+        '| heavy | 不良相当 | >= 12.5 秒/ハロン |',
+        '| unknown | 不明 | avg_halon なし・異常値 |',
+        '',
+        SEP,
+    ]
+
+    # ── セクション1: 馬場状態別KPIサマリー ──
+    lines += [
+        '## セクション1: 馬場状態別KPIサマリー',
+        '',
+        '| 馬場 | N | 平均HL | 複勝率 | 複勝ROI | ワイドROI | 三連複ROI | 傾向 |',
+        '|------|---|--------|--------|---------|-----------|-----------|------|',
+    ]
+    for s in going_stats:
+        hl50  = '{:.3f}'.format(s['avg_halon_mean']) if s['avg_halon_mean'] is not None else 'N/A'
+        hr50  = _r50_pct(s['place_hit_rate'] * s['n'], s['n'])
+        p_roi = _r50_roi_str(s['place_roi'])
+        w_roi = _r50_roi_str(s['wide_roi'])
+        t_roi = _r50_roi_str(s['trio_roi'])
+        tend  = _r50_trend(s['place_roi'])
+        lines.append('| {} | {} | {} | {} | {} | {} | {} | {} |'.format(
+            s['label'], s['n'], hl50, hr50, p_roi, w_roi, t_roi, tend))
+    lines += ['', SEP]
+
+    # ── セクション2: 複勝ROI ランキング ──
+    lines += ['## セクション2: 複勝ROI ランキング（馬場状態別）', '']
+    sorted_place = sorted(
+        [s for s in going_stats if s['place_roi'] is not None],
+        key=lambda x: x['place_roi'], reverse=True)
+    lines += [
+        '| 順位 | 馬場 | N | 複勝ROI | バー |',
+        '|------|------|---|---------|------|',
+    ]
+    for rank, s in enumerate(sorted_place, 1):
+        lines.append('| {} | {} | {} | {} | {} |'.format(
+            rank, s['label'], s['n'],
+            _r50_roi_str(s['place_roi']),
+            _r50_bar(s['place_roi'])))
+    lines += ['', SEP]
+
+    # ── セクション3: ワイドROI ランキング ──
+    lines += ['## セクション3: ワイドROI ランキング（馬場状態別）', '']
+    sorted_wide = sorted(
+        [s for s in going_stats if s['wide_roi'] is not None],
+        key=lambda x: x['wide_roi'], reverse=True)
+    lines += [
+        '| 順位 | 馬場 | N | ワイドROI | バー |',
+        '|------|------|---|-----------|------|',
+    ]
+    for rank, s in enumerate(sorted_wide, 1):
+        lines.append('| {} | {} | {} | {} | {} |'.format(
+            rank, s['label'], s['n'],
+            _r50_roi_str(s['wide_roi']),
+            _r50_bar(s['wide_roi'])))
+    lines += ['', SEP]
+
+    # ── セクション4: 三連複ROI ランキング ──
+    lines += ['## セクション4: 三連複ROI ランキング（馬場状態別）', '']
+    sorted_trio = sorted(
+        [s for s in going_stats if s['trio_roi'] is not None],
+        key=lambda x: x['trio_roi'], reverse=True)
+    lines += [
+        '| 順位 | 馬場 | N | 三連複ROI | バー |',
+        '|------|------|---|-----------|------|',
+    ]
+    for rank, s in enumerate(sorted_trio, 1):
+        lines.append('| {} | {} | {} | {} | {} |'.format(
+            rank, s['label'], s['n'],
+            _r50_roi_str(s['trio_roi']),
+            _r50_bar(s['trio_roi'], max_val=2.0)))
+    lines += ['', SEP]
+
+    # ── セクション5: 会場×馬場状態クロス集計 ──
+    lines += ['## セクション5: 会場×馬場状態クロス集計（複勝ROI）', '']
+    if not cross_data:
+        lines += ['> データなし', '']
+    else:
+        # 会場一覧と馬場状態一覧を取得
+        venues_cross = sorted(set(r['venue'] for r in cross_data))
+        gcats_cross  = [g for g in _R50_GOING_CATS if any(r['going_cat'] == g for r in cross_data)]
+
+        # ヘッダー行
+        header = '| 会場 | ' + ' | '.join(_r50_going_label(g) for g in gcats_cross) + ' |'
+        sep_row = '|------|' + '-------|' * len(gcats_cross)
+        lines += [header, sep_row]
+
+        # データ行
+        cross_idx = {(r['venue'], r['going_cat']): r for r in cross_data}
+        for v in venues_cross:
+            cells = [v]
+            for g in gcats_cross:
+                r = cross_idx.get((v, g))
+                if r is None or r['n'] == 0:
+                    cells.append('N/A')
+                else:
+                    cells.append('{} (n={})'.format(_r50_roi_str(r['place_roi']), r['n']))
+            lines.append('| ' + ' | '.join(cells) + ' |')
+    lines += ['', SEP]
+
+    # ── セクション6: AnchorScore補正提案 ──
+    lines += ['## セクション6: AnchorScore 馬場補正提案', '']
+    lines.append('各馬場状態カテゴリーにおける AnchorScore 統計と投資補正推奨:')
+    lines.append('')
+    lines += [
+        '| 馬場 | Score平均 | Score標準偏差 | p_place推定平均 | 推奨アクション |',
+        '|------|-----------|-------------|----------------|----------------|',
+    ]
+    for s in going_stats:
+        sm50  = '{:.2f}'.format(s['score_mean'])  if s['score_mean'] is not None else 'N/A'
+        ss50  = '{:.2f}'.format(s['score_std'])   if s['score_std']  is not None else 'N/A'
+        pm50  = '{:.4f}'.format(s['pp_mean'])     if s['pp_mean']    is not None else 'N/A'
+        adv50 = s['advice'][:40] + '...' if len(s['advice']) > 40 else s['advice']
+        lines.append('| {} | {} | {} | {} | {} |'.format(
+            s['label'], sm50, ss50, pm50, adv50))
+    lines += ['', SEP]
+
+    # ── セクション7: 総合推奨設定 (JSON) ──
+    lines += ['## セクション7: 総合推奨設定 (JSON)', '']
+
+    best_place50 = sorted_place[0]['going_cat'] if sorted_place else 'unknown'
+    best_wide50  = sorted_wide[0]['going_cat']  if sorted_wide  else 'unknown'
+    best_trio50  = sorted_trio[0]['going_cat']  if sorted_trio  else 'unknown'
+    worst_place50 = sorted_place[-1]['going_cat'] if len(sorted_place) > 1 else 'unknown'
+
+    rec50 = {
+        'best_going_for_place': {
+            'category': best_place50,
+            'label':    _r50_going_label(best_place50),
+            'roi':      round(float(sorted_place[0]['place_roi']), 4) if sorted_place and sorted_place[0]['place_roi'] else None,
+        },
+        'best_going_for_wide': {
+            'category': best_wide50,
+            'label':    _r50_going_label(best_wide50),
+            'roi':      round(float(sorted_wide[0]['wide_roi']), 4) if sorted_wide and sorted_wide[0]['wide_roi'] else None,
+        },
+        'best_going_for_trio': {
+            'category': best_trio50,
+            'label':    _r50_going_label(best_trio50),
+            'roi':      round(float(sorted_trio[0]['trio_roi']), 4) if sorted_trio and sorted_trio[0]['trio_roi'] else None,
+        },
+        'avoid_going': {
+            'category': worst_place50,
+            'label':    _r50_going_label(worst_place50),
+        },
+        'advice_per_condition': {
+            s['going_cat']: s['advice'] for s in going_stats
+        },
+    }
+
+    lines += [
+        '```json',
+        _json50.dumps(rec50, ensure_ascii=False, indent=2),
+        '```',
+        '',
+        SEP,
+    ]
+
+    # ── セクション8: 次アクション提案 ──
+    lines += ['## セクション8: 次アクション提案', '']
+
+    if sorted_place:
+        best_lbl = _r50_going_label(sorted_place[0]['going_cat'])
+        best_roi = sorted_place[0]['place_roi']
+        lines += [
+            '1. **最適馬場に集中**: {} (複勝ROI {}) のレースを重点的に狙う。'.format(
+                best_lbl, _r50_roi_str(best_roi)),
+        ]
+        if worst_place50 != 'unknown' and len(sorted_place) > 1:
+            worst_lbl = _r50_going_label(worst_place50)
+            worst_roi = sorted_place[-1]['place_roi']
+            lines.append(
+                '2. **不振馬場を回避**: {} (複勝ROI {}) は賭け金を抑制するか見送りを検討。'.format(
+                    worst_lbl, _r50_roi_str(worst_roi)))
+    else:
+        lines += ['> データ不足のため具体的な提案を生成できません。', '']
+
+    lines += [
+        '3. **データ蓄積**: N < 10 の馬場状態は判断を保留し、データを蓄積する。',
+        '4. **月次モニタリング**: `--track_condition` で馬場別成績を定期チェックする。',
+        '5. **会場×馬場クロス**: 特定会場+特定馬場の組み合わせで高ROI条件を特定する。',
+        '',
+        '---',
+        '*Generated by STELLA v1.32 R50 Track Condition Analysis*',
+    ]
+
+    return NL.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# メインドライバー
+# ---------------------------------------------------------------------------
+
+def analyze_track_condition(
+    result_dir,
+    params=None,
+    stake_place=1000.0,
+    stake_wide=100.0,
+    stake_trio=100.0,
+    out_md=None,
+    verbose=True,
+):
+    """馬場状態補正分析レポートを生成するメインドライバー (R50)
+
+    Parameters
+    ----------
+    result_dir : str
+        結果JSONが格納されているディレクトリ
+    params : dict, optional
+        予測パラメータ辞書
+    stake_place : float
+        複勝1レースの賭け金 (円)
+    stake_wide : float
+        ワイド1点の賭け金 (円)
+    stake_trio : float
+        三連複1点の賭け金 (円)
+    out_md : str, optional
+        出力Markdownファイルパス
+    verbose : bool
+        進捗を表示するか
+
+    Returns
+    -------
+    dict
+        report_md, going_stats, cross_data,
+        best_going_place, best_going_wide, best_going_trio,
+        n_races, n_categories
+    """
+    if params is None:
+        params = {}
+
+    stakes = {
+        'place': float(stake_place or 1000.0),
+        'wide':  float(stake_wide  or 100.0),
+        'trio':  float(stake_trio  or 100.0),
+    }
+
+    meta = {
+        'timestamp':  _dt50.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'result_dir': str(result_dir),
+    }
+
+    if verbose:
+        print('[R50] 馬場状態補正分析開始 dir={}'.format(result_dir))
+
+    # データロード
+    df = _r50_load_enriched_df(result_dir)
+    n_total = len(df) if df is not None else 0
+
+    if verbose:
+        print('[R50] ロード完了: {} レース'.format(n_total))
+
+    # 馬場状態別KPI集計
+    going_stats = _r50_all_going_stats(df, stakes['place'], stakes['wide'], stakes['trio'])
+
+    # 会場×馬場状態クロス集計
+    cross_data = _r50_venue_going_cross(df, stakes['place'])
+
+    if verbose:
+        print('[R50] 集計完了: {} カテゴリー'.format(len(going_stats)))
+
+    # Markdown生成
+    report_md = _r50_build_going_md(going_stats, cross_data, n_total, meta, stakes)
+
+    # ファイル保存
+    if out_md:
+        from pathlib import Path as _Path50
+        _Path50(out_md).parent.mkdir(parents=True, exist_ok=True)
+        _Path50(out_md).write_text(report_md, encoding='utf-8')
+        if verbose:
+            print('[R50] レポート保存 -> {}'.format(out_md))
+
+    # ベスト馬場状態
+    sorted_place50 = sorted(
+        [s for s in going_stats if s.get('place_roi') is not None],
+        key=lambda x: x['place_roi'], reverse=True)
+    sorted_wide50 = sorted(
+        [s for s in going_stats if s.get('wide_roi') is not None],
+        key=lambda x: x['wide_roi'], reverse=True)
+    sorted_trio50 = sorted(
+        [s for s in going_stats if s.get('trio_roi') is not None],
+        key=lambda x: x['trio_roi'], reverse=True)
+
+    best_place50 = sorted_place50[0]['going_cat'] if sorted_place50 else 'unknown'
+    best_wide50  = sorted_wide50[0]['going_cat']  if sorted_wide50  else 'unknown'
+    best_trio50  = sorted_trio50[0]['going_cat']  if sorted_trio50  else 'unknown'
+
+    if verbose:
+        print('[R50] 完了: 複勝推奨馬場={}, ワイド推奨={}, 三連複推奨={}'.format(
+            _r50_going_label(best_place50),
+            _r50_going_label(best_wide50),
+            _r50_going_label(best_trio50)))
+
+    return {
+        'report_md':        report_md,
+        'going_stats':      going_stats,
+        'cross_data':       cross_data,
+        'best_going_place': best_place50,
+        'best_going_wide':  best_wide50,
+        'best_going_trio':  best_trio50,
+        'n_races':          n_total,
+        'n_categories':     len(going_stats),
+    }
+
+
+
+# =========================
+# R52: ペース×会場×馬場条件 3軸クロス分析 (v1.28)
+# =========================
+# Purpose: --cross_analysis <dir>
+#   pace(H/M/S) × venue_cat(東京/阪神/...) × going_cat(fast/normal/slow/heavy)
+#   の3軸でROI・複勝率をクロス集計し、最適な組み合わせを特定する。
+#
+# Report sections (0-8):
+#   0: 実行サマリー
+#   1: ペース別 KPI サマリー
+#   2: 会場別 KPI サマリー
+#   3: 馬場状態別 KPI サマリー
+#   4: ペース×会場 2軸クロス (複勝率ヒートマップ)
+#   5: ペース×馬場条件 2軸クロス
+#   6: 会場×馬場条件 2軸クロス
+#   7: 3軸クロス TOP10 組み合わせ (複勝ROI順)
+#   8: 推奨設定 JSON + 次アクション
+
+import pandas as _pd52
+import numpy as _np52
+import json as _json52
+import os as _os52
+from pathlib import Path as _Path52
+from typing import Optional, Dict, List, Any
+
+# ---- 定数 ----
+_R52_PACE_LABELS = {'H': 'ハイ(H)', 'M': 'ミドル(M)', 'S': 'スロー(S)', '': '不明'}
+_R52_GOING_LABELS = {
+    'fast': '良相当(fast)', 'normal': 'やや重相当(normal)',
+    'slow': '重相当(slow)', 'heavy': '不良相当(heavy)', 'unknown': '不明'
+}
+_R52_PACE_ORDER  = ['H', 'M', 'S']
+_R52_GOING_ORDER = ['fast', 'normal', 'slow', 'heavy']
+_R52_VENUE_MAJOR = ['東京', '阪神', '中山', '京都']
+
+
+def _r52_pct(n, d, dec=1):
+    """安全なパーセント計算"""
+    try:
+        if d == 0:
+            return float('nan')
+        return round(float(n) / float(d) * 100.0, dec)
+    except Exception:
+        return float('nan')
+
+
+def _r52_roi(ret, stake):
+    """安全なROI計算"""
+    try:
+        if stake == 0:
+            return float('nan')
+        return round(float(ret) / float(stake), 4)
+    except Exception:
+        return float('nan')
+
+
+def _r52_fmt_pct(v, na='N/A'):
+    """パーセント文字列フォーマット"""
+    if v is None or (isinstance(v, float) and _np52.isnan(v)):
+        return na
+    return f"{v:.1f}%"
+
+
+def _r52_fmt_roi(v, na='N/A'):
+    """ROI文字列フォーマット"""
+    if v is None or (isinstance(v, float) and _np52.isnan(v)):
+        return na
+    return f"{v:.3f}"
+
+
+def _r52_bar(v, max_v, width=16, na='─'):
+    """ASCII バー生成"""
+    if v is None or max_v is None or max_v == 0:
+        return na
+    try:
+        ratio = max(0.0, min(1.0, float(v) / float(max_v)))
+        filled = int(ratio * width)
+        return '█' * filled + '░' * (width - filled)
+    except Exception:
+        return na
+
+
+def _r52_trend(series, window=3):
+    """最近window件の傾向マーク (↑↓→)"""
+    try:
+        s = [x for x in series if x is not None and not _np52.isnan(x)]
+        if len(s) < 2:
+            return '→'
+        tail = s[-window:] if len(s) >= window else s
+        if tail[-1] > tail[0] * 1.03:
+            return '↑'
+        elif tail[-1] < tail[0] * 0.97:
+            return '↓'
+        return '→'
+    except Exception:
+        return '→'
+
+
+def _r52_load_df(result_dir):
+    """3軸分析用 DataFrame をロード（venue_cat + going_cat 付き）"""
+    # _r46_load_enriched_df で venue_cat を付与
+    df = _r46_load_enriched_df(result_dir)
+    if df is None or len(df) == 0:
+        return _pd52.DataFrame()
+    # going_cat を追加（avg_halon から）
+    df = _r50_enrich_df(df)
+    # pace 正規化（H/M/S/空）
+    if 'pace' in df.columns:
+        df['pace'] = df['pace'].fillna('').astype(str).str.strip().str.upper().str[:1]
+        df.loc[~df['pace'].isin(['H', 'M', 'S']), 'pace'] = ''
+    return df
+
+
+def _r52_axis_kpi(df, axis_col, axis_vals, stake_place=1000.0, stake_wide=100.0, stake_trio=100.0):
+    """1軸ごとの KPI 辞書リストを生成"""
+    results = []
+    ok_df = df[df['place_ok'].infer_objects(copy=False).fillna(False).astype(bool)].copy() if 'place_ok' in df.columns else df.copy()
+    for val in axis_vals:
+        sub = ok_df[ok_df[axis_col] == val].copy() if axis_col in ok_df.columns else _pd52.DataFrame()
+        n = len(sub)
+        if n == 0:
+            results.append({
+                'key': val, 'n': 0,
+                'place_hit_rate': float('nan'), 'place_roi': float('nan'),
+                'wide_hit_rate': float('nan'), 'wide_roi': float('nan'),
+                'trio_hit_rate': float('nan'), 'trio_roi': float('nan'),
+            })
+            continue
+        # 複勝
+        ph = sub['place_hit'].map(lambda _x: bool(_x) if _x is not None else False)
+        n_ph = int(ph.sum())
+        place_hit_rate = _r52_pct(n_ph, n)
+        pay_p = _pd52.to_numeric(sub['payout_fukusho_max'], errors='coerce').fillna(0.0)
+        place_ret = float((ph.astype(float) * pay_p).sum())
+        place_roi = _r52_roi(place_ret, n * stake_place)
+        # ワイド
+        wh = _pd52.to_numeric(sub['wide_hit_count'], errors='coerce').fillna(0.0) if 'wide_hit_count' in sub.columns else _pd52.Series([0.0]*n)
+        n_wh = int((wh >= 1).sum())
+        wide_hit_rate = _r52_pct(n_wh, n)
+        pay_w = _pd52.to_numeric(sub['payout_wide_max'], errors='coerce').fillna(0.0) if 'payout_wide_max' in sub.columns else _pd52.Series([0.0]*n)
+        wide_ret = float((wh.clip(upper=1) * pay_w).sum())
+        wide_roi = _r52_roi(wide_ret, n * stake_wide)
+        # 三連複
+        th = sub['trio_hit'].map(lambda _x: bool(_x) if _x is not None else False) if 'trio_hit' in sub.columns else _pd52.Series([False]*n)
+        n_th = int(th.sum())
+        trio_hit_rate = _r52_pct(n_th, n)
+        pay_t = _pd52.to_numeric(sub['payout_sanrenpuku'], errors='coerce').fillna(0.0) if 'payout_sanrenpuku' in sub.columns else _pd52.Series([0.0]*n)
+        trio_ret = float((th.astype(float) * pay_t).sum())
+        trio_roi = _r52_roi(trio_ret, n * stake_trio)
+
+        results.append({
+            'key': val, 'n': n,
+            'place_hit_rate': place_hit_rate, 'place_roi': place_roi,
+            'wide_hit_rate': wide_hit_rate, 'wide_roi': wide_roi,
+            'trio_hit_rate': trio_hit_rate, 'trio_roi': trio_roi,
+        })
+    return results
+
+
+def _r52_cross2(df, axis1_col, axis1_vals, axis2_col, axis2_vals,
+                stake_place=1000.0, metric='place_hit_rate'):
+    """2軸クロス集計: axis1 × axis2 の KPI マトリクスを返す"""
+    ok_df = df[df['place_ok'].infer_objects(copy=False).fillna(False).astype(bool)].copy() \
+        if 'place_ok' in df.columns else df.copy()
+    matrix = {}  # {a1_val: {a2_val: value}}
+    for a1 in axis1_vals:
+        matrix[a1] = {}
+        sub1 = ok_df[ok_df[axis1_col] == a1] if axis1_col in ok_df.columns else _pd52.DataFrame()
+        for a2 in axis2_vals:
+            sub2 = sub1[sub1[axis2_col] == a2] if axis2_col in sub1.columns else _pd52.DataFrame()
+            n = len(sub2)
+            if n == 0:
+                matrix[a1][a2] = float('nan')
+                continue
+            if metric == 'place_hit_rate':
+                ph = sub2['place_hit'].map(lambda _x: bool(_x) if _x is not None else False)
+                matrix[a1][a2] = _r52_pct(int(ph.sum()), n)
+            elif metric == 'place_roi':
+                ph = sub2['place_hit'].map(lambda _x: bool(_x) if _x is not None else False)
+                pay = _pd52.to_numeric(sub2['payout_fukusho_max'], errors='coerce').fillna(0.0)
+                ret = float((ph.astype(float) * pay).sum())
+                matrix[a1][a2] = _r52_roi(ret, n * stake_place)
+            elif metric == 'n':
+                matrix[a1][a2] = n
+    return matrix
+
+
+def _r52_top10_combos(df, stake_place=1000.0, stake_wide=100.0, stake_trio=100.0):
+    """ペース×会場×馬場条件の3軸組み合わせを複勝ROI降順でTOP10返す"""
+    ok_df = df[df['place_ok'].infer_objects(copy=False).fillna(False).astype(bool)].copy() \
+        if 'place_ok' in df.columns else df.copy()
+    combos = []
+    paces   = [p for p in _R52_PACE_ORDER  if p in ok_df.get('pace',      _pd52.Series()).values] if 'pace'      in ok_df.columns else []
+    venues  = ok_df['venue_cat'].unique().tolist()  if 'venue_cat'  in ok_df.columns else []
+    goings  = ok_df['going_cat'].unique().tolist()  if 'going_cat'  in ok_df.columns else []
+
+    for p in (paces or ['H','M','S']):
+        for v in venues:
+            for g in goings:
+                mask = _pd52.Series([True]*len(ok_df), index=ok_df.index)
+                if 'pace'      in ok_df.columns: mask &= (ok_df['pace']      == p)
+                if 'venue_cat' in ok_df.columns: mask &= (ok_df['venue_cat'] == v)
+                if 'going_cat' in ok_df.columns: mask &= (ok_df['going_cat'] == g)
+                sub = ok_df[mask]
+                n = len(sub)
+                if n < 3:   # サンプル少なすぎは除外
+                    continue
+                ph  = sub['place_hit'].map(lambda _x: bool(_x) if _x is not None else False)
+                pay = _pd52.to_numeric(sub['payout_fukusho_max'], errors='coerce').fillna(0.0)
+                ret = float((ph.astype(float) * pay).sum())
+                roi = _r52_roi(ret, n * stake_place)
+                hr  = _r52_pct(int(ph.sum()), n)
+                combos.append({
+                    'pace': p, 'venue_cat': v, 'going_cat': g,
+                    'n': n, 'place_hit_rate': hr, 'place_roi': roi,
+                })
+    combos.sort(key=lambda x: (x['place_roi'] if not _np52.isnan(x['place_roi']) else -999), reverse=True)
+    return combos[:10]
+
+
+def _r52_matrix_md(matrix, row_vals, col_vals, row_label_fn, col_label_fn, title, metric_fmt=None):
+    """2軸マトリクスをMarkdownテーブルに変換"""
+    if metric_fmt is None:
+        metric_fmt = lambda v: f"{v:.1f}%" if (v is not None and not _np52.isnan(v)) else '─'
+    lines = [f"### {title}", ""]
+    # ヘッダー
+    col_labels = [col_label_fn(c) for c in col_vals]
+    header = "| ペース / 軸 | " + " | ".join(col_labels) + " |"
+    sep    = "|---|" + "---|" * len(col_vals)
+    lines.append(header)
+    lines.append(sep)
+    for r in row_vals:
+        row_label = row_label_fn(r)
+        cells = []
+        for c in col_vals:
+            v = matrix.get(r, {}).get(c, float('nan'))
+            cells.append(metric_fmt(v))
+        lines.append(f"| {row_label} | " + " | ".join(cells) + " |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _r52_axis_md(kpi_list, axis_label, key_label_fn, stake_label="複勝ROI"):
+    """1軸 KPI をMarkdownテーブルに変換"""
+    lines = [f"### {axis_label}別 KPI", "",
+             f"| {axis_label} | N | 複勝率 | 複勝ROI | ワイド率 | ワイドROI | 三連複率 | 三連複ROI |",
+             "|---|---|---|---|---|---|---|---|"]
+    for r in kpi_list:
+        if r['n'] == 0:
+            continue
+        lines.append(
+            f"| {key_label_fn(r['key'])} | {r['n']} "
+            f"| {_r52_fmt_pct(r['place_hit_rate'])} | {_r52_fmt_roi(r['place_roi'])} "
+            f"| {_r52_fmt_pct(r['wide_hit_rate'])} | {_r52_fmt_roi(r['wide_roi'])} "
+            f"| {_r52_fmt_pct(r['trio_hit_rate'])} | {_r52_fmt_roi(r['trio_roi'])} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _r52_build_cross_md(
+    df, pace_kpi, venue_kpi, going_kpi,
+    cross_pace_venue_hr, cross_pace_venue_roi,
+    cross_pace_going_hr, cross_pace_going_roi,
+    cross_venue_going_hr,
+    top10, meta
+):
+    """8セクション Markdown レポートを生成"""
+    n_races = meta.get('n_races', 0)
+    n_ok    = meta.get('n_ok', 0)
+    n_pace  = meta.get('n_pace_vals', 0)
+    n_venue = meta.get('n_venue_vals', 0)
+    n_going = meta.get('n_going_vals', 0)
+
+    paces_present  = [p for p in _R52_PACE_ORDER  if any(r['key']==p and r['n']>0 for r in pace_kpi)]
+    venues_present = [r['key'] for r in venue_kpi  if r['n'] > 0]
+    goings_present = [g for g in _R52_GOING_ORDER  if any(r['key']==g and r['n']>0 for r in going_kpi)]
+
+    lines = []
+
+    # --- Section 0: 実行サマリー ---
+    lines += [
+        "# ペース×会場×馬場条件 3軸クロス分析レポート",
+        f"> STELLA v1.32 | 対象レース数: {n_races} | place_ok: {n_ok}",
+        "",
+        "## 0. 実行サマリー", "",
+        f"| 項目 | 値 |",
+        f"|------|-----|",
+        f"| 総レース数 | {n_races} |",
+        f"| 分析対象(place_ok) | {n_ok} |",
+        f"| ペース軸 (H/M/S) | {n_pace} 種 |",
+        f"| 会場軸 | {n_venue} 場 |",
+        f"| 馬場条件軸 | {n_going} 種 |",
+        f"| TOP10組み合わせ数 | {len(top10)} |",
+        "",
+    ]
+
+    # --- Section 1: ペース別 KPI ---
+    lines += ["## 1. ペース別 KPI", ""]
+    lines += [_r52_axis_md(pace_kpi, "ペース",
+                           lambda k: _R52_PACE_LABELS.get(k, k))]
+
+    # --- Section 2: 会場別 KPI ---
+    lines += ["## 2. 会場別 KPI", ""]
+    lines += [_r52_axis_md(venue_kpi, "会場",
+                           lambda k: k)]
+
+    # --- Section 3: 馬場状態別 KPI ---
+    lines += ["## 3. 馬場状態別 KPI", ""]
+    lines += [_r52_axis_md(going_kpi, "馬場状態",
+                           lambda k: _R52_GOING_LABELS.get(k, k))]
+
+    # --- Section 4: ペース×会場 複勝率クロス ---
+    lines += ["## 4. ペース×会場 クロス集計", ""]
+    lines += [_r52_matrix_md(
+        cross_pace_venue_hr, paces_present, venues_present,
+        lambda k: _R52_PACE_LABELS.get(k, k),
+        lambda k: k,
+        "複勝率 (%)",
+        lambda v: f"{v:.1f}%" if (v is not None and not _np52.isnan(v)) else '─'
+    )]
+    lines += [_r52_matrix_md(
+        cross_pace_venue_roi, paces_present, venues_present,
+        lambda k: _R52_PACE_LABELS.get(k, k),
+        lambda k: k,
+        "複勝ROI",
+        lambda v: f"{v:.3f}" if (v is not None and not _np52.isnan(v)) else '─'
+    )]
+
+    # --- Section 5: ペース×馬場条件 ---
+    lines += ["## 5. ペース×馬場条件 クロス集計", ""]
+    lines += [_r52_matrix_md(
+        cross_pace_going_hr, paces_present, goings_present,
+        lambda k: _R52_PACE_LABELS.get(k, k),
+        lambda k: _R52_GOING_LABELS.get(k, k),
+        "複勝率 (%)",
+        lambda v: f"{v:.1f}%" if (v is not None and not _np52.isnan(v)) else '─'
+    )]
+    lines += [_r52_matrix_md(
+        cross_pace_going_roi, paces_present, goings_present,
+        lambda k: _R52_PACE_LABELS.get(k, k),
+        lambda k: _R52_GOING_LABELS.get(k, k),
+        "複勝ROI",
+        lambda v: f"{v:.3f}" if (v is not None and not _np52.isnan(v)) else '─'
+    )]
+
+    # --- Section 6: 会場×馬場条件 ---
+    lines += ["## 6. 会場×馬場条件 クロス集計", ""]
+    lines += [_r52_matrix_md(
+        cross_venue_going_hr, venues_present, goings_present,
+        lambda k: k,
+        lambda k: _R52_GOING_LABELS.get(k, k),
+        "複勝率 (%)",
+        lambda v: f"{v:.1f}%" if (v is not None and not _np52.isnan(v)) else '─'
+    )]
+
+    # --- Section 7: TOP10 3軸組み合わせ ---
+    lines += ["## 7. 3軸クロス TOP10 組み合わせ (複勝ROI順)", "",
+              "| # | ペース | 会場 | 馬場状態 | N | 複勝率 | 複勝ROI |",
+              "|---|---|---|---|---|---|---|"]
+    for i, c in enumerate(top10, 1):
+        lines.append(
+            f"| {i} | {_R52_PACE_LABELS.get(c['pace'], c['pace'])} "
+            f"| {c['venue_cat']} | {_R52_GOING_LABELS.get(c['going_cat'], c['going_cat'])} "
+            f"| {c['n']} | {_r52_fmt_pct(c['place_hit_rate'])} | {_r52_fmt_roi(c['place_roi'])} |"
+        )
+    lines.append("")
+
+    # --- Section 8: 推奨設定 JSON + 次アクション ---
+    # ベスト組み合わせ特定
+    best = top10[0] if top10 else {}
+    best_pace  = best.get('pace', 'M')
+    best_venue = best.get('venue_cat', '不明')
+    best_going = best.get('going_cat', 'fast')
+
+    # 各軸のベスト
+    def _best_key(kpi_list, metric):
+        valid = [r for r in kpi_list if r['n'] > 0 and not _np52.isnan(r.get(metric, float('nan')))]
+        if not valid:
+            return '不明'
+        return max(valid, key=lambda x: x.get(metric, -999))['key']
+
+    best_pace_for_place  = _best_key(pace_kpi,  'place_roi')
+    best_venue_for_place = _best_key(venue_kpi, 'place_roi')
+    best_going_for_place = _best_key(going_kpi, 'place_roi')
+
+    recommend = {
+        "best_3axis_combo": {
+            "pace": best_pace,
+            "venue_cat": best_venue,
+            "going_cat": best_going,
+            "place_roi": _r52_fmt_roi(best.get('place_roi')),
+            "n": best.get('n', 0)
+        },
+        "best_pace_for_place_roi":  best_pace_for_place,
+        "best_venue_for_place_roi": best_venue_for_place,
+        "best_going_for_place_roi": _R52_GOING_LABELS.get(best_going_for_place, best_going_for_place),
+        "note": "サンプル数N>=3の組み合わせのみ対象"
+    }
+
+    lines += [
+        "## 8. 推奨設定 & 次アクション", "",
+        "### 推奨 JSON", "```json",
+        _json52.dumps(recommend, ensure_ascii=False, indent=2),
+        "```", "",
+        "### 次アクション",
+        f"1. **最適3軸**: ペース={_R52_PACE_LABELS.get(best_pace, best_pace)}, 会場={best_venue}, 馬場={_R52_GOING_LABELS.get(best_going, best_going)} を優先ターゲットに設定",
+        f"2. **ペース戦略**: {_R52_PACE_LABELS.get(best_pace_for_place, best_pace_for_place)} ペースレースで複勝ROI最大",
+        f"3. **会場戦略**: {best_venue_for_place} が複勝ROI最高 → 重点出走会場を絞り込む",
+        f"4. **馬場戦略**: {_R52_GOING_LABELS.get(best_going_for_place, best_going_for_place)} 条件を優先",
+        "5. 次サイクル: 時系列トレンドレポート (R52候補) で月次ROI推移を確認",
+        "",
+    ]
+
+    return "\n".join(lines)
+
+
+def analyze_cross_analysis(
+    result_dir: str,
+    params: Optional[dict] = None,
+    stake_place: float = 1000.0,
+    stake_wide: float = 100.0,
+    stake_trio: float = 100.0,
+    out_md: Optional[str] = None,
+    verbose: bool = True,
+) -> dict:
+    """R52: ペース×会場×馬場条件 3軸クロス分析のメインドライバー。
+
+    Args:
+        result_dir:   解析済みJSONが格納されたディレクトリ
+        params:       予測パラメータ辞書（省略可）
+        stake_place:  複勝1点賭け金
+        stake_wide:   ワイド1点賭け金
+        stake_trio:   三連複1点賭け金
+        out_md:       Markdownレポート出力パス（省略=返値のみ）
+        verbose:      進捗表示フラグ
+
+    Returns:
+        dict:
+            report_md      (str)  : Markdownレポート全文
+            pace_kpi       (list) : ペース別KPIリスト
+            venue_kpi      (list) : 会場別KPIリスト
+            going_kpi      (list) : 馬場状態別KPIリスト
+            top10          (list) : TOP10 3軸組み合わせ
+            n_races        (int)  : 総レース数
+            n_ok           (int)  : place_ok=True のレース数
+            n_success      (int)  : 1 (成功) / 0 (失敗)
+    """
+    if params is None:
+        params = {}
+
+    # --- データロード ---
+    try:
+        df = _r52_load_df(result_dir)
+    except Exception as e:
+        df = _pd52.DataFrame()
+
+    n_races = len(df)
+    ok_mask = df['place_ok'].map(lambda _x: bool(_x) if _x is not None else False) if ('place_ok' in df.columns and n_races > 0) else _pd52.Series(dtype=bool)
+    n_ok    = int(ok_mask.sum()) if len(ok_mask) > 0 else 0
+
+    if verbose:
+        print(f"[R52] ロード完了: {n_races} レース, place_ok={n_ok}")
+
+    # --- 各軸の値リスト ---
+    ok_df = df[ok_mask].copy() if n_ok > 0 else _pd52.DataFrame()
+
+    paces_present  = [p for p in _R52_PACE_ORDER if 'pace' in ok_df.columns and p in ok_df['pace'].values]
+    venues_present = sorted(ok_df['venue_cat'].unique().tolist()) if 'venue_cat' in ok_df.columns else []
+    goings_present = [g for g in _R52_GOING_ORDER if 'going_cat' in ok_df.columns and g in ok_df['going_cat'].values]
+
+    # --- 1軸 KPI ---
+    pace_kpi  = _r52_axis_kpi(df, 'pace',      paces_present,  stake_place, stake_wide, stake_trio)
+    venue_kpi = _r52_axis_kpi(df, 'venue_cat', venues_present, stake_place, stake_wide, stake_trio)
+    going_kpi = _r52_axis_kpi(df, 'going_cat', goings_present, stake_place, stake_wide, stake_trio)
+
+    # --- 2軸クロス ---
+    cross_pace_venue_hr  = _r52_cross2(df, 'pace', paces_present, 'venue_cat',  venues_present, stake_place, 'place_hit_rate')
+    cross_pace_venue_roi = _r52_cross2(df, 'pace', paces_present, 'venue_cat',  venues_present, stake_place, 'place_roi')
+    cross_pace_going_hr  = _r52_cross2(df, 'pace', paces_present, 'going_cat',  goings_present, stake_place, 'place_hit_rate')
+    cross_pace_going_roi = _r52_cross2(df, 'pace', paces_present, 'going_cat',  goings_present, stake_place, 'place_roi')
+    cross_venue_going_hr = _r52_cross2(df, 'venue_cat', venues_present, 'going_cat', goings_present, stake_place, 'place_hit_rate')
+
+    # --- 3軸 TOP10 ---
+    top10 = _r52_top10_combos(df, stake_place, stake_wide, stake_trio)
+
+    # --- メタ情報 ---
+    meta = {
+        'n_races': n_races, 'n_ok': n_ok,
+        'n_pace_vals': len(paces_present),
+        'n_venue_vals': len(venues_present),
+        'n_going_vals': len(goings_present),
+    }
+
+    # --- レポート生成 ---
+    report_md = _r52_build_cross_md(
+        df, pace_kpi, venue_kpi, going_kpi,
+        cross_pace_venue_hr, cross_pace_venue_roi,
+        cross_pace_going_hr, cross_pace_going_roi,
+        cross_venue_going_hr,
+        top10, meta
+    )
+
+    # --- 出力 ---
+    if out_md:
+        try:
+            with open(out_md, 'w', encoding='utf-8') as f:
+                f.write(report_md)
+            if verbose:
+                print(f"[R52] レポート保存: {out_md}")
+        except Exception as e:
+            if verbose:
+                print(f"[R52] レポート保存失敗: {e}")
+
+    return {
+        'report_md': report_md,
+        'pace_kpi': pace_kpi,
+        'venue_kpi': venue_kpi,
+        'going_kpi': going_kpi,
+        'top10': top10,
+        'n_races': n_races,
+        'n_ok': n_ok,
+        'n_success': 1,
+    }
+
+
+# =========================
+# R53: 信頼度スコア再調整（馬場条件補正係数）(v1.29)
+# =========================
+# Purpose: --score_adjust <dir>
+#   going_cat(仮想馬場状態) × anchor_score の関係を分析し、
+#   馬場条件ごとの最適補正係数を算出。補正後スコアによる
+#   複勝率・ROI改善効果をレポートする。
+#
+# Report sections (0-7):
+#   0: 実行サマリー
+#   1: 馬場状態別 AnchorScore 統計 (平均・中央値・分布)
+#   2: 馬場状態×スコアバンド クロス集計 (複勝率ヒートマップ)
+#   3: 馬場状態別 最適補正係数 (α: 補正後スコア = α × raw_score)
+#   4: 補正前後スコアバンド別 複勝率比較
+#   5: confidence_level × 馬場状態 クロス集計
+#   6: 推奨 補正パラメータ JSON
+#   7: 次アクション提案
+
+import pandas as _pd53
+import numpy as _np53
+import json as _json53
+import os as _os53
+from pathlib import Path as _Path53
+from typing import Optional, List, Dict, Any
+
+# ---- 定数 ----
+_R53_GOING_LABELS = {
+    'fast':    '良相当(fast)',
+    'normal':  'やや重相当(normal)',
+    'slow':    '重相当(slow)',
+    'heavy':   '不良相当(heavy)',
+    'unknown': '不明',
+}
+_R53_GOING_ORDER   = ['fast', 'normal', 'slow', 'heavy']
+_R53_SCORE_BANDS   = ['<40', '40-49', '50-59', '60-69', '70-79', '80-89', '90+']
+_R53_CONF_LEVELS   = ['HIGH', 'MEDIUM', 'LOW']
+# 補正係数の探索範囲
+_R53_ALPHA_RANGE   = [round(0.80 + i * 0.05, 2) for i in range(9)]  # 0.80~1.20
+
+
+# ---- ユーティリティ ----
+def _r53_pct(n, d, dec=1):
+    try:
+        if d == 0:
+            return float('nan')
+        return round(float(n) / float(d) * 100.0, dec)
+    except Exception:
+        return float('nan')
+
+
+def _r53_fmt_pct(v, na='N/A'):
+    if v is None or (isinstance(v, float) and _np53.isnan(v)):
+        return na
+    return f"{v:.1f}%"
+
+
+def _r53_fmt_roi(v, na='N/A'):
+    if v is None or (isinstance(v, float) and _np53.isnan(v)):
+        return na
+    return f"{v:.3f}"
+
+
+def _r53_fmt_float(v, dec=2, na='N/A'):
+    if v is None or (isinstance(v, float) and _np53.isnan(v)):
+        return na
+    return f"{v:.{dec}f}"
+
+
+def _r53_score_band(score):
+    """anchor_score を10点刻みバンドに分類"""
+    if score is None or (isinstance(score, float) and _np53.isnan(score)):
+        return '不明'
+    s = float(score)
+    if s < 40:   return '<40'
+    elif s < 50: return '40-49'
+    elif s < 60: return '50-59'
+    elif s < 70: return '60-69'
+    elif s < 80: return '70-79'
+    elif s < 90: return '80-89'
+    else:        return '90+'
+
+
+def _r53_adjusted_band(score, alpha):
+    """alpha 補正後スコアのバンド"""
+    if score is None or (isinstance(score, float) and _np53.isnan(score)):
+        return '不明'
+    return _r53_score_band(float(score) * float(alpha))
+
+
+# ---- データロード ----
+def _r53_load_df(result_dir):
+    """going_cat + スコア情報付き DataFrame をロード"""
+    df = _r50_load_enriched_df(result_dir)
+    if df is None or len(df) == 0:
+        return _pd53.DataFrame()
+    # score_band 列を追加
+    if 'anchor_score' in df.columns:
+        df['score_band'] = df['anchor_score'].apply(_r53_score_band)
+    else:
+        df['score_band'] = '不明'
+    return df
+
+
+# ---- 馬場状態別スコア統計 ----
+def _r53_going_score_stats(df):
+    """going_cat 別の anchor_score 統計を返す"""
+    results = []
+    if 'going_cat' not in df.columns or 'anchor_score' not in df.columns:
+        return results
+    for gc in _R53_GOING_ORDER:
+        sub = df[df['going_cat'] == gc]
+        scores = _pd53.to_numeric(sub['anchor_score'], errors='coerce').dropna()
+        n = len(sub)
+        n_sc = len(scores)
+        results.append({
+            'going_cat': gc,
+            'n': n,
+            'score_mean':   float(scores.mean())   if n_sc > 0 else float('nan'),
+            'score_median': float(scores.median())  if n_sc > 0 else float('nan'),
+            'score_std':    float(scores.std())     if n_sc > 0 else float('nan'),
+            'score_min':    float(scores.min())     if n_sc > 0 else float('nan'),
+            'score_max':    float(scores.max())     if n_sc > 0 else float('nan'),
+        })
+    return results
+
+
+# ---- 馬場状態×スコアバンド クロス集計 ----
+def _r53_going_band_cross(df, stake_place=1000.0):
+    """going_cat × score_band の複勝率マトリクスを返す"""
+    matrix_hr  = {}  # hit_rate
+    matrix_roi = {}  # roi
+    if 'going_cat' not in df.columns or 'score_band' not in df.columns:
+        return matrix_hr, matrix_roi
+
+    ok_df = df[df['place_ok'].map(lambda x: bool(x) if x is not None else False)].copy() \
+        if 'place_ok' in df.columns else df.copy()
+
+    for gc in _R53_GOING_ORDER:
+        matrix_hr[gc]  = {}
+        matrix_roi[gc] = {}
+        sub_g = ok_df[ok_df['going_cat'] == gc]
+        for band in _R53_SCORE_BANDS:
+            sub = sub_g[sub_g['score_band'] == band]
+            n = len(sub)
+            if n == 0:
+                matrix_hr[gc][band]  = float('nan')
+                matrix_roi[gc][band] = float('nan')
+                continue
+            ph = sub['place_hit'].map(lambda x: bool(x) if x is not None else False)
+            n_hit = int(ph.sum())
+            pay = _pd53.to_numeric(sub['payout_fukusho_max'], errors='coerce').fillna(0.0)
+            ret = float((ph.astype(float) * pay).sum())
+            matrix_hr[gc][band]  = _r53_pct(n_hit, n)
+            matrix_roi[gc][band] = round(ret / (n * stake_place), 4) if n > 0 else float('nan')
+    return matrix_hr, matrix_roi
+
+
+# ---- 最適補正係数の算出 ----
+def _r53_find_best_alpha(df, going_cat, stake_place=1000.0):
+    """going_cat に対する最適補正係数 alpha を探索する。
+    補正後の score_band で複勝ROIが最大になる alpha を返す。
+    """
+    if 'going_cat' not in df.columns or 'anchor_score' not in df.columns:
+        return 1.0, float('nan')
+    ok_df = df[
+        (df['going_cat'] == going_cat) &
+        df['place_ok'].map(lambda x: bool(x) if x is not None else False)
+    ].copy() if 'place_ok' in df.columns else df[df['going_cat'] == going_cat].copy()
+
+    if len(ok_df) < 5:
+        return 1.0, float('nan')
+
+    scores  = _pd53.to_numeric(ok_df['anchor_score'], errors='coerce')
+    ph      = ok_df['place_hit'].map(lambda x: bool(x) if x is not None else False)
+    payouts = _pd53.to_numeric(ok_df['payout_fukusho_max'], errors='coerce').fillna(0.0)
+
+    best_alpha = 1.0
+    best_roi   = float('-inf')
+
+    for alpha in _R53_ALPHA_RANGE:
+        adj_scores = scores * alpha
+        # 高スコアバンド (70+) の的中率を評価
+        high_mask = adj_scores >= 70.0
+        n_high = int(high_mask.sum())
+        if n_high == 0:
+            continue
+        n_hit = int(ph[high_mask].sum())
+        ret   = float((ph[high_mask].astype(float) * payouts[high_mask]).sum())
+        roi   = ret / (n_high * stake_place) if n_high > 0 else float('-inf')
+        if roi > best_roi:
+            best_roi   = roi
+            best_alpha = alpha
+
+    return best_alpha, best_roi if best_roi > float('-inf') else float('nan')
+
+
+def _r53_all_alphas(df, stake_place=1000.0):
+    """全馬場状態の最適 alpha を辞書で返す"""
+    result = {}
+    for gc in _R53_GOING_ORDER:
+        alpha, roi = _r53_find_best_alpha(df, gc, stake_place)
+        result[gc] = {'alpha': alpha, 'best_roi_at_high': roi}
+    return result
+
+
+# ---- 補正前後スコアバンド比較 ----
+def _r53_compare_adjusted(df, alphas, stake_place=1000.0):
+    """補正前後のスコアバンド別 複勝率・ROIを比較する"""
+    rows = []
+    if 'anchor_score' not in df.columns:
+        return rows
+    ok_df = df[df['place_ok'].map(lambda x: bool(x) if x is not None else False)].copy() \
+        if 'place_ok' in df.columns else df.copy()
+    if len(ok_df) == 0:
+        return rows
+
+    for gc in _R53_GOING_ORDER:
+        alpha = alphas.get(gc, {}).get('alpha', 1.0)
+        sub   = ok_df[ok_df['going_cat'] == gc] if 'going_cat' in ok_df.columns else ok_df
+        if len(sub) == 0:
+            continue
+        scores  = _pd53.to_numeric(sub['anchor_score'], errors='coerce')
+        ph      = sub['place_hit'].map(lambda x: bool(x) if x is not None else False)
+        payouts = _pd53.to_numeric(sub['payout_fukusho_max'], errors='coerce').fillna(0.0)
+
+        # 補正前: スコア >= 70
+        mask_raw = scores >= 70.0
+        n_raw    = int(mask_raw.sum())
+        hr_raw   = _r53_pct(int(ph[mask_raw].sum()), n_raw) if n_raw > 0 else float('nan')
+        ret_raw  = float((ph[mask_raw].astype(float) * payouts[mask_raw]).sum()) if n_raw > 0 else 0.0
+        roi_raw  = ret_raw / (n_raw * stake_place) if n_raw > 0 else float('nan')
+
+        # 補正後: 補正スコア >= 70
+        adj_scores = scores * alpha
+        mask_adj   = adj_scores >= 70.0
+        n_adj      = int(mask_adj.sum())
+        hr_adj     = _r53_pct(int(ph[mask_adj].sum()), n_adj) if n_adj > 0 else float('nan')
+        ret_adj    = float((ph[mask_adj].astype(float) * payouts[mask_adj]).sum()) if n_adj > 0 else 0.0
+        roi_adj    = ret_adj / (n_adj * stake_place) if n_adj > 0 else float('nan')
+
+        rows.append({
+            'going_cat': gc, 'alpha': alpha,
+            'n_raw': n_raw, 'hr_raw': hr_raw, 'roi_raw': roi_raw,
+            'n_adj': n_adj, 'hr_adj': hr_adj, 'roi_adj': roi_adj,
+        })
+    return rows
+
+
+# ---- confidence_level × 馬場状態 クロス ----
+def _r53_conf_going_cross(df):
+    """confidence_level × going_cat の複勝率マトリクスを返す"""
+    matrix = {}
+    if 'confidence_level' not in df.columns or 'going_cat' not in df.columns:
+        return matrix
+    ok_df = df[df['place_ok'].map(lambda x: bool(x) if x is not None else False)].copy() \
+        if 'place_ok' in df.columns else df.copy()
+    for cl in _R53_CONF_LEVELS:
+        matrix[cl] = {}
+        sub_cl = ok_df[ok_df['confidence_level'] == cl]
+        for gc in _R53_GOING_ORDER:
+            sub = sub_cl[sub_cl['going_cat'] == gc]
+            n = len(sub)
+            if n == 0:
+                matrix[cl][gc] = float('nan')
+                continue
+            ph = sub['place_hit'].map(lambda x: bool(x) if x is not None else False)
+            matrix[cl][gc] = _r53_pct(int(ph.sum()), n)
+    return matrix
+
+
+# ---- Markdown レポート生成 ----
+def _r53_build_md(
+    score_stats, going_band_hr, going_band_roi,
+    alphas, compare_rows, conf_going_matrix, meta
+):
+    """7セクション Markdown レポートを生成"""
+    n_races = meta.get('n_races', 0)
+    n_ok    = meta.get('n_ok', 0)
+    lines   = []
+
+    # --- Section 0: 実行サマリー ---
+    lines += [
+        "# 信頼度スコア再調整レポート（馬場条件補正係数）",
+        f"> STELLA v1.32 | 対象レース数: {n_races} | place_ok: {n_ok}",
+        "",
+        "## 0. 実行サマリー", "",
+        "| 項目 | 値 |",
+        "|------|-----|",
+        f"| 総レース数 | {n_races} |",
+        f"| 分析対象(place_ok) | {n_ok} |",
+        f"| 補正係数探索範囲 | {_R53_ALPHA_RANGE[0]} ～ {_R53_ALPHA_RANGE[-1]} (刻み 0.05) |",
+        f"| スコアバンド数 | {len(_R53_SCORE_BANDS)} |",
+        "",
+    ]
+
+    # --- Section 1: 馬場状態別スコア統計 ---
+    lines += ["## 1. 馬場状態別 AnchorScore 統計", "",
+              "| 馬場状態 | N | 平均 | 中央値 | 標準偏差 | 最小 | 最大 |",
+              "|---|---|---|---|---|---|---|"]
+    for r in score_stats:
+        if r['n'] == 0:
+            continue
+        lines.append(
+            f"| {_R53_GOING_LABELS.get(r['going_cat'], r['going_cat'])} "
+            f"| {r['n']} "
+            f"| {_r53_fmt_float(r['score_mean'])} "
+            f"| {_r53_fmt_float(r['score_median'])} "
+            f"| {_r53_fmt_float(r['score_std'])} "
+            f"| {_r53_fmt_float(r['score_min'])} "
+            f"| {_r53_fmt_float(r['score_max'])} |"
+        )
+    lines.append("")
+
+    # --- Section 2: 馬場状態×スコアバンド クロス ---
+    lines += ["## 2. 馬場状態×スコアバンド クロス集計（複勝率）", ""]
+    header = "| 馬場状態 | " + " | ".join(_R53_SCORE_BANDS) + " |"
+    sep    = "|---|" + "---|" * len(_R53_SCORE_BANDS)
+    lines += [header, sep]
+    for gc in _R53_GOING_ORDER:
+        if gc not in going_band_hr:
+            continue
+        cells = [_r53_fmt_pct(going_band_hr[gc].get(b, float('nan'))) for b in _R53_SCORE_BANDS]
+        lines.append(f"| {_R53_GOING_LABELS.get(gc, gc)} | " + " | ".join(cells) + " |")
+    lines.append("")
+
+    # --- Section 3: 最適補正係数 ---
+    lines += ["## 3. 馬場状態別 最適補正係数 (α)", "",
+              "> α = 補正係数。補正後スコア = α × 元スコア。",
+              "> スコア70以上の複勝ROIを最大化する α を探索。",
+              "",
+              "| 馬場状態 | 最適 α | 補正後ROI (スコア70+) |",
+              "|---|---|---|"]
+    for gc in _R53_GOING_ORDER:
+        if gc not in alphas:
+            continue
+        a   = alphas[gc]['alpha']
+        roi = alphas[gc]['best_roi_at_high']
+        lines.append(
+            f"| {_R53_GOING_LABELS.get(gc, gc)} "
+            f"| **{a:.2f}** "
+            f"| {_r53_fmt_roi(roi)} |"
+        )
+    lines.append("")
+
+    # --- Section 4: 補正前後比較 ---
+    lines += ["## 4. 補正前後スコアバンド比較 (スコア70以上)", "",
+              "| 馬場状態 | α | 補正前 N | 補正前複勝率 | 補正前ROI | 補正後 N | 補正後複勝率 | 補正後ROI | 改善 |",
+              "|---|---|---|---|---|---|---|---|---|"]
+    for r in compare_rows:
+        gc = r['going_cat']
+        hr_diff = (r['hr_adj'] - r['hr_raw']) if (
+            not _np53.isnan(r.get('hr_adj', float('nan'))) and
+            not _np53.isnan(r.get('hr_raw', float('nan')))) else float('nan')
+        improve = (f"↑{hr_diff:+.1f}%" if not _np53.isnan(hr_diff) and hr_diff > 0
+                   else f"↓{hr_diff:+.1f}%" if not _np53.isnan(hr_diff) and hr_diff < 0
+                   else "─")
+        lines.append(
+            f"| {_R53_GOING_LABELS.get(gc, gc)} "
+            f"| {r['alpha']:.2f} "
+            f"| {r['n_raw']} | {_r53_fmt_pct(r['hr_raw'])} | {_r53_fmt_roi(r['roi_raw'])} "
+            f"| {r['n_adj']} | {_r53_fmt_pct(r['hr_adj'])} | {_r53_fmt_roi(r['roi_adj'])} "
+            f"| {improve} |"
+        )
+    lines.append("")
+
+    # --- Section 5: confidence_level × 馬場状態 ---
+    lines += ["## 5. confidence_level × 馬場状態 クロス集計（複勝率）", ""]
+    going_labels = [_R53_GOING_LABELS.get(g, g) for g in _R53_GOING_ORDER]
+    header5 = "| 信頼度 | " + " | ".join(going_labels) + " |"
+    sep5    = "|---|" + "---|" * len(_R53_GOING_ORDER)
+    lines += [header5, sep5]
+    for cl in _R53_CONF_LEVELS:
+        if cl not in conf_going_matrix:
+            continue
+        cells = [_r53_fmt_pct(conf_going_matrix[cl].get(gc, float('nan'))) for gc in _R53_GOING_ORDER]
+        lines.append(f"| {cl} | " + " | ".join(cells) + " |")
+    lines.append("")
+
+    # --- Section 6: 推奨 JSON ---
+    # ベスト補正係数まとめ
+    recommend = {
+        "going_correction_factors": {
+            gc: alphas.get(gc, {}).get('alpha', 1.0)
+            for gc in _R53_GOING_ORDER
+        },
+        "usage": (
+            "adjusted_score = anchor_score * going_correction_factors[going_cat]。"
+            "going_cat は avg_halon から _r50_estimate_going() で推定。"
+        ),
+        "note": "スコア70以上の複勝ROIを最大化する係数。サンプルN<5の馬場状態はα=1.0固定。"
+    }
+
+    lines += [
+        "## 6. 推奨 補正パラメータ JSON", "",
+        "```json",
+        _json53.dumps(recommend, ensure_ascii=False, indent=2),
+        "```", "",
+    ]
+
+    # --- Section 7: 次アクション ---
+    best_going = max(
+        (gc for gc in _R53_GOING_ORDER if gc in alphas),
+        key=lambda gc: (
+            compare_rows[[r['going_cat'] for r in compare_rows].index(gc)]['hr_adj']
+            if gc in [r['going_cat'] for r in compare_rows] else float('nan')
+        ),
+        default='fast'
+    ) if compare_rows else 'fast'
+
+    lines += [
+        "## 7. 次アクション提案", "",
+        "1. **補正係数の適用**: `going_correction_factors` を `params` に追加し、"
+        "予測時に `anchor_score * alpha` を使用",
+        f"2. **優先馬場状態**: `{_R53_GOING_LABELS.get(best_going, best_going)}` で補正後複勝率が最高",
+        "3. **confidence_level 調整**: `fast` 馬場でHIGH信頼度の複勝率が低い場合、"
+        "`confidence_score_gap_min` を引き下げ検討",
+        "4. 次サイクル: 時系列トレンドレポート (月次ROI推移) で効果を継続モニタリング",
+        "",
+    ]
+
+    return "\n".join(lines)
+
+
+# ---- メインドライバー ----
+def analyze_score_adjust(
+    result_dir: str,
+    params: Optional[dict] = None,
+    stake_place: float = 1000.0,
+    out_md: Optional[str] = None,
+    verbose: bool = True,
+) -> dict:
+    """R53: 信頼度スコア再調整（馬場条件補正係数）のメインドライバー。
+
+    Args:
+        result_dir:  解析済みJSONが格納されたディレクトリ
+        params:      予測パラメータ辞書（省略可）
+        stake_place: 複勝1点賭け金
+        out_md:      Markdownレポート出力パス
+        verbose:     進捗表示フラグ
+
+    Returns:
+        dict:
+            report_md         (str)  : Markdownレポート全文
+            alphas            (dict) : going_cat → {alpha, best_roi_at_high}
+            score_stats       (list) : 馬場状態別スコア統計
+            compare_rows      (list) : 補正前後比較
+            going_band_hr     (dict) : 馬場×スコアバンド 複勝率マトリクス
+            conf_going_matrix (dict) : confidence×馬場 複勝率マトリクス
+            n_races           (int)  : 総レース数
+            n_ok              (int)  : place_ok=True のレース数
+            n_success         (int)  : 1(成功) / 0(失敗)
+    """
+    if params is None:
+        params = {}
+
+    try:
+        df = _r53_load_df(result_dir)
+    except Exception as e:
+        if verbose:
+            print(f"[R53] データロード失敗: {e}")
+        df = _pd53.DataFrame()
+
+    n_races = len(df)
+    ok_mask = (df['place_ok'].map(lambda x: bool(x) if x is not None else False)
+               if ('place_ok' in df.columns and n_races > 0) else _pd53.Series(dtype=bool))
+    n_ok = int(ok_mask.sum()) if len(ok_mask) > 0 else 0
+
+    if verbose:
+        print(f"[R53] ロード完了: {n_races} レース, place_ok={n_ok}")
+
+    # --- 各分析 ---
+    score_stats       = _r53_going_score_stats(df)
+    going_band_hr, going_band_roi = _r53_going_band_cross(df, stake_place)
+    alphas            = _r53_all_alphas(df, stake_place)
+    compare_rows      = _r53_compare_adjusted(df, alphas, stake_place)
+    conf_going_matrix = _r53_conf_going_cross(df)
+
+    meta = {'n_races': n_races, 'n_ok': n_ok}
+
+    # --- レポート生成 ---
+    report_md = _r53_build_md(
+        score_stats, going_band_hr, going_band_roi,
+        alphas, compare_rows, conf_going_matrix, meta
+    )
+
+    if verbose:
+        best_gc = max(
+            (gc for gc in _R53_GOING_ORDER if gc in alphas),
+            key=lambda gc: alphas[gc].get('alpha', 1.0),
+            default='fast'
+        )
+        print(f"[R53] 最高補正係数: {best_gc} → α={alphas.get(best_gc, {}).get('alpha', 1.0):.2f}")
+
+    # --- 出力 ---
+    if out_md:
+        try:
+            with open(out_md, 'w', encoding='utf-8') as f:
+                f.write(report_md)
+            if verbose:
+                print(f"[R53] レポート保存: {out_md}")
+        except Exception as e:
+            if verbose:
+                print(f"[R53] レポート保存失敗: {e}")
+
+    return {
+        'report_md':         report_md,
+        'alphas':            alphas,
+        'score_stats':       score_stats,
+        'compare_rows':      compare_rows,
+        'going_band_hr':     going_band_hr,
+        'conf_going_matrix': conf_going_matrix,
+        'n_races':           n_races,
+        'n_ok':              n_ok,
+        'n_success':         1,
+    }
+
+
+
+
+# ─── R54: 時系列トレンドレポート ───
+"""
+R54 – 時系列トレンドレポート
+月次ごとに複勝/ワイド/三連複のROI・的中率を集計し、
+ASCII折れ線グラフと移動平均でトレンドを可視化する。
+
+定数
+----
+_R54_VERSION   : str
+_R54_SPARKLINE : list[str]   ▁▂▃▄▅▆▇█
+_R54_TREND_WIN : int         移動平均ウィンドウ (3ヶ月)
+_R54_MIN_RACES : int         1ヶ月あたりの最小レース数 (3)
+_R54_CHART_W   : int         ASCII折れ線グラフの幅 (60桁)
+
+関数
+----
+_r54_ym(s)                      → str  "YYYY-MM" 変換
+_r54_pct(v)                     → str  "XX.X%" 表示
+_r54_fmt_roi(v)                 → str  "+XX.X%" / "N/A"
+_r54_bar_sparkline(vals, width) → str  ▁▂▃▄▅▇█ スパークライン
+_r54_moving_avg(vals, win)      → list 移動平均
+_r54_trend_label(vals)          → str  "↑上昇"/"→横ばい"/"↓下降"
+_r54_load_df(result_dir)        → DataFrame
+_r54_monthly_kpi(df, stake_*)   → list[dict]  月次KPI集計
+_r54_summary_stats(monthly)     → dict  全体サマリー
+_r54_ascii_chart(monthly, col, title, height, width) → str  ASCII折れ線グラフ
+_r54_monthly_table_md(monthly)  → str  月次KPIテーブル
+_r54_best_worst_md(monthly)     → str  最良月・最悪月比較
+_r54_chart_md(monthly)          → str  ASCII折れ線グラフ各種
+_r54_ma_table_md(monthly)       → str  3ヶ月移動平均テーブル
+_r54_build_trend_md(...)        → str  最終レポート (8セクション)
+analyze_trend_report(...)       → dict  エントリポイント
+"""
+
+# ─────────────────────────────────────────────
+# R54 定数
+# ─────────────────────────────────────────────
+_R54_VERSION = "1.30"
+_R54_SPARKLINE = list("▁▂▃▄▅▆▇█")
+_R54_TREND_WIN = 3      # 移動平均ウィンドウ (ヶ月)
+_R54_MIN_RACES = 3      # 統計表示の最小レース数/月
+_R54_CHART_W   = 60     # ASCII折れ線グラフの文字幅
+
+
+def _r54_ym(s: str) -> str:
+    """ISO8601文字列 / 日付文字列から 'YYYY-MM' を返す。"""
+    s = str(s or "").strip()
+    from datetime import datetime as _dt
+    # フォーマット: (フォーマット文字列, 対応する実際の文字列長)
+    for fmt, slen in (
+        ("%Y-%m-%dT%H:%M:%S", 19),
+        ("%Y-%m-%d %H:%M:%S", 19),
+        ("%Y-%m-%d", 10),
+        ("%Y/%m/%d", 10),
+        ("%Y%m%d",   8),
+    ):
+        try:
+            d = _dt.strptime(s[:slen], fmt)
+            return d.strftime("%Y-%m")
+        except Exception:
+            pass
+    # フォールバック: 先頭7文字が "YYYY-MM" 形式なら使用
+    if len(s) >= 7 and s[4] == "-":
+        return s[:7]
+    return "不明"
+
+
+def _r54_pct(v) -> str:
+    """小数を百分率文字列に変換。None は N/A。"""
+    try:
+        return f"{float(v) * 100:.1f}%"
+    except Exception:
+        return "N/A"
+
+
+def _r54_fmt_roi(v) -> str:
+    """ROI (%) 文字列。+/-付き。None は N/A。"""
+    try:
+        r = float(v)
+        sign = "+" if r >= 0 else ""
+        return f"{sign}{r:.1f}%"
+    except Exception:
+        return "N/A"
+
+
+def _r54_bar_sparkline(vals: list, width: int = 20) -> str:
+    """数値リストをスパークライン文字列に変換。"""
+    if not vals:
+        return ""
+    valid = [v for v in vals if v is not None and _r54_finite(v)]
+    if not valid:
+        return ""
+    mn, mx = min(valid), max(valid)
+    span = mx - mn
+    chars = _R54_SPARKLINE
+    result = []
+    for v in vals:
+        if v is None or not _r54_finite(v):
+            result.append(" ")
+        else:
+            idx = int((v - mn) / span * (len(chars) - 1)) if span > 0 else len(chars) // 2
+            result.append(chars[min(idx, len(chars) - 1)])
+    return "".join(result)
+
+
+def _r54_finite(v) -> bool:
+    """有限数値チェック。"""
+    try:
+        import math
+        return math.isfinite(float(v))
+    except Exception:
+        return False
+
+
+def _r54_moving_avg(vals: list, win: int = 3) -> list:
+    """単純移動平均。有効値が win 未満の期間は None。"""
+    result = []
+    for i in range(len(vals)):
+        window = [v for v in vals[max(0, i - win + 1): i + 1]
+                  if v is not None and _r54_finite(v)]
+        if len(window) >= min(win, i + 1) and window:
+            result.append(sum(window) / len(window))
+        else:
+            result.append(None)
+    return result
+
+
+def _r54_trend_label(vals: list) -> str:
+    """最後の有効値と最初の有効値を比較してトレンド文字列を返す。"""
+    valid = [(i, v) for i, v in enumerate(vals)
+             if v is not None and _r54_finite(v)]
+    if len(valid) < 2:
+        return "→ 横ばい"
+    first_v = valid[0][1]
+    last_v  = valid[-1][1]
+    diff = last_v - first_v
+    if diff > 3.0:
+        return "↑ 上昇"
+    elif diff < -3.0:
+        return "↓ 下降"
+    else:
+        return "→ 横ばい"
+
+
+def _r54_load_df(result_dir: str):
+    """JSONから標準DataFrameをロード (_r41_load_results_df を再利用)。"""
+    df = _r41_load_results_df(result_dir)
+    if df.empty:
+        return df
+    # year_month列を付与 (created_at → YYYY-MM)
+    if "created_at" in df.columns:
+        df["year_month"] = df["created_at"].apply(_r54_ym)
+    elif "date" in df.columns:
+        df["year_month"] = df["date"].apply(_r54_ym)
+    else:
+        df["year_month"] = "不明"
+    return df
+
+
+def _r54_monthly_kpi(df,
+                     stake_place: float = 1000.0,
+                     stake_wide: float  = 100.0,
+                     stake_trio: float  = 100.0) -> list:
+    """月次ごとの複勝/ワイド/三連複KPIを計算しリストで返す。
+
+    各要素は dict:
+        year_month, n_races,
+        place_hit, place_hit_rate, place_ret, place_roi,
+        wide_hit,  wide_hit_rate,  wide_ret,  wide_roi,
+        trio_hit,  trio_hit_rate,  trio_ret,  trio_roi,
+        place_ok_n  (複勝購入レース数)
+    """
+    if df.empty or "year_month" not in df.columns:
+        return []
+
+    months = sorted([m for m in df["year_month"].unique() if m != "不明"])
+    monthly = []
+
+    for ym in months:
+        sub = df[df["year_month"] == ym].copy()
+        n_races = len(sub)
+
+        # ── 複勝 ──
+        place_ok = sub["place_ok"].map(
+            lambda x: bool(x) if x is not None else False
+        ).astype(bool)
+        place_ok_n = int(place_ok.sum())
+
+        place_hit_arr = sub.loc[place_ok, "place_hit"].map(
+            lambda x: bool(x) if x is not None else False
+        ).astype(bool)
+        place_hit_n  = int(place_hit_arr.sum())
+        place_hit_rate = place_hit_n / place_ok_n if place_ok_n > 0 else None
+
+        payout_place = pd.to_numeric(
+            sub.loc[place_ok, "payout_fukusho_max"], errors="coerce"
+        ).fillna(0.0)
+        place_ret = float(payout_place[place_hit_arr].sum())
+        place_cost = stake_place * place_ok_n
+        place_roi = (place_ret / place_cost * 100 - 100) if place_cost > 0 else None
+
+        # ── ワイド ──
+        wide_hit_cnt = pd.to_numeric(
+            sub["wide_hit_count"], errors="coerce"
+        ).fillna(0.0)
+        wide_hit_n     = int((wide_hit_cnt > 0).sum())
+        wide_hit_rate  = wide_hit_n / n_races if n_races > 0 else None
+
+        payout_wide = pd.to_numeric(
+            sub["payout_wide_max"], errors="coerce"
+        ).fillna(0.0)
+        wide_ret  = float(payout_wide[wide_hit_cnt > 0].sum())
+        wide_cost = stake_wide * n_races
+        wide_roi  = (wide_ret / wide_cost * 100 - 100) if wide_cost > 0 else None
+
+        # ── 三連複 ──
+        trio_hit_arr = sub["trio_hit"].map(
+            lambda x: bool(x) if x is not None else False
+        ).astype(bool)
+        trio_hit_n    = int(trio_hit_arr.sum())
+        trio_hit_rate = trio_hit_n / n_races if n_races > 0 else None
+
+        payout_trio = pd.to_numeric(
+            sub["payout_sanrenpuku"], errors="coerce"
+        ).fillna(0.0)
+        trio_ret  = float(payout_trio[trio_hit_arr].sum())
+        trio_cost = stake_trio * n_races
+        trio_roi  = (trio_ret / trio_cost * 100 - 100) if trio_cost > 0 else None
+
+        monthly.append({
+            "year_month":    ym,
+            "n_races":       n_races,
+            "place_ok_n":    place_ok_n,
+            "place_hit":     place_hit_n,
+            "place_hit_rate": place_hit_rate,
+            "place_ret":     place_ret,
+            "place_roi":     place_roi,
+            "wide_hit":      wide_hit_n,
+            "wide_hit_rate": wide_hit_rate,
+            "wide_ret":      wide_ret,
+            "wide_roi":      wide_roi,
+            "trio_hit":      trio_hit_n,
+            "trio_hit_rate": trio_hit_rate,
+            "trio_ret":      trio_ret,
+            "trio_roi":      trio_roi,
+        })
+
+    return monthly
+
+
+def _r54_summary_stats(monthly: list) -> dict:
+    """月次KPIリストから全体サマリー統計を算出。"""
+    if not monthly:
+        return {}
+
+    n_months = len(monthly)
+    n_races  = sum(m["n_races"] for m in monthly)
+
+    # 複勝ROI
+    valid_place_roi = [m["place_roi"] for m in monthly
+                       if m["place_roi"] is not None and m["n_races"] >= _R54_MIN_RACES]
+    avg_place_roi = sum(valid_place_roi) / len(valid_place_roi) if valid_place_roi else None
+
+    # ワイドROI
+    valid_wide_roi = [m["wide_roi"] for m in monthly
+                      if m["wide_roi"] is not None and m["n_races"] >= _R54_MIN_RACES]
+    avg_wide_roi = sum(valid_wide_roi) / len(valid_wide_roi) if valid_wide_roi else None
+
+    # 三連複ROI
+    valid_trio_roi = [m["trio_roi"] for m in monthly
+                      if m["trio_roi"] is not None and m["n_races"] >= _R54_MIN_RACES]
+    avg_trio_roi = sum(valid_trio_roi) / len(valid_trio_roi) if valid_trio_roi else None
+
+    # トレンド
+    place_roi_list = [m["place_roi"] for m in monthly]
+    wide_roi_list  = [m["wide_roi"]  for m in monthly]
+    trio_roi_list  = [m["trio_roi"]  for m in monthly]
+
+    return {
+        "n_months":      n_months,
+        "n_races":       n_races,
+        "avg_place_roi": avg_place_roi,
+        "avg_wide_roi":  avg_wide_roi,
+        "avg_trio_roi":  avg_trio_roi,
+        "trend_place":   _r54_trend_label(place_roi_list),
+        "trend_wide":    _r54_trend_label(wide_roi_list),
+        "trend_trio":    _r54_trend_label(trio_roi_list),
+        "spark_place":   _r54_bar_sparkline(place_roi_list),
+        "spark_wide":    _r54_bar_sparkline(wide_roi_list),
+        "spark_trio":    _r54_bar_sparkline(trio_roi_list),
+    }
+
+
+def _r54_ascii_chart(monthly: list, col: str, title: str,
+                     height: int = 8, width: int = None) -> str:
+    """ASCII折れ線グラフを生成する。
+
+    Parameters
+    ----------
+    monthly : list[dict]   月次KPIリスト
+    col     : str          描画する列名 (例: 'place_roi')
+    title   : str          グラフタイトル
+    height  : int          縦方向のセル数
+    width   : int          横方向のセル数 (None → 月数に自動)
+    """
+    vals = [m[col] for m in monthly]
+    labels = [m["year_month"] for m in monthly]
+    valid_vals = [v for v in vals if v is not None and _r54_finite(v)]
+    if not valid_vals:
+        return f"### {title}\n*データなし*\n"
+
+    w = width if width else max(len(monthly), _R54_CHART_W)
+    # 値域
+    mn = min(valid_vals)
+    mx = max(valid_vals)
+    span = mx - mn if mx != mn else 1.0
+    # 0ラインの位置
+    zero_row = int((mx / span) * (height - 1)) if span > 0 else height // 2
+    zero_row = max(0, min(zero_row, height - 1))
+
+    # グリッド初期化
+    grid = [[" "] * w for _ in range(height)]
+
+    # 0ライン
+    for c in range(w):
+        grid[zero_row][c] = "─"
+
+    # プロット
+    cell_w = max(1, w // len(monthly)) if monthly else 1
+    for i, (v, lbl) in enumerate(zip(vals, labels)):
+        if v is None or not _r54_finite(v):
+            continue
+        row = int(((mx - v) / span) * (height - 1)) if span > 0 else height // 2
+        row = max(0, min(row, height - 1))
+        col_pos = min(i * cell_w + cell_w // 2, w - 1)
+        # 前のポイントとの接続
+        if i > 0:
+            prev_v = vals[i - 1]
+            if prev_v is not None and _r54_finite(prev_v):
+                prev_row = int(((mx - prev_v) / span) * (height - 1)) if span > 0 else height // 2
+                prev_row = max(0, min(prev_row, height - 1))
+                prev_col = min((i - 1) * cell_w + cell_w // 2, w - 1)
+                # 中間線で接続
+                for c in range(prev_col, col_pos):
+                    frac = (c - prev_col) / max(col_pos - prev_col, 1)
+                    r = int(prev_row + frac * (row - prev_row))
+                    r = max(0, min(r, height - 1))
+                    if grid[r][c] == " ":
+                        grid[r][c] = "·"
+        grid[row][col_pos] = "●"
+
+    # Y軸ラベル
+    lines = []
+    for r in range(height):
+        y_val = mx - (r / (height - 1)) * span if height > 1 else mx
+        y_label = f"{y_val:+7.1f}%"
+        line_str = "".join(grid[r])
+        if r == zero_row:
+            lines.append(f"{y_label}│{line_str}")
+        else:
+            lines.append(f"{y_label}│{line_str}")
+
+    # X軸ラベル (年月)
+    x_axis = " " * 9 + "└" + "─" * w
+    # 月ラベル (スペース節約のため奇数インデックスのみ)
+    x_labels_row = " " * 10
+    for i, lbl in enumerate(labels):
+        pos = i * cell_w + cell_w // 2
+        # 7文字幅で右詰め
+        short_lbl = lbl[2:] if lbl.startswith("20") else lbl  # "YYYY-MM"→"YY-MM"
+        # 位置調整
+        while len(x_labels_row) < pos + 10:
+            x_labels_row += " "
+        x_labels_row = x_labels_row[:pos + 10] + short_lbl
+
+    chart_lines = [f"### {title}"]
+    chart_lines += lines
+    chart_lines.append(x_axis)
+    chart_lines.append(x_labels_row[:10 + w])
+    return "\n".join(chart_lines) + "\n"
+
+
+def _r54_monthly_table_md(monthly: list) -> str:
+    """月次KPIテーブルのMarkdown文字列を返す。"""
+    if not monthly:
+        return "*データなし*\n"
+
+    header = (
+        "| 年月 | レース数 | 複勝的中率 | 複勝ROI | "
+        "W的中率 | W ROI | 三連複的中率 | 三連複ROI |\n"
+        "|------|---------|-----------|--------|---------|-------|------------|----------|\n"
+    )
+    rows = []
+    for m in monthly:
+        note = " ※" if m["n_races"] < _R54_MIN_RACES else ""
+        rows.append(
+            f"| {m['year_month']}{note} "
+            f"| {m['n_races']} "
+            f"| {_r54_pct(m['place_hit_rate'])} "
+            f"| {_r54_fmt_roi(m['place_roi'])} "
+            f"| {_r54_pct(m['wide_hit_rate'])} "
+            f"| {_r54_fmt_roi(m['wide_roi'])} "
+            f"| {_r54_pct(m['trio_hit_rate'])} "
+            f"| {_r54_fmt_roi(m['trio_roi'])} |"
+        )
+    return header + "\n".join(rows) + "\n\n※ レース数 < 3 の月は参考値\n"
+
+
+def _r54_best_worst_md(monthly: list) -> str:
+    """複勝ROIで最良月・最悪月の比較Markdownを返す。"""
+    valid = [m for m in monthly
+             if m["place_roi"] is not None and m["n_races"] >= _R54_MIN_RACES]
+    if not valid:
+        return "*有効データなし (各月レース数 < 3)*\n"
+
+    best  = max(valid, key=lambda m: m["place_roi"])
+    worst = min(valid, key=lambda m: m["place_roi"])
+
+    lines = [
+        "| 項目 | 最良月 | 最悪月 |",
+        "|------|--------|--------|",
+        f"| 年月 | **{best['year_month']}** | {worst['year_month']} |",
+        f"| レース数 | {best['n_races']} | {worst['n_races']} |",
+        f"| 複勝的中率 | {_r54_pct(best['place_hit_rate'])} | {_r54_pct(worst['place_hit_rate'])} |",
+        f"| 複勝ROI | **{_r54_fmt_roi(best['place_roi'])}** | {_r54_fmt_roi(worst['place_roi'])} |",
+        f"| ワイドROI | {_r54_fmt_roi(best['wide_roi'])} | {_r54_fmt_roi(worst['wide_roi'])} |",
+        f"| 三連複ROI | {_r54_fmt_roi(best['trio_roi'])} | {_r54_fmt_roi(worst['trio_roi'])} |",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _r54_chart_md(monthly: list) -> str:
+    """複勝・ワイド・三連複ROIのASCII折れ線グラフ3枚を返す。"""
+    out = []
+    out.append(_r54_ascii_chart(monthly, "place_roi",  "複勝ROI 月次推移 (%)", height=8))
+    out.append(_r54_ascii_chart(monthly, "wide_roi",   "ワイドROI 月次推移 (%)", height=8))
+    out.append(_r54_ascii_chart(monthly, "trio_roi",   "三連複ROI 月次推移 (%)", height=8))
+    return "\n".join(out)
+
+
+def _r54_ma_table_md(monthly: list) -> str:
+    """3ヶ月移動平均テーブルのMarkdown文字列を返す。"""
+    if not monthly:
+        return "*データなし*\n"
+
+    place_rois = [m["place_roi"] for m in monthly]
+    wide_rois  = [m["wide_roi"]  for m in monthly]
+    trio_rois  = [m["trio_roi"]  for m in monthly]
+
+    ma_place = _r54_moving_avg(place_rois, _R54_TREND_WIN)
+    ma_wide  = _r54_moving_avg(wide_rois,  _R54_TREND_WIN)
+    ma_trio  = _r54_moving_avg(trio_rois,  _R54_TREND_WIN)
+
+    header = (
+        "| 年月 | 複勝ROI (MA3) | ワイドROI (MA3) | 三連複ROI (MA3) |\n"
+        "|------|-------------|----------------|----------------|\n"
+    )
+    rows = []
+    for i, m in enumerate(monthly):
+        rows.append(
+            f"| {m['year_month']} "
+            f"| {_r54_fmt_roi(ma_place[i])} "
+            f"| {_r54_fmt_roi(ma_wide[i])} "
+            f"| {_r54_fmt_roi(ma_trio[i])} |"
+        )
+    return header + "\n".join(rows) + "\n"
+
+
+def _r54_build_trend_md(monthly: list,
+                        summary: dict,
+                        stake_place: float = 1000.0,
+                        stake_wide: float  = 100.0,
+                        stake_trio: float  = 100.0,
+                        verbose: bool      = False) -> str:
+    """時系列トレンドレポートのMarkdown文字列を構築する (8セクション)。"""
+    import json as _json
+
+    lines = []
+
+    # ── セクション0: ヘッダー ──
+    lines.append("# 時系列トレンドレポート (R54 – STELLA v1.32)")
+    lines.append("")
+    lines.append(f"分析期間: {monthly[0]['year_month'] if monthly else 'N/A'}"
+                 f" ～ {monthly[-1]['year_month'] if monthly else 'N/A'}")
+    lines.append(f"月数: {summary.get('n_months', 0)} ヶ月 / "
+                 f"総レース数: {summary.get('n_races', 0)}")
+    lines.append(f"賭け金設定: 複勝 ¥{stake_place:,.0f} / "
+                 f"ワイド ¥{stake_wide:,.0f} / "
+                 f"三連複 ¥{stake_trio:,.0f}")
+    lines.append("")
+
+    # ── セクション1: サマリーKPI ──
+    lines.append("## 1. サマリー KPI")
+    lines.append("")
+    lines.append("| 指標 | 値 | トレンド | スパークライン |")
+    lines.append("|------|-----|---------|--------------|")
+    lines.append(f"| 複勝ROI (月次平均) "
+                 f"| {_r54_fmt_roi(summary.get('avg_place_roi'))} "
+                 f"| {summary.get('trend_place', 'N/A')} "
+                 f"| `{summary.get('spark_place', '')}` |")
+    lines.append(f"| ワイドROI (月次平均) "
+                 f"| {_r54_fmt_roi(summary.get('avg_wide_roi'))} "
+                 f"| {summary.get('trend_wide', 'N/A')} "
+                 f"| `{summary.get('spark_wide', '')}` |")
+    lines.append(f"| 三連複ROI (月次平均) "
+                 f"| {_r54_fmt_roi(summary.get('avg_trio_roi'))} "
+                 f"| {summary.get('trend_trio', 'N/A')} "
+                 f"| `{summary.get('spark_trio', '')}` |")
+    lines.append("")
+
+    # ── セクション2: 月次KPIテーブル ──
+    lines.append("## 2. 月次 KPI テーブル")
+    lines.append("")
+    lines.append(_r54_monthly_table_md(monthly))
+
+    # ── セクション3: ASCII折れ線グラフ ──
+    lines.append("## 3. ROI 推移グラフ (ASCII)")
+    lines.append("")
+    lines.append("```")
+    lines.append(_r54_chart_md(monthly).rstrip())
+    lines.append("```")
+    lines.append("")
+
+    # ── セクション4: 3ヶ月移動平均 ──
+    lines.append("## 4. 3ヶ月移動平均 (MA3)")
+    lines.append("")
+    lines.append(_r54_ma_table_md(monthly))
+
+    # ── セクション5: 最良月・最悪月 ──
+    lines.append("## 5. 最良月・最悪月 (複勝ROI基準)")
+    lines.append("")
+    lines.append(_r54_best_worst_md(monthly))
+    lines.append("")
+
+    # ── セクション6: 月次トレンド方向 ──
+    lines.append("## 6. 月次トレンド方向サマリー")
+    lines.append("")
+    for bet_type, col in [("複勝ROI", "place_roi"),
+                           ("ワイドROI", "wide_roi"),
+                           ("三連複ROI", "trio_roi")]:
+        vals = [m[col] for m in monthly]
+        ma = _r54_moving_avg(vals, _R54_TREND_WIN)
+        spark = _r54_bar_sparkline(vals)
+        ma_spark = _r54_bar_sparkline(ma)
+        trend = _r54_trend_label(vals)
+        lines.append(f"- **{bet_type}**: {trend}  "
+                     f"実績`{spark}`  MA3`{ma_spark}`")
+    lines.append("")
+
+    # ── セクション7: JSON推奨パラメータ ──
+    best_valid = [m for m in monthly
+                  if m["place_roi"] is not None and m["n_races"] >= _R54_MIN_RACES]
+    best_ym = max(best_valid, key=lambda m: m["place_roi"])["year_month"] \
+        if best_valid else "N/A"
+    rec = {
+        "report": "trend",
+        "period": {
+            "start": monthly[0]["year_month"] if monthly else None,
+            "end":   monthly[-1]["year_month"] if monthly else None,
+            "months": summary.get("n_months", 0),
+        },
+        "avg_roi": {
+            "place": round(summary.get("avg_place_roi") or 0, 2),
+            "wide":  round(summary.get("avg_wide_roi")  or 0, 2),
+            "trio":  round(summary.get("avg_trio_roi")  or 0, 2),
+        },
+        "trend": {
+            "place": summary.get("trend_place", ""),
+            "wide":  summary.get("trend_wide",  ""),
+            "trio":  summary.get("trend_trio",  ""),
+        },
+        "best_month_place_roi": best_ym,
+    }
+    lines.append("## 7. JSON 推奨情報")
+    lines.append("")
+    lines.append("```json")
+    lines.append(_json.dumps(rec, ensure_ascii=False, indent=2))
+    lines.append("```")
+    lines.append("")
+
+    # ── セクション8: 次アクション提案 ──
+    lines.append("## 8. 次アクション提案")
+    lines.append("")
+    avg_pr = summary.get("avg_place_roi")
+    trend_p = summary.get("trend_place", "")
+    if avg_pr is not None:
+        if avg_pr > 5:
+            lines.append("- ✅ 複勝ROIは良好 (+5%超)。現在のパラメータを維持することを推奨。")
+        elif avg_pr > -10:
+            lines.append("- ⚠️ 複勝ROIはやや低迷。R42 `tune_confidence_params` での再調整を検討。")
+        else:
+            lines.append("- 🚨 複勝ROIが大幅マイナス。R53 `analyze_score_adjust` で補正係数を確認してください。")
+    if "↑" in trend_p:
+        lines.append("- 📈 複勝ROIは上昇トレンドです。現在の戦略を継続してください。")
+    elif "↓" in trend_p:
+        lines.append("- 📉 複勝ROIは下降トレンドです。直近3ヶ月のデータを R41 で再分析することを推奨。")
+    lines.append("- 📊 R52 `analyze_cross_analysis` でペース×会場×馬場の3軸分析と組み合わせることで精度向上が期待できます。")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def analyze_trend_report(
+    result_dir: str,
+    params: Optional[dict] = None,
+    stake_place: float = 1000.0,
+    stake_wide: float  = 100.0,
+    stake_trio: float  = 100.0,
+    out_md: Optional[str] = None,
+    verbose: bool = False,
+) -> dict:
+    """時系列トレンドレポートを生成する (R54 エントリポイント)。
+
+    Parameters
+    ----------
+    result_dir  : str            JSON結果ディレクトリ
+    params      : dict, optional 設定パラメータ (未使用 / 将来拡張用)
+    stake_place : float          複勝1レース当り賭け金 (円)
+    stake_wide  : float          ワイド1レース当り賭け金 (円)
+    stake_trio  : float          三連複1レース当り賭け金 (円)
+    out_md      : str, optional  Markdownファイル出力パス
+    verbose     : bool           詳細ログ出力
+
+    Returns
+    -------
+    dict:
+        monthly   : list[dict]  月次KPIリスト
+        summary   : dict        全体サマリー
+        report_md : str         Markdownレポート文字列
+        n_races   : int         総レース数
+        n_months  : int         分析月数
+    """
+    from pathlib import Path
+
+    # ロード
+    df = _r54_load_df(result_dir)
+    if df.empty:
+        if verbose:
+            print(f"[R54] データなし: {result_dir}")
+        return {
+            "monthly": [],
+            "summary": {},
+            "report_md": "# 時系列トレンドレポート\n\n*データなし*\n",
+            "n_races": 0,
+            "n_months": 0,
+        }
+
+    if verbose:
+        print(f"[R54] ロード完了: {len(df)} レース, "
+              f"月数={df['year_month'].nunique()}")
+
+    # 月次KPI計算
+    monthly = _r54_monthly_kpi(df,
+                               stake_place=stake_place,
+                               stake_wide=stake_wide,
+                               stake_trio=stake_trio)
+    if not monthly:
+        return {
+            "monthly": [],
+            "summary": {},
+            "report_md": "# 時系列トレンドレポート\n\n*月次データなし*\n",
+            "n_races": len(df),
+            "n_months": 0,
+        }
+
+    # サマリー計算
+    summary = _r54_summary_stats(monthly)
+
+    # レポート構築
+    report_md = _r54_build_trend_md(
+        monthly, summary,
+        stake_place=stake_place,
+        stake_wide=stake_wide,
+        stake_trio=stake_trio,
+        verbose=verbose,
+    )
+
+    # ファイル出力
+    if out_md:
+        try:
+            Path(out_md).write_text(report_md, encoding="utf-8")
+            if verbose:
+                print(f"[R54] Markdown出力: {out_md}")
+        except Exception as e:
+            if verbose:
+                print(f"[R54] 出力エラー: {e}")
+
+    return {
+        "monthly":   monthly,
+        "summary":   summary,
+        "report_md": report_md,
+        "n_races":   len(df),
+        "n_months":  len(monthly),
+    }
+
+
+
+
+# ─── R55: 信頼度スコア補正 自動適用 ───
+"""
+R55 – 信頼度スコア補正の自動適用
+R53で算出した馬場状態別補正係数(α)を予測時に自動反映する仕組み。
+
+定数
+----
+_R55_VERSION      : str
+_R55_DEFAULT_ALPHA: float   デフォルト補正係数 (1.0 = 補正なし)
+_R55_MIN_N        : int     補正適用の最小サンプル数 (5)
+
+関数
+----
+_r55_get_going_cat(meta)            → str        メタ情報から馬場状態カテゴリを推定
+_r55_adjusted_score(score, gc, alphas) → float   αを適用して補正後スコアを返す
+_r55_adjusted_high_p_min(params, gc, alphas) → float  補正後の高信頼度閾値
+_r55_save_alphas(alphas, out_json)  → str        αをJSONファイルに保存
+_r55_load_alphas(json_path)         → dict       JSONからαをロード
+_r55_apply_alphas_to_params(params, alphas) → dict  αをparamsに組み込む
+_r55_get_alphas_from_params(params) → dict       paramsからαを取得
+_r55_validate_race(row, alphas, stake_place) → dict  1レースの補正前後比較
+_r55_validation_kpi(df, alphas, stake_place) → dict  全レースの補正効果集計
+_r55_alpha_table_md(alphas)         → str        補正係数テーブルMarkdown
+_r55_validation_table_md(kpi)       → str        検証結果テーブルMarkdown
+_r55_per_going_table_md(per_going)  → str        馬場別改善Markdown
+_r55_build_apply_md(alphas, kpi, meta) → str     最終レポート (8セクション)
+analyze_alpha_application(...)      → dict        エントリポイント
+"""
+
+# ─────────────────────────────────────────────
+# R55 定数
+# ─────────────────────────────────────────────
+_R55_VERSION       = "1.31"
+_R55_DEFAULT_ALPHA = 1.0   # デフォルト補正係数
+_R55_MIN_N         = 5     # 補正適用の最小サンプル数
+
+
+def _r55_get_going_cat(meta: dict) -> str:
+    """メタ情報の avg_halon から馬場状態カテゴリを推定する。
+
+    Returns
+    -------
+    str: 'fast' | 'normal' | 'slow' | 'heavy' | 'unknown'
+    """
+    if not isinstance(meta, dict):
+        return "unknown"
+    avg_halon_raw = meta.get("avg_halon", None)
+    if avg_halon_raw is None:
+        return "unknown"
+    try:
+        return _r50_estimate_going(float(str(avg_halon_raw).strip()))
+    except Exception:
+        return "unknown"
+
+
+def _r55_adjusted_score(score, going_cat: str, alphas: dict) -> float:
+    """anchor_score に馬場状態補正係数を適用して補正後スコアを返す。
+
+    Parameters
+    ----------
+    score     : float / None  元のAnchorScore
+    going_cat : str           馬場状態カテゴリ ('fast'/'normal'/'slow'/'heavy')
+    alphas    : dict          going_cat → {'alpha': float, ...}
+
+    Returns
+    -------
+    float: 補正後スコア (変換不能時は元のスコアをそのまま返す)
+    """
+    try:
+        s = float(score)
+        if not (s == s):  # NaN check
+            return s
+    except (TypeError, ValueError):
+        return score
+
+    alpha_info = alphas.get(going_cat, {})
+    if isinstance(alpha_info, dict):
+        alpha = float(alpha_info.get("alpha", _R55_DEFAULT_ALPHA))
+    else:
+        alpha = float(alpha_info) if alpha_info else _R55_DEFAULT_ALPHA
+
+    return round(s * alpha, 2)
+
+
+def _r55_adjusted_high_p_min(params: dict, going_cat: str, alphas: dict) -> float:
+    """馬場補正を加味した high_p_place_min を返す。
+
+    補正αが高い (α > 1) 馬場では、閾値を若干緩める方向で調整する。
+    補正αが低い (α < 1) 馬場では、閾値を若干厳しくする。
+    """
+    pr = (params.get("place_rules") or {}) if isinstance(params, dict) else {}
+    base_min = float(pr.get("confidence_high_p_place_min", 0.35) or 0.35)
+
+    alpha_info = alphas.get(going_cat, {})
+    if isinstance(alpha_info, dict):
+        alpha = float(alpha_info.get("alpha", 1.0))
+    else:
+        alpha = float(alpha_info) if alpha_info else 1.0
+
+    # αに応じて閾値を微調整 (最大 ±0.03)
+    delta = (alpha - 1.0) * 0.15   # α=1.2 → +0.03, α=0.8 → -0.03
+    adjusted = base_min - delta     # αが高い→閾値緩める (−)
+    return round(float(max(0.25, min(0.50, adjusted))), 3)
+
+
+def _r55_save_alphas(alphas: dict, out_json: str) -> str:
+    """補正係数αをJSONファイルに保存する。
+
+    Parameters
+    ----------
+    alphas   : dict  going_cat → {'alpha': float, ...}
+    out_json : str   出力JSONパス
+
+    Returns
+    -------
+    str: 保存したJSONパス
+    """
+    import json
+    from pathlib import Path
+    from datetime import datetime as _dt
+
+    payload = {
+        "version": _R55_VERSION,
+        "saved_at": _dt.now().isoformat(timespec="seconds"),
+        "alphas": {
+            gc: {
+                "alpha": float(info.get("alpha", 1.0)) if isinstance(info, dict) else float(info),
+                "best_roi_at_high": info.get("best_roi_at_high") if isinstance(info, dict) else None,
+            }
+            for gc, info in alphas.items()
+        },
+    }
+    Path(out_json).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return out_json
+
+
+def _r55_load_alphas(json_path: str) -> dict:
+    """JSONから補正係数αをロードする。
+
+    Returns
+    -------
+    dict: going_cat → {'alpha': float, 'best_roi_at_high': float|None}
+         ロード失敗時は空辞書
+    """
+    import json
+    from pathlib import Path
+
+    try:
+        data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    raw = data.get("alphas", {}) or {}
+    result = {}
+    for gc, info in raw.items():
+        if isinstance(info, dict):
+            result[gc] = {
+                "alpha": float(info.get("alpha", 1.0)),
+                "best_roi_at_high": info.get("best_roi_at_high"),
+            }
+        else:
+            result[gc] = {"alpha": float(info), "best_roi_at_high": None}
+    return result
+
+
+def _r55_apply_alphas_to_params(params: dict, alphas: dict) -> dict:
+    """補正係数αをparamsに組み込んで返す (破壊的変更なし)。
+
+    params['score_adjust_alphas'] に alphas を格納する。
+
+    Parameters
+    ----------
+    params : dict  既存のparamsdict
+    alphas : dict  going_cat → {'alpha': float, ...}
+
+    Returns
+    -------
+    dict: 更新されたparamsのコピー
+    """
+    import copy
+    new_params = copy.deepcopy(params) if params else {}
+    new_params["score_adjust_alphas"] = {
+        gc: {
+            "alpha": float(info.get("alpha", 1.0)) if isinstance(info, dict) else float(info),
+            "best_roi_at_high": info.get("best_roi_at_high") if isinstance(info, dict) else None,
+        }
+        for gc, info in alphas.items()
+    }
+    return new_params
+
+
+def _r55_get_alphas_from_params(params: dict) -> dict:
+    """paramsから補正係数αを取得する。
+
+    Returns
+    -------
+    dict: going_cat → {'alpha': float, ...}
+         設定なし/不正時は空辞書
+    """
+    if not isinstance(params, dict):
+        return {}
+    alphas = params.get("score_adjust_alphas", {}) or {}
+    if not isinstance(alphas, dict):
+        return {}
+    result = {}
+    for gc, info in alphas.items():
+        if isinstance(info, dict):
+            result[gc] = {"alpha": float(info.get("alpha", 1.0)),
+                          "best_roi_at_high": info.get("best_roi_at_high")}
+        else:
+            try:
+                result[gc] = {"alpha": float(info), "best_roi_at_high": None}
+            except Exception:
+                pass
+    return result
+
+
+def _r55_validate_race(row, alphas: dict, stake_place: float = 1000.0) -> dict:
+    """1レースの補正前後の信頼度スコア・KPIを比較するdictを返す。"""
+    try:
+        raw_score = float(row.get("anchor_score") or float("nan"))
+    except (TypeError, ValueError):
+        raw_score = float("nan")
+
+    going_cat = str(row.get("going_cat", "unknown") or "unknown")
+
+    adj_score = (
+        _r55_adjusted_score(raw_score, going_cat, alphas)
+        if (raw_score == raw_score)  # not NaN
+        else float("nan")
+    )
+
+    alpha_info = alphas.get(going_cat, {})
+    alpha = float(alpha_info.get("alpha", 1.0)) if isinstance(alpha_info, dict) else float(alpha_info or 1.0)
+
+    try:
+        place_ok = bool(row.get("place_ok")) if row.get("place_ok") is not None else False
+        place_hit = bool(row.get("place_hit")) if row.get("place_hit") is not None else False
+    except Exception:
+        place_ok = place_hit = False
+
+    try:
+        payout = float(row.get("payout_fukusho_max") or 0.0)
+    except (TypeError, ValueError):
+        payout = 0.0
+
+    # 高スコアバンド判定
+    in_high_raw = (place_ok and raw_score == raw_score and raw_score >= 70.0)
+    in_high_adj = (place_ok and adj_score == adj_score and adj_score >= 70.0)
+
+    return {
+        "race_id":      str(row.get("race_id", "") or ""),
+        "going_cat":    going_cat,
+        "alpha":        alpha,
+        "raw_score":    raw_score,
+        "adj_score":    adj_score,
+        "place_ok":     place_ok,
+        "place_hit":    place_hit,
+        "payout":       payout,
+        "in_high_raw":  in_high_raw,
+        "in_high_adj":  in_high_adj,
+    }
+
+
+def _r55_validation_kpi(df, alphas: dict, stake_place: float = 1000.0) -> dict:
+    """全レースの補正前後効果を集計する。
+
+    Returns
+    -------
+    dict:
+        overall: dict  全体KPI(補正前/後)
+        per_going: dict  馬場別KPI
+        rows: list[dict]  レース別詳細
+    """
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return {"overall": {}, "per_going": {}, "rows": []}
+
+    rows = []
+    for _, row in df.iterrows():
+        rows.append(_r55_validate_race(row, alphas, stake_place))
+
+    def _kpi(subset):
+        n_high   = sum(1 for r in subset if r["in_high_raw"])
+        n_hit    = sum(1 for r in subset if r["in_high_raw"] and r["place_hit"])
+        ret      = sum(r["payout"] for r in subset if r["in_high_raw"] and r["place_hit"])
+        n_high_a = sum(1 for r in subset if r["in_high_adj"])
+        n_hit_a  = sum(1 for r in subset if r["in_high_adj"] and r["place_hit"])
+        ret_a    = sum(r["payout"] for r in subset if r["in_high_adj"] and r["place_hit"])
+        hr_raw   = n_hit   / n_high   if n_high   > 0 else None
+        hr_adj   = n_hit_a / n_high_a if n_high_a > 0 else None
+        roi_raw  = (ret   / (n_high   * stake_place) * 100 - 100) if n_high   > 0 else None
+        roi_adj  = (ret_a / (n_high_a * stake_place) * 100 - 100) if n_high_a > 0 else None
+        return {
+            "n_total":  len(subset),
+            "n_high_raw": n_high,   "n_hit_raw": n_hit,
+            "hr_raw":   hr_raw,     "roi_raw":   roi_raw,
+            "n_high_adj": n_high_a, "n_hit_adj": n_hit_a,
+            "hr_adj":   hr_adj,     "roi_adj":   roi_adj,
+            "hr_delta":  (hr_adj  - hr_raw)  if (hr_raw  is not None and hr_adj  is not None) else None,
+            "roi_delta": (roi_adj - roi_raw) if (roi_raw is not None and roi_adj is not None) else None,
+        }
+
+    overall = _kpi(rows)
+
+    per_going = {}
+    for gc in _R53_GOING_ORDER:
+        sub = [r for r in rows if r["going_cat"] == gc]
+        if sub:
+            per_going[gc] = _kpi(sub)
+
+    return {"overall": overall, "per_going": per_going, "rows": rows}
+
+
+def _r55_alpha_table_md(alphas: dict) -> str:
+    """補正係数テーブルのMarkdownを返す。"""
+    labels = {"fast": "良 (fast)", "normal": "やや重 (normal)",
+               "slow": "重 (slow)", "heavy": "不良 (heavy)"}
+    lines = [
+        "| 馬場状態 | 補正係数 α | 最適ROI (高スコア帯) |",
+        "|---------|-----------|---------------------|",
+    ]
+    for gc in _R53_GOING_ORDER:
+        info = alphas.get(gc, {})
+        if isinstance(info, dict):
+            alpha = float(info.get("alpha", 1.0))
+            roi   = info.get("best_roi_at_high")
+        else:
+            alpha = float(info or 1.0)
+            roi   = None
+
+        alpha_str = f"**{alpha:.2f}**" if alpha != 1.0 else f"{alpha:.2f}"
+        roi_str   = f"{roi * 100:.1f}%" if (roi is not None and roi == roi) else "N/A"
+        note      = " ← 補正あり" if alpha != 1.0 else ""
+        label     = labels.get(gc, gc)
+        lines.append(f"| {label} | {alpha_str}{note} | {roi_str} |")
+    return "\n".join(lines) + "\n"
+
+
+def _r55_validation_table_md(kpi: dict) -> str:
+    """全体検証KPIテーブルのMarkdownを返す。"""
+    ov = kpi.get("overall", {})
+    if not ov:
+        return "*データなし*\n"
+
+    def _pct(v):
+        return f"{v * 100:.1f}%" if (v is not None and v == v) else "N/A"
+
+    def _roi(v):
+        if v is None or v != v:
+            return "N/A"
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v:.1f}%"
+
+    def _delta(v, positive_good=True):
+        if v is None or v != v:
+            return "N/A"
+        sign = "+" if v >= 0 else ""
+        mark = "✅" if (v > 0) == positive_good else "⚠️"
+        return f"{sign}{v:.1f}% {mark}" if isinstance(v, float) else f"{sign}{v} {mark}"
+
+    def _delta_roi(v):
+        return _delta(v, positive_good=True)
+
+    lines = [
+        "| 指標 | 補正前 | 補正後 | 差分 |",
+        "|------|--------|--------|------|",
+        f"| 総レース数 | {ov.get('n_total', 0)} | {ov.get('n_total', 0)} | - |",
+        f"| 高スコア帯 (≥70) レース数 "
+        f"| {ov.get('n_high_raw', 0)} | {ov.get('n_high_adj', 0)} "
+        f"| {ov.get('n_high_adj', 0) - ov.get('n_high_raw', 0):+d} |",
+        f"| 複勝的中数 | {ov.get('n_hit_raw', 0)} | {ov.get('n_hit_adj', 0)} | - |",
+        f"| 複勝的中率 "
+        f"| {_pct(ov.get('hr_raw'))} | {_pct(ov.get('hr_adj'))} "
+        f"| {_delta(ov.get('hr_delta'))} |",
+        f"| 複勝ROI "
+        f"| {_roi(ov.get('roi_raw'))} | {_roi(ov.get('roi_adj'))} "
+        f"| {_delta_roi(ov.get('roi_delta'))} |",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _r55_per_going_table_md(per_going: dict) -> str:
+    """馬場別KPIテーブルのMarkdownを返す。"""
+    if not per_going:
+        return "*データなし*\n"
+
+    labels = {"fast": "良", "normal": "やや重", "slow": "重", "heavy": "不良"}
+
+    def _pct(v):
+        return f"{v * 100:.1f}%" if (v is not None and v == v) else "N/A"
+
+    def _roi(v):
+        if v is None or v != v:
+            return "N/A"
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v:.1f}%"
+
+    def _rdelta(v):
+        if v is None or v != v:
+            return "N/A"
+        sign = "+" if v >= 0 else ""
+        mark = "✅" if v > 0 else "⚠️"
+        return f"{sign}{v:.1f}% {mark}"
+
+    lines = [
+        "| 馬場 | n | 的中率(前→後) | ROI(前→後) | ROI改善 |",
+        "|------|---|-------------|-----------|---------|",
+    ]
+    for gc in _R53_GOING_ORDER:
+        kpi = per_going.get(gc)
+        if not kpi:
+            continue
+        lbl = labels.get(gc, gc)
+        lines.append(
+            f"| {lbl} | {kpi['n_total']} "
+            f"| {_pct(kpi.get('hr_raw'))} → {_pct(kpi.get('hr_adj'))} "
+            f"| {_roi(kpi.get('roi_raw'))} → {_roi(kpi.get('roi_adj'))} "
+            f"| {_rdelta(kpi.get('roi_delta'))} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _r55_build_apply_md(alphas: dict, kpi: dict, meta: dict) -> str:
+    """補正自動適用レポートのMarkdownを構築する (8セクション)。"""
+    import json as _json
+
+    ov    = kpi.get("overall", {})
+    lines = []
+
+    # ── セクション0: ヘッダー ──
+    lines.append("# 信頼度スコア補正 自動適用レポート (R55 – STELLA v1.32)")
+    lines.append("")
+    lines.append(f"- 総レース数: {meta.get('n_races', 0)}")
+    lines.append(f"- place_ok レース数: {meta.get('n_ok', 0)}")
+    lines.append(f"- 賭け金設定: 複勝 ¥{meta.get('stake_place', 1000):,.0f}")
+    lines.append(f"- alphaJSON保存先: {meta.get('alpha_json', 'N/A')}")
+    lines.append("")
+
+    # ── セクション1: 補正係数テーブル ──
+    lines.append("## 1. 馬場別補正係数 α")
+    lines.append("")
+    lines.append(_r55_alpha_table_md(alphas))
+
+    # ── セクション2: 補正の仕組み説明 ──
+    lines.append("## 2. 補正の仕組み")
+    lines.append("")
+    lines.append("補正後スコア = AnchorScore × α (馬場状態別)")
+    lines.append("")
+    lines.append("| ステップ | 内容 |")
+    lines.append("|---------|------|")
+    lines.append("| 1 | レースのmeta情報からavg_halonを取得 |")
+    lines.append("| 2 | avg_halon → 馬場状態カテゴリ (fast/normal/slow/heavy) |")
+    lines.append("| 3 | 馬場カテゴリに対応するαを取得 |")
+    lines.append("| 4 | AnchorScore × α = 補正後スコア |")
+    lines.append("| 5 | 補正後スコア ≥ 70 → 高信頼帯として購入判断 |")
+    lines.append("")
+    lines.append("**αの導出方法:** R53 `analyze_score_adjust` で馬場別に複勝ROI最大化αを探索 (0.80〜1.20, 刻み0.05)")
+    lines.append("")
+
+    # ── セクション3: 全体KPI比較 ──
+    lines.append("## 3. 補正前後 全体KPI比較")
+    lines.append("")
+    lines.append(_r55_validation_table_md(kpi))
+
+    # ── セクション4: 馬場別KPI比較 ──
+    lines.append("## 4. 馬場別 KPI改善")
+    lines.append("")
+    lines.append(_r55_per_going_table_md(kpi.get("per_going", {})))
+
+    # ── セクション5: ROI改善評価 ──
+    lines.append("## 5. ROI改善評価")
+    lines.append("")
+    roi_delta = ov.get("roi_delta")
+    hr_delta  = ov.get("hr_delta")
+
+    if roi_delta is not None and roi_delta == roi_delta:
+        if roi_delta > 5:
+            lines.append(f"✅ **補正後ROIが大幅改善 (+{roi_delta:.1f}%)**: 現在のαを本番適用することを強く推奨。")
+        elif roi_delta > 0:
+            lines.append(f"✅ **補正後ROIが改善 (+{roi_delta:.1f}%)**: 本番適用を推奨。")
+        elif roi_delta > -3:
+            lines.append(f"→ **補正効果は微小 ({roi_delta:+.1f}%)**: α=1.0 (補正なし) との差が小さい。データ蓄積後に再評価を推奨。")
+        else:
+            lines.append(f"⚠️ **補正後ROIが悪化 ({roi_delta:+.1f}%)**: サンプル数不足の可能性。α=1.0 (補正なし) での運用を推奨。")
+    else:
+        lines.append("*ROI比較データが不足しています。*")
+
+    if hr_delta is not None and hr_delta == hr_delta:
+        lines.append(f"- 的中率変化: {hr_delta * 100:+.1f}%")
+    lines.append("")
+
+    # ── セクション6: params設定方法 ──
+    lines.append("## 6. params への適用方法")
+    lines.append("")
+    lines.append("以下のコードで補正係数をparamsに組み込み、予測時に自動適用できます。")
+    lines.append("")
+    lines.append("```python")
+    lines.append("from gin_and_tonic import _r55_load_alphas, _r55_apply_alphas_to_params")
+    lines.append("")
+    lines.append(f"# JSONからαをロード")
+    lines.append(f"alphas = _r55_load_alphas('{meta.get('alpha_json', 'alphas.json')}')")
+    lines.append("")
+    lines.append("# paramsに組み込む")
+    lines.append("params = _r55_apply_alphas_to_params(params, alphas)")
+    lines.append("")
+    lines.append("# 予測時に補正スコアを計算")
+    lines.append("from gin_and_tonic import _r55_adjusted_score, _r55_get_going_cat")
+    lines.append("going_cat = _r55_get_going_cat(meta)  # meta: レースmeta辞書")
+    lines.append("adj_score = _r55_adjusted_score(anchor_score, going_cat, alphas)")
+    lines.append("```")
+    lines.append("")
+
+    # ── セクション7: JSON α情報 ──
+    alpha_payload = {
+        gc: round(float(info.get("alpha", 1.0)) if isinstance(info, dict) else float(info or 1.0), 3)
+        for gc, info in alphas.items()
+    }
+    roi_raw  = ov.get("roi_raw")
+    roi_adj  = ov.get("roi_adj")
+    rec = {
+        "version": _R55_VERSION,
+        "alphas":  alpha_payload,
+        "validation": {
+            "n_total":    ov.get("n_total", 0),
+            "roi_raw":    round(roi_raw,  2) if (roi_raw  is not None and roi_raw  == roi_raw)  else None,
+            "roi_adj":    round(roi_adj,  2) if (roi_adj  is not None and roi_adj  == roi_adj)  else None,
+            "roi_delta":  round(roi_delta, 2) if (roi_delta is not None and roi_delta == roi_delta) else None,
+        },
+    }
+    lines.append("## 7. JSON α情報")
+    lines.append("")
+    lines.append("```json")
+    lines.append(_json.dumps(rec, ensure_ascii=False, indent=2))
+    lines.append("```")
+    lines.append("")
+
+    # ── セクション8: 次アクション提案 ──
+    lines.append("## 8. 次アクション提案")
+    lines.append("")
+    lines.append("1. **本番適用**: CLIオプション `--apply_alpha <alphas.json>` でαを自動ロード。")
+    lines.append("2. **定期更新**: レース結果が蓄積されるたびに R53 → R55 を再実行してαを更新。")
+    lines.append("3. **R54との連携**: 月次ROIトレンドでαの効果を時系列で確認。")
+    lines.append("4. **α有効性モニタリング**: n < 5 の馬場状態はα=1.0を維持し、データ蓄積後に再評価。")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def analyze_alpha_application(
+    result_dir: str,
+    params: Optional[dict] = None,
+    stake_place: float = 1000.0,
+    out_md: Optional[str] = None,
+    out_json: Optional[str] = None,
+    verbose: bool = True,
+) -> dict:
+    """R55: 信頼度スコア補正係数の自動適用 (メインエントリポイント)。
+
+    1. result_dir からJSONをロードし going_cat 列を付与
+    2. R53 `_r53_all_alphas` で馬場別最適αを計算
+    3. 補正前後の複勝KPIを比較検証
+    4. αをJSONに保存 (out_json)
+    5. Markdownレポートを生成 (out_md)
+    6. 更新されたparamsを返す
+
+    Parameters
+    ----------
+    result_dir  : str            JSON結果ディレクトリ
+    params      : dict, optional 設定パラメータ (補正情報を追加して返す)
+    stake_place : float          複勝1レース当り賭け金 (円)
+    out_md      : str, optional  Markdownレポート出力パス
+    out_json    : str, optional  αのJSON保存パス (省略時は result_dir/alphas.json)
+    verbose     : bool           詳細ログ出力
+
+    Returns
+    -------
+    dict:
+        alphas       : dict   going_cat → {alpha, best_roi_at_high}
+        updated_params: dict  αを組み込んだparamsのコピー
+        kpi          : dict   補正前後のKPI (overall, per_going, rows)
+        report_md    : str    Markdownレポート文字列
+        n_races      : int    総レース数
+        n_ok         : int    place_ok=True のレース数
+        alpha_json   : str    保存したαのJSONパス
+    """
+    from pathlib import Path
+
+    params = params or {}
+
+    # ── 1. データロード ──
+    df = _r53_load_df(result_dir)
+    if df.empty:
+        if verbose:
+            print(f"[R55] データなし: {result_dir}")
+        return {
+            "alphas": {}, "updated_params": params, "kpi": {},
+            "report_md": "# 信頼度スコア補正 自動適用レポート\n\n*データなし*\n",
+            "n_races": 0, "n_ok": 0, "alpha_json": "",
+        }
+
+    n_races = len(df)
+    n_ok = int(
+        df["place_ok"].map(lambda x: bool(x) if x is not None else False).sum()
+    ) if "place_ok" in df.columns else 0
+
+    if verbose:
+        print(f"[R55] ロード完了: {n_races} レース, place_ok={n_ok}")
+
+    # ── 2. α計算 ──
+    alphas = _r53_all_alphas(df, stake_place)
+    if verbose:
+        print("[R55] 補正係数α:")
+        for gc, info in alphas.items():
+            a = info.get("alpha", 1.0) if isinstance(info, dict) else info
+            print(f"       {gc}: α={a:.2f}")
+
+    # ── 3. 補正前後検証 ──
+    kpi = _r55_validation_kpi(df, alphas, stake_place)
+
+    # ── 4. αをJSONに保存 ──
+    json_path = out_json or str(Path(result_dir) / "alphas.json")
+    try:
+        _r55_save_alphas(alphas, json_path)
+        if verbose:
+            print(f"[R55] α保存: {json_path}")
+    except Exception as e:
+        if verbose:
+            print(f"[R55] α保存失敗: {e}")
+        json_path = ""
+
+    # ── 5. paramsを更新 ──
+    updated_params = _r55_apply_alphas_to_params(params, alphas)
+
+    # ── 6. レポート生成 ──
+    meta = {
+        "n_races": n_races, "n_ok": n_ok,
+        "stake_place": stake_place,
+        "alpha_json": json_path,
+    }
+    report_md = _r55_build_apply_md(alphas, kpi, meta)
+
+    if out_md:
+        try:
+            Path(out_md).write_text(report_md, encoding="utf-8")
+            if verbose:
+                print(f"[R55] レポート保存: {out_md}")
+        except Exception as e:
+            if verbose:
+                print(f"[R55] レポート保存失敗: {e}")
+
+    ov = kpi.get("overall", {})
+    if verbose:
+        roi_raw = ov.get("roi_raw")
+        roi_adj = ov.get("roi_adj")
+        if roi_raw is not None and roi_adj is not None:
+            print(f"[R55] ROI: {roi_raw:+.1f}% → {roi_adj:+.1f}% "
+                  f"(Δ{ov.get('roi_delta', 0):+.1f}%)")
+
+    return {
+        "alphas":        alphas,
+        "updated_params": updated_params,
+        "kpi":           kpi,
+        "report_md":     report_md,
+        "n_races":       n_races,
+        "n_ok":          n_ok,
+        "alpha_json":    json_path,
+    }
+
+
+# ANALYSIS cache helpers (v10.9)
+# =========================
+
+def _analysis_cache_key_from_inputs(args, params: dict) -> str:
+    """Key excludes market inputs so that market refresh can reuse sampling."""
+    import hashlib
+    import json
+
+    def _h_file(p: str) -> str:
+        """ファイルのSHA-1ハッシュ(16進数)を返す。例外発生時はパス文字列を返す。"""
+        try:
+            return _sha1_of_file(str(p))
+        except Exception:
+            return str(p)
+
+    parts = []
+
+    mode = str(getattr(args, 'analysis_cache_key_mode', 'wide_only') or 'wide_only').strip().lower()
+
+    # core images (market-independent inputs)
+    for k in ['meta_img', 'ai_time_img', 'rating_img', 'speed_index_img', 'factor_img']:
+        v = getattr(args, k, None)
+        if v:
+            parts.append(f"{k}={_h_file(v)}")
+
+    # pred times images
+    for i, v in enumerate(list(getattr(args, 'pred_times_imgs', None) or [])):
+        if v:
+            parts.append(f"pred_times_imgs[{i}]={_h_file(v)}")
+    # (v10.9) analysis cache key mode
+    # - wide_only: exclude all market inputs (best for wide-market refresh loops)
+    # - strict: include place/win market too (safe if you refresh them often)
+    if mode == 'strict':
+        # (market inputs removed)
+        pass
+
+    # pair model affects wide probabilities
+    v = getattr(args, 'pair_model_in', None)
+    if v:
+        parts.append(f"pair_model_in={_h_file(v)}")
+
+    # params (path + expanded)
+    v = getattr(args, 'params_json', None)
+    if v:
+        parts.append(f"params_json={_h_file(v)}")
+    try:
+        parts.append('params=' + json.dumps(params, ensure_ascii=False, sort_keys=True))
+    except Exception:
+        pass
+
+    raw = ('\n'.join(parts)).encode('utf-8', errors='ignore')
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _analysis_cache_paths(cache_dir: str, key: str) -> Dict[str, str]:
+    """cache_dir / key をベースに分析キャッシュ(joblib)のパス辞書を返す。"""
+    from pathlib import Path
+    d = Path(cache_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    return {'joblib': str(d / f"{key}.joblib")}
+
+
+def try_load_analysis_cache(cache_dir: Optional[str], key: str) -> Optional[dict]:
+    """分析キャッシュを読み込み、存在すれば dict を返す。なければ None。"""
+    if not cache_dir:
+        return None
+    try:
+        from pathlib import Path
+        p = _analysis_cache_paths(cache_dir, key)['joblib']
+        pp = Path(p)
+        if pp.exists() and pp.stat().st_size > 0:
+            import joblib
+            obj = joblib.load(p)
+            return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+    return None
+
+
+def save_analysis_cache(cache_dir: Optional[str], key: str, obj: dict) -> None:
+    """分析結果 dict をキャッシュに保存する。"""
+    if not cache_dir:
+        return
+    try:
+        import joblib
+        p = _analysis_cache_paths(cache_dir, key)['joblib']
+        joblib.dump(obj, p)
+    except Exception:
+        pass
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    """x を [lo, hi] の範囲にクランプして float で返す。"""
+    return float(max(lo, min(hi, x)))
+
+
+# ----- Place calibration helper (PURE_DATA) -----
+_NUM_DEFAULT = object()
+
+
+def _num_series(obj, key_or_default=np.nan, default=_NUM_DEFAULT, *, index=None, dtype=float, lower=None, upper=None, key=None) -> pd.Series:
+    """Unified numeric coercion helper.
+
+    Supported forms:
+    - _num_series(series_like, default=..., index=...)
+    - _num_series(series_like, 0.0, index=...)
+    - _num_series(df, 'col', 50.0, index=df.index)
+    - _num_series(df, ['col1', 'col2'], 50.0)
+
+    The DataFrame-column form preserves legacy fallback behavior while routing all
+    numeric conversion through this single implementation path.
+    """
+    if isinstance(obj, pd.DataFrame) or key is not None:
+        if not isinstance(obj, pd.DataFrame):
+            raise TypeError('_num_series(key=...) requires DataFrame input')
+        df = obj
+        if key is None:
+            key = key_or_default
+            fill_default = np.nan if default is _NUM_DEFAULT else default
+        else:
+            fill_default = key_or_default if default is _NUM_DEFAULT else default
+        if index is None:
+            index = getattr(df, 'index', pd.RangeIndex(0))
+        try:
+            candidates = list(key) if isinstance(key, (list, tuple)) else [key]
+        except Exception:
+            candidates = [key]
+
+        base = None
+        for cand in candidates:
+            if isinstance(cand, str) and hasattr(df, 'columns') and cand in df.columns:
+                base = df[cand]
+                break
+            if isinstance(cand, pd.Series):
+                base = cand.reindex(index)
+                break
+
+        if base is None:
+            if isinstance(fill_default, pd.Series):
+                base = fill_default.reindex(index)
+                fill_default = np.nan
+            elif isinstance(fill_default, str) and hasattr(df, 'columns') and fill_default in df.columns:
+                base = df[fill_default]
+                fill_default = df[fill_default].reindex(index)
+            else:
+                base = pd.Series([fill_default] * len(index), index=index)
+        elif isinstance(fill_default, str) and hasattr(df, 'columns') and fill_default in df.columns:
+            fill_default = df[fill_default].reindex(index)
+
+        return _num_series(base, default=fill_default, index=index, dtype=dtype, lower=lower, upper=upper)
+
+    if default is _NUM_DEFAULT:
+        default = key_or_default
+
+    base = obj
+    out = pd.to_numeric(base, errors='coerce')
+    if not isinstance(out, pd.Series):
+        if isinstance(base, pd.Series):
+            out = pd.Series([out] * len(base.index), index=base.index)
+        else:
+            if index is None:
+                try:
+                    index = getattr(base, 'index', None)
+                except Exception:
+                    index = None
+            if index is None:
+                try:
+                    out = pd.Series(base)
+                    out = pd.to_numeric(out, errors='coerce')
+                except Exception:
+                    out = pd.Series([out], dtype=float)
+            else:
+                try:
+                    out = pd.Series(base, index=index)
+                    out = pd.to_numeric(out, errors='coerce')
+                except Exception:
+                    out = pd.Series([out] * len(index), index=index)
+    if index is None:
+        index = getattr(out, 'index', pd.RangeIndex(0))
+    out = out.reindex(index).replace([np.inf, -np.inf], np.nan)
+
+    if isinstance(default, pd.Series):
+        fill_series = pd.to_numeric(default.reindex(index), errors='coerce').replace([np.inf, -np.inf], np.nan)
+        out = out.fillna(fill_series)
+    elif default is not None:
+        try:
+            fill_value = pd.to_numeric(default, errors='coerce')
+        except Exception:
+            fill_value = np.nan
+        if pd.notna(fill_value):
+            out = out.fillna(float(fill_value))
+
+    if lower is not None or upper is not None:
+        out = out.clip(lower=lower, upper=upper)
+    try:
+        return out.astype(dtype)
+    except Exception:
+        return out.astype(float)
+
+
+
+def _num_scalar(obj: Any, default: float = float('nan'), *, dtype: type = float) -> float:
+    """Numeric scalar coercion helper for row/iloc-safe extraction."""
+    try:
+        ser = _num_series(obj, default=default, dtype=float)
+        val = ser.iloc[0] if len(ser) else default
+    except Exception:
+        val = default
+    try:
+        return int(float(val)) if dtype is int else dtype(val)
+    except Exception:
+        return int(float(default)) if dtype is int else dtype(default)
+
+
+def _meta_float(meta: Optional[Dict[str, str]], keys: Union[str, List[str], Tuple[str, ...]], default: float = float('nan')) -> float:
+    """meta dict から keys を順に探して最初に変換できた float を返す。失敗時は default。"""
+    meta = meta or {}
+    key_list = list(keys) if isinstance(keys, (list, tuple)) else [keys]
+    for k in key_list:
+        try:
+            v = meta.get(k, None)
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        try:
+            return float(s)
+        except Exception:
+            m = re.search(r'-?\d+(?:\.\d+)?', s)
+            if m:
+                try:
+                    return float(m.group(0))
+                except Exception:
+                    pass
+    return float(default)
+
+
+def _meta_lap_list(meta: Optional[Dict[str, str]], keys: Union[str, Tuple[str, ...]] = ('lap_times', 'lap_splits', 'laps', 'lap_text')) -> List[float]:
+    """meta dict からラップタイムの list[float] を返す。見つからなければ空リスト。"""
+    meta = meta or {}
+    key_list = list(keys) if isinstance(keys, (list, tuple)) else [keys]
+    for k in key_list:
+        try:
+            raw = meta.get(k, None)
+        except Exception:
+            raw = None
+        if raw is None:
+            continue
+        if isinstance(raw, (list, tuple)):
+            vals = []
+            for x in raw:
+                try:
+                    vals.append(float(x))
+                except Exception:
+                    pass
+            if vals:
+                return vals
+        s = str(raw).strip()
+        if not s:
+            continue
+        nums = [float(x) for x in re.findall(r'-?\d+(?:\.\d+)?', s)]
+        if len(nums) >= 3:
+            return nums
+    return []
+
+
+def _lap_shape_meta_features(meta: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    """メタデータからラップ形状特徴量を抽出して dict で返す。
+
+    Returns:
+        dict with keys: laps, avg_sf, first_half, last_half,
+                        closing_bias, goodpos_bias, sustain_bias
+    """
+    meta = meta or {}
+    laps = _meta_lap_list(meta)
+    avg_sf = _meta_float(meta, ['avg_sec_per_furlong', 'avg_seconds_per_furlong', 'avg_furlong_sec'], default=float('nan'))
+    first_half = _meta_float(meta, ['first_half_time', 'first_half_secs', 'half_time_first', 'half_time_front'], default=float('nan'))
+    last_half = _meta_float(meta, ['last_half_time', 'last_half_secs', 'half_time_last', 'half_time_back'], default=float('nan'))
+    if (not np.isfinite(avg_sf)) and laps:
+        try:
+            avg_sf = float(np.mean(laps))
+        except Exception:
+            avg_sf = float('nan')
+    if (not np.isfinite(first_half)):
+        first_half = _meta_float(meta, ['half_time', 'half_front', 'front_half'], default=float('nan'))
+    if (not np.isfinite(last_half)):
+        last_half = _meta_float(meta, ['half_time_back', 'back_half'], default=float('nan'))
+    if laps and ((not np.isfinite(first_half)) or (not np.isfinite(last_half))):
+        half = max(1, len(laps) // 2)
+        try:
+            first_half = float(np.sum(laps[:half])) if not np.isfinite(first_half) else first_half
+            last_half = float(np.sum(laps[-half:])) if not np.isfinite(last_half) else last_half
+        except Exception:
+            pass
+    closing_bias = 0.0
+    goodpos_bias = 0.0
+    sustain_bias = 0.0
+    if laps:
+        try:
+            early = float(np.mean(laps[:max(1, len(laps) // 3)]))
+            late = float(np.mean(laps[-max(1, len(laps) // 3):]))
+            mid = float(np.mean(laps[max(0, len(laps)//3): max(len(laps)//3 + 1, len(laps)-len(laps)//3)])) if len(laps) >= 5 else float(np.mean(laps))
+            closing_bias = np.clip((early - late) * 14.0, -8.0, 8.0)
+            goodpos_bias = np.clip((late - mid) * 12.0 + (0.0 if not np.isfinite(first_half) or not np.isfinite(last_half) else (last_half - first_half) * 0.8), -8.0, 8.0)
+            sustain_bias = np.clip((float(np.std(laps)) * 3.5), 0.0, 8.0)
+        except Exception:
+            pass
+    if np.isfinite(avg_sf):
+        if avg_sf <= 11.95:
+            goodpos_bias += 1.8
+            sustain_bias += 0.8
+        elif avg_sf >= 12.20:
+            closing_bias += 1.5
+    return {
+        'laps': laps,
+        'avg_sf': avg_sf,
+        'first_half': first_half,
+        'last_half': last_half,
+        'closing_bias': float(np.clip(closing_bias, -8.0, 8.0)),
+        'goodpos_bias': float(np.clip(goodpos_bias, -8.0, 8.0)),
+        'sustain_bias': float(np.clip(sustain_bias, 0.0, 8.0)),
+    }
+
+
+def _place_prob_from_score(sc: float, calib: dict, sc_mean: float) -> float:
+    """Map score -> P(place) without market.
+
+    mode='sigmoid_z': p = p_lo + (p_hi-p_lo)*sigmoid((sc-mean)/tau), then clip.
+    """
+    try:
+        mode = str((calib or {}).get('mode', 'sigmoid_z') or 'sigmoid_z').strip()
+    except Exception:
+        mode = 'sigmoid_z'
+    try:
+        tau = float((calib or {}).get('tau', 12.0) or 12.0)
+    except Exception:
+        tau = 12.0
+    tau = float(max(1e-6, tau))
+    try:
+        p_lo = float((calib or {}).get('p_lo', 0.06) or 0.06)
+        p_hi = float((calib or {}).get('p_hi', 0.42) or 0.42)
+    except Exception:
+        p_lo, p_hi = 0.06, 0.42
+    try:
+        clip_lo = float((calib or {}).get('clip_lo', 0.05) or 0.05)
+        clip_hi = float((calib or {}).get('clip_hi', 0.60) or 0.60)
+    except Exception:
+        clip_lo, clip_hi = 0.05, 0.60
+
+    sc = float(sc)
+    mu = float(sc_mean)
+
+    if mode == 'linear':
+        # fallback legacy behavior (tunable)
+        try:
+            a = float((calib or {}).get('intercept', 0.06) or 0.06)
+            b = float((calib or {}).get('slope', 0.0030) or 0.0030)
+        except Exception:
+            a, b = 0.06, 0.0030
+        p = a + b * sc
+        return float(clamp(p, clip_lo, clip_hi))
+
+    # default: sigmoid of z-score (stable)
+    z = (sc - mu) / tau
+    # stable sigmoid
+    if z >= 0:
+        ez = np.exp(-z)
+        sig = 1.0 / (1.0 + ez)
+    else:
+        ez = np.exp(z)
+        sig = ez / (1.0 + ez)
+    p = p_lo + (p_hi - p_lo) * float(sig)
+    return float(clamp(p, clip_lo, clip_hi))
+
+
+
+def _sigmoid(x: float) -> float:
+    """数値安定版シグモイド関数: σ(x) = 1 / (1 + e^{-x})。"""
+    x = float(x)
+    if x >= 0:
+        z = np.exp(-x)
+        return float(1.0 / (1.0 + z))
+    else:
+        z = np.exp(x)
+        return float(z / (1.0 + z))
+
+
+def _logit(p: float, eps: float = 1e-6) -> float:
+    """確率 p を対数オッズ（ロジット）に変換する。eps でクランプして log(0) を防ぐ。"""
+    p = clamp(float(p), eps, 1.0 - eps)
+    return float(np.log(p / (1.0 - p)))
+
+
+def blend_probs_logit(p_model: float, p_mkt: float, w_model: float = 0.70, eps: float = 1e-6) -> float:
+    """Blend two probabilities in logit space for stability.
+
+    p = sigmoid(w*logit(p_model) + (1-w)*logit(p_mkt))
+    """
+    if p_mkt is None or (not np.isfinite(p_mkt)):
+        return clamp(float(p_model), eps, 1.0 - eps)
+    if p_model is None or (not np.isfinite(p_model)):
+        return clamp(float(p_mkt), eps, 1.0 - eps)
+    w = clamp(float(w_model), 0.0, 1.0)
+    z = w * _logit(p_model, eps=eps) + (1.0 - w) * _logit(p_mkt, eps=eps)
+    return clamp(_sigmoid(z), eps, 1.0 - eps)
+
+def norm_minmax_to_0_100(series: pd.Series) -> Tuple[pd.Series, float, float]:
+    """min-max 正規化。min=max の場合は全馬 50 固定"""
+    s = _num_series(series, index=getattr(series, 'index', None))
+    # R36: 全要素 NaN の場合 np.nanmin/nanmax が RuntimeWarning を出すため事前にガード
+    _s_vals = s.values
+    _all_nan = len(_s_vals) == 0 or np.all(np.isnan(_s_vals))
+    mn = float(np.nanmin(_s_vals)) if (not _all_nan and np.isfinite(np.nanmin(_s_vals))) else np.nan
+    mx = float(np.nanmax(_s_vals)) if (not _all_nan and np.isfinite(np.nanmax(_s_vals))) else np.nan
+
+    if not np.isfinite(mn) or not np.isfinite(mx):
+        return pd.Series([np.nan] * len(series), index=series.index), np.nan, np.nan
+
+    if mx == mn:
+        return pd.Series([50.0] * len(series), index=series.index), mn, mx
+
+    return ((s - mn) / (mx - mn) * 100.0).astype(float), mn, mx
+
+
+def parse_speed_hist(s: str) -> List[float]:
+    """速度ヒストリ文字列をパースして float リストを返す。"""
+    if s is None:
+        return []
+    s = str(s).strip()
+    if s == "" or s.lower() == "nan":
+        return []
+    parts = re.split(r"[,\s/]+", s)
+    vals: List[float] = []
+    for p in parts:
+        try:
+            vals.append(float(p))
+        except Exception:
+            pass
+    return vals
+
+
+def factor_mark_to_points(mark: str) -> float:
+    """印文字列（◎○▲△×）をポイント数値に変換する。"""
+    mark = "" if mark is None else str(mark).strip()
+    if mark == "◎":
+        return 2.0
+    if mark == "○":
+        return 1.0
+    if mark == "△":
+        return 0.5
+    return 0.0
+
+
+def normalize_zone_token(x: str) -> str:
+    """OCR誤読を FRONT/MIDDLE/REAR に丸める（英字前提）。不明→MIDDLE"""
+    if x is None:
+        return "MIDDLE"
+    s = str(x).upper().strip()
+    if s == "" or s == "NAN":
+        return "MIDDLE"
+
+    s = s.replace("0", "O")
+    s = s.replace("|", "I")
+    s = re.sub(r"[^A-Z]", "", s)
+
+    if "FRONT" in s or s.startswith("FRO") or s.startswith("FRON"):
+        return "FRONT"
+    if "MIDDLE" in s or s.startswith("MID") or s.startswith("MIDD") or s.startswith("MI"):
+        return "MIDDLE"
+    if "REAR" in s or s.startswith("REA") or s.startswith("R"):
+        return "REAR"
+
+    return "MIDDLE"
+
+
+def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
+    """OCR前処理（拡大 + 2値化）。
+
+    速度最適化:
+    - 画像が十分大きい場合は過度な拡大を避ける（resizeがOCR全体の足を引っ張るため）
+    - 小さい画像は従来通り拡大して精度を確保
+    """
+    img = np.array(pil_img.convert("RGB"))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    h, w = gray.shape[:2]
+    # heuristic: large screenshots already have enough pixels
+    if max(h, w) >= 2200:
+        fx = fy = 1.0
+    elif max(h, w) >= 1400:
+        fx = fy = 1.4
+    else:
+        fx = fy = 2.0
+
+    if fx != 1.0:
+        gray = cv2.resize(gray, None, fx=float(fx), fy=float(fy), interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    th = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        10,
+    )
+    return th
+
+
+# =========================
+# 1) OCR: image -> table
+# =========================
+
+def ocr_words(image: np.ndarray, lang: str = "jpn+eng") -> pd.DataFrame:
+    """画像から OCR でワード情報を抽出し DataFrame を返す。"""
+    data = pytesseract.image_to_data(
+        image,
+        lang=lang,
+        output_type=pytesseract.Output.DATAFRAME,
+        config="--psm 6",
+    )
+    data = data.dropna(subset=["text"])
+    data["text"] = data["text"].astype(str).str.strip()
+    data = data[data["text"] != ""]
+    if "conf" in data.columns:
+        data = data[_num_series(data["conf"], -1, index=data.index, dtype=float) >= 0]
+    return data
+
+
+def cluster_rows_by_y(words: pd.DataFrame, y_tol: int = 18) -> pd.DataFrame:
+    """Y 座標の近いワードを同一行にクラスタリングし row_id 列を付与して返す。"""
+    words = words.copy()
+    words["y_center"] = words["top"] + words["height"] / 2.0
+    words = words.sort_values("y_center")
+
+    row_id = []
+    current = -1
+    last_y = None
+    for y in words["y_center"].values:
+        if last_y is None or abs(y - last_y) > y_tol:
+            current += 1
+            last_y = y
+        row_id.append(current)
+    words["row_id"] = row_id
+    return words
+
+
+def _ocr_header_key(text: str) -> str:
+    """OCR ヘッダーテキストを小文字・全角→半角変換した正規化キーに変換する。"""
+    s = _norm_ocr_token(text)
+    try:
+        s = s.translate(str.maketrans('ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ', 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'))
+    except Exception:
+        pass
+    s = s.upper()
+    s = s.replace('一', 'ー').replace('-', 'ー').replace('_', '')
+    s = re.sub(r'[\s:：./・,，]+', '', s)
+    return s
+
+
+def _ocr_header_aliases(col: str) -> List[str]:
+    """列名 col に対する OCR 上のエイリアス文字列リストを返す。"""
+    alias_map = {
+        '道悪': ['道悪', '馬場', '道悪適性'],
+        'コース': ['コース', 'コ一ス', 'コ-ス', 'コス'],
+        '距離': ['距離', '距離適性', '距'],
+        '前走': ['前走', '前'],
+        '調教': ['調教', '調', '追切'],
+        '実績': ['実績', '戦績', '実'],
+    }
+    vals = [col] + alias_map.get(col, [])
+    out = []
+    for v in vals:
+        k = _ocr_header_key(v)
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
+def _ocr_header_match_score(line: str, expected_cols: List[str]) -> tuple[float, int]:
+    """    OCR テキスト行に対して expected_cols のヘッダーマッチスコアを計算する。
+
+    Returns:
+        tuple[float, int]: (スコア割合, ヒット数)
+
+    """
+    lk = _ocr_header_key(line)
+    hit = 0
+    for c in expected_cols:
+        aliases = _ocr_header_aliases(c)
+        if any((a in lk) or (lk in a and len(lk) >= 2) for a in aliases):
+            hit += 1
+    return hit / max(1, len(expected_cols)), hit
+
+
+def build_table_by_header_alignment(
+    words: pd.DataFrame,
+    expected_cols: List[str],
+    header_match_threshold: float = 0.35,
+) -> pd.DataFrame:
+    """ヘッダ位置に基づいて OCR ワードをテーブル構造に整形し DataFrame を返す。"""
+    w = cluster_rows_by_y(words)
+
+    rows = []
+    for rid, g in w.groupby("row_id"):
+        line = " ".join(g.sort_values("left")["text"].astype(str).tolist())
+        score, hit = _ocr_header_match_score(line, expected_cols)
+        rows.append((rid, line, g, score, hit))
+
+    best = None
+    best_score = -1.0
+    best_hit = -1
+    for rid, line, g, score, hit in rows:
+        if (score > best_score) or (score == best_score and hit > best_hit):
+            best_score = score
+            best_hit = hit
+            best = (rid, line, g)
+
+    if best is None or best_score < header_match_threshold:
+        raise RuntimeError(
+            f"ヘッダー行の検出に失敗（score={best_score:.2f}）。列名付きの表スクショにしてください。"
+        )
+
+    header_rid, _, header_g = best
+
+    col_x = {}
+    for col in expected_cols:
+        aliases = _ocr_header_aliases(col)
+        mask = header_g["text"].apply(
+            lambda t: any((a in _ocr_header_key(str(t))) or (_ocr_header_key(str(t)) in a and len(_ocr_header_key(str(t))) >= 2) for a in aliases)
+        )
+        candidates = header_g[mask]
+        if len(candidates) == 0:
+            continue
+        c = candidates.sort_values("left").iloc[0]
+        col_x[col] = float(c["left"] + c["width"] / 2.0)
+
+    if len(col_x) < max(3, int(len(expected_cols) * 0.5)):
+        raise RuntimeError(
+            f"列位置の推定が不足（{len(col_x)}/{len(expected_cols)}）。列名をexpectedに寄せるか解像度を上げてください。"
+        )
+
+    ordered = sorted(col_x.items(), key=lambda kv: kv[1])
+    ordered_cols = [c for c, _ in ordered]
+    ordered_x = np.array([x for _, x in ordered], dtype=float)
+
+    data_w = w[w["row_id"] > header_rid].copy()
+    data_w["x_center"] = data_w["left"] + data_w["width"] / 2.0
+
+    def nearest_col(x) -> str:
+        """x に最も近いヘッダ列インデックスを返す内部ヘルパ。"""
+        idx = int(np.argmin(np.abs(ordered_x - x)))
+        return ordered_cols[idx]
+
+    data_w["col"] = data_w["x_center"].apply(nearest_col)
+
+    table = (
+        data_w.sort_values(["row_id", "left"])
+        .groupby(["row_id", "col"])["text"]
+        .apply(lambda xs: " ".join(xs.astype(str).tolist()))
+        .unstack(fill_value="")
+        .reset_index(drop=True)
+    )
+
+    for c in expected_cols:
+        if c not in table.columns:
+            table[c] = ""
+    table = table[expected_cols]
+    return table
+
+
+def ocr_table_image(image_path: str, expected_cols: List[str], lang: str = "jpn+eng") -> pd.DataFrame:
+    """競走馬テーブル画像を OCR し、期待列名に合わせた DataFrame を返す。"""
+    pil = Image.open(image_path)
+    img = preprocess_for_ocr(pil)
+    words = ocr_words(img, lang=lang)
+    return build_table_by_header_alignment(words, expected_cols=expected_cols)
+
+
+def ocr_meta_image(meta_path: str, lang: str = "jpn+eng") -> Dict[str, str]:
+    """レースメタ画像を OCR し、キー・バリュー dict を返す。"""
+    pil = Image.open(meta_path)
+    img = preprocess_for_ocr(pil)
+    txt = pytesseract.image_to_string(img, lang=lang, config="--psm 6")
+    out: Dict[str, str] = {}
+    for k in ["race", "pace", "bias", "map_summary"]:
+        m = re.search(rf"{k}\s*[:：]\s*(.+)", txt, flags=re.IGNORECASE)
+        if m:
+            out[k] = m.group(1).strip()
+    return out
+
+
+
+# =========================
+# v10) OCR: structured tables (rating/speed/pred_times/factor)
+# - tailored for your screenshot format
+# =========================
+
+_MARK_TOKENS = set(['◎','○','▲','△','☆','★','穴','注','消','-'])
+
+
+def _image_size(path: str) -> tuple[int,int]:
+    """画像ファイルの (幅, 高さ) ピクセルサイズを返す。読み込み失敗時は (0, 0) を返す。"""
+    try:
+        pil = Image.open(path)
+        return pil.size[0], pil.size[1]
+    except Exception:
+        try:
+            bgr = _to_bgr_from_path(path)
+            h,w = bgr.shape[:2]
+            return int(w), int(h)
+        except Exception:
+            return 0,0
+
+
+def _norm_ocr_token(t: str) -> str:
+    """OCR トークンを正規化する（全角数字→半角、空白除去、長音・記号統一等）。"""
+    if t is None:
+        return ''
+    s = str(t).strip()
+    try:
+        s = s.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
+    except Exception:
+        pass
+    # common noise
+    s = s.replace('　',' ')
+    s = s.replace('．','.').replace('。','.').replace('，',',').replace('、',',').replace('：',':').replace('；',';')
+
+    # numeric-like OCR noise only (do NOT touch horse names)
+    try:
+        numeric_like = bool(re.fullmatch(r"[0-9OoIl\|SBZsbz,\.:;\-\s']+", s)) and bool(re.search(r'[0-9OoIl\|SBZsbz]', s))
+    except Exception:
+        numeric_like = False
+    if numeric_like:
+        s = (s.replace('O','0').replace('o','0')
+               .replace('I','1').replace('l','1').replace('|','1')
+               .replace('S','5').replace('s','5')
+               .replace('B','8').replace('Z','2').replace('z','2'))
+        s = s.replace(',', '.').replace(':', '.').replace(';', '.').replace("'", '.')
+        s = re.sub(r'\s+', '', s)
+        s = re.sub(r'\.{2,}', '.', s)
+        s = s.strip('.')
+    return s
+
+
+def _parse_int_token(s: str) -> int | None:
+    """OCR トークンを整数に変換する。1〜3桁の数字以外は None を返す。"""
+    s=_norm_ocr_token(s)
+    if not re.fullmatch(r"\d{1,3}", s):
+        return None
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+
+def _parse_float_token(s: str) -> float | None:
+    """OCR トークンを浮動小数点数に変換する。形式が一致しない場合は None を返す。"""
+    s=_norm_ocr_token(s)
+    if re.fullmatch(r"\d{1,3}\.\d", s) or re.fullmatch(r"\d{1,3}\.\d{2}", s) or re.fullmatch(r"\d{1,3}", s):
+        try:
+            return float(s)
+        except Exception:
+            return None
+    return None
+
+
+def _parse_float_token_loose(s: str, lo: float | None = None, hi: float | None = None) -> float | None:
+    """    ゆるい形式（単位付き等）の文字列から浮動小数点数を抽出する。
+    lo/hi 範囲外の場合は None を返す。
+    """
+    s = _norm_ocr_token(s)
+    def _ok(x) -> bool:
+        """値が有限な float に変換できるかを判定する内部ヘルパ。"""
+        try:
+            v = float(x)
+        except Exception:
+            return False
+        if not np.isfinite(v):
+            return False
+        if lo is not None and v < float(lo):
+            return False
+        if hi is not None and v > float(hi):
+            return False
+        return True
+
+    v = _parse_float_token(s)
+    if _ok(v):
+        return float(v)
+
+    digits = re.sub(r'[^0-9]', '', s)
+    cands = []
+    if re.fullmatch(r'\d{3}', digits):
+        cands = [int(digits) / 10.0]
+    elif re.fullmatch(r'\d{4}', digits):
+        cands = [int(digits) / 10.0, int(digits) / 100.0]
+    elif re.fullmatch(r'\d{5}', digits):
+        cands = [int(digits) / 100.0]
+    for x in cands:
+        if _ok(x):
+            return float(x)
+    return None
+
+
+def _row_tokens(words: pd.DataFrame) -> list[dict]:
+    """row group -> list of token dict with normalized text and x center"""
+    out=[]
+    for _, r in words.iterrows():
+        t=_norm_ocr_token(r.get('text',''))
+        if not t:
+            continue
+        xc=float(r.get('left',0))+float(r.get('width',0))/2.0
+        out.append({'t':t,'xc':xc,'left':float(r.get('left',0)), 'top':float(r.get('top',0)), 'w':float(r.get('width',0)), 'h':float(r.get('height',0))})
+    out.sort(key=lambda d:d['xc'])
+    return out
+
+
+def _extract_num_and_name(tokens: list[dict], img_w: int) -> tuple[str,str,str]:
+    """Return (num, name, cpu_mark). name is concatenated from middle tokens."""
+    num=''
+    cpu=''
+    # pick leftmost 1-20 integer near left side
+    for d in tokens:
+        iv=_parse_int_token(d['t'])
+        if iv is not None and 1 <= iv <= 20 and d['xc'] <= img_w*0.18:
+            num=str(iv)
+            break
+    # cpu mark: first mark token near left-mid
+    for d in tokens:
+        if d['t'] in _MARK_TOKENS and d['xc'] <= img_w*0.28:
+            cpu=d['t']
+            break
+    # name: tokens in the central band, excluding pure numbers and marks
+    name_tokens=[]
+    for d in tokens:
+        t=d['t']
+        if d['xc'] < img_w*0.18:
+            continue
+        if d['xc'] > img_w*0.78:
+            continue
+        if t in _MARK_TOKENS:
+            continue
+        if re.fullmatch(r"\d+(?:\.\d+)?", t):
+            continue
+        # remove stray symbols
+        t=re.sub(r"[^0-9A-Za-z\u3040-\u30ff\u4e00-\u9fffー\-]", "", t)
+        t=t.strip('-')
+        if t:
+            name_tokens.append(t)
+    name=''.join(name_tokens).strip()
+    return num,name,cpu
+
+
+def ocr_rating_table_v10(image_path: str, lang: str = 'jpn+eng') -> pd.DataFrame:
+    """Rating table OCR: num/name/rating (float 1-dec)."""
+    require_ocr_deps()
+    w,_=_image_size(image_path)
+    words=_ocr_words_basic(_to_bgr_from_path(image_path), lang=lang)
+    if len(words)==0:
+        return pd.DataFrame(columns=['num','name','rating','cpu_mark'])
+    words=_cluster_rows(words, y_tol=18)
+    rows=[]
+    for _, g in words.groupby('row_id'):
+        toks=_row_tokens(g)
+        if not toks:
+            continue
+        num,name,cpu=_extract_num_and_name(toks, w)
+        # rating float near right
+        floats=[(d['xc'], _parse_float_token_loose(d['t'], lo=0.0, hi=200.0)) for d in toks if d['xc']>=w*0.78]
+        floats=[(xc,v) for xc,v in floats if v is not None and 0.0 < v < 200.0]
+        if not num or not name or not floats:
+            continue
+        xc,v = sorted(floats, key=lambda x:x[0])[-1]
+        # prefer x.x format
+        rating=float(v)
+        rows.append({'num':num,'name':name,'rating':rating,'cpu_mark':cpu})
+    out=pd.DataFrame(rows)
+    if len(out)==0:
+        return pd.DataFrame(columns=['num','name','rating','cpu_mark'])
+    out=out.drop_duplicates(subset=['num'], keep='last').reset_index(drop=True)
+    return out
+
+
+def ocr_speed_index_table_v10(image_path: str, lang: str = 'jpn+eng') -> pd.DataFrame:
+    """Speed Index table OCR: num/name/speed_max/speed_3ago/speed_2ago/speed_last."""
+    require_ocr_deps()
+    w,_=_image_size(image_path)
+    words=_ocr_words_basic(_to_bgr_from_path(image_path), lang=lang)
+    if len(words)==0:
+        return pd.DataFrame(columns=['num','name','speed_max','speed_3ago','speed_2ago','speed_last','cpu_mark'])
+    words=_cluster_rows(words, y_tol=18)
+    rows=[]
+    for _, g in words.groupby('row_id'):
+        toks=_row_tokens(g)
+        if not toks:
+            continue
+        num,name,cpu=_extract_num_and_name(toks, w)
+        # collect right-side integers as candidate indices
+        ints=[(d['xc'], _parse_int_token(d['t'])) for d in toks if d['xc']>=w*0.70]
+        ints=[(xc,v) for xc,v in ints if v is not None and 0 <= v <= 140]
+        if not num or not name or len(ints) < 4:
+            continue
+        ints_sorted=sorted(ints, key=lambda x:x[0])
+        # take last 4 as [最高,3走前,2走前,前回] by x order
+        xs=ints_sorted[-4:]
+        vals=[v for _,v in xs]
+        rows.append({'num':num,'name':name,'speed_max':vals[0],'speed_3ago':vals[1],'speed_2ago':vals[2],'speed_last':vals[3],'cpu_mark':cpu})
+    out=pd.DataFrame(rows)
+    if len(out)==0:
+        return pd.DataFrame(columns=['num','name','speed_max','speed_3ago','speed_2ago','speed_last','cpu_mark'])
+    out=out.drop_duplicates(subset=['num'], keep='last').reset_index(drop=True)
+    return out
+
+
+
+
+def _find_header_x(words: pd.DataFrame, header_tokens: list[str]) -> dict[str, float]:
+    """Find header token x-centers from OCR words. Returns dict token->xc."""
+    if words is None or len(words)==0:
+        return {}
+    # cluster rows first if needed
+    if 'row_id' not in words.columns:
+        words = _cluster_rows(words, y_tol=18)
+    best = None
+    best_hits = 0
+    for _, g in words.groupby('row_id'):
+        toks = [_norm_ocr_token(t) for t in g.get('text',[])]
+        hits = sum(1 for ht in header_tokens if ht in toks)
+        if hits > best_hits:
+            best_hits = hits
+            best = g
+    if best is None or best_hits < 3:
+        return {}
+    out = {}
+    for _, r in best.iterrows():
+        t = _norm_ocr_token(r.get('text',''))
+        if t in header_tokens:
+            xc = float(r.get('left',0)) + float(r.get('width',0))/2.0
+            out[t] = xc
+    return out
+
+
+def ocr_factor_table_v10(image_path: str, lang: str = 'jpn+eng') -> pd.DataFrame:
+    """Factor table OCR: 道悪/コース/距離/前走/調教/実績 marks per horse.
+
+    Returns columns: num,name,cpu_mark,dirt,course,distance,last,training,record
+    Each mark is one of _MARK_TOKENS, otherwise '' (blank).
+    """
+    require_ocr_deps()
+    w,_ = _image_size(image_path)
+    words = _ocr_words_basic(_to_bgr_from_path(image_path), lang=lang)
+    if len(words)==0:
+        return pd.DataFrame(columns=['num','name','cpu_mark','dirt','course','distance','last','training','record'])
+
+    # determine header x centers (preferred)
+    headers = ['道悪','コース','距離','前走','調教','実績']
+    hx = _find_header_x(words, headers)
+
+    words = _cluster_rows(words, y_tol=18)
+    rows=[]
+    # fallback bins if header not found
+    if not hx:
+        # approximate 6 columns on the right half
+        x0, x1 = w*0.55, w*0.98
+        step = (x1-x0)/6.0
+        hx = {h: x0 + (i+0.5)*step for i,h in enumerate(headers)}
+
+    # estimate tolerance as a fraction of distance between columns
+    xs = sorted(hx.values())
+    if len(xs)>=2:
+        tol = max(12.0, min(60.0, (xs[1]-xs[0])*0.45))
+    else:
+        tol = 35.0
+
+    for _, g in words.groupby('row_id'):
+        toks = _row_tokens(g)
+        if not toks:
+            continue
+        num,name,cpu = _extract_num_and_name(toks, w)
+        if not num or not name:
+            continue
+
+        # collect mark tokens with their x
+        marks = [(d['xc'], d['t']) for d in toks if d['t'] in _MARK_TOKENS]
+
+        def pick_mark(target_x: float) -> str:
+            """target_x に最も近い印文字を選ぶ内部ヘルパ。"""
+            cand = [(abs(x-target_x), t) for x,t in marks if abs(x-target_x) <= tol]
+            if not cand:
+                return ''
+            cand.sort(key=lambda z: z[0])
+            return cand[0][1]
+
+        row = {
+            'num': num,
+            'name': name,
+            'cpu_mark': cpu,
+            'dirt': pick_mark(hx['道悪']),
+            'course': pick_mark(hx['コース']),
+            'distance': pick_mark(hx['距離']),
+            'last': pick_mark(hx['前走']),
+            'training': pick_mark(hx['調教']),
+            'record': pick_mark(hx['実績']),
+        }
+        # skip header-like rows (contain many headers as text)
+        if any(row[k] in headers for k in row):
+            pass
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    if len(out)==0:
+        return pd.DataFrame(columns=['num','name','cpu_mark','dirt','course','distance','last','training','record'])
+    out = out.drop_duplicates(subset=['num'], keep='last').reset_index(drop=True)
+    return out
+def ocr_pred_times_table_v10(image_paths: List[str], lang: str = 'jpn+eng') -> pd.DataFrame:
+    """Predicted times table OCR (may be split into 2 screenshots)."""
+    require_ocr_deps()
+    rows=[]
+    for image_path in (image_paths or []):
+        w,_=_image_size(image_path)
+        words=_ocr_words_basic(_to_bgr_from_path(image_path), lang=lang)
+        if len(words)==0:
+            continue
+        words=_cluster_rows(words, y_tol=18)
+        for _, g in words.groupby('row_id'):
+            toks=_row_tokens(g)
+            if not toks:
+                continue
+            num,name,cpu=_extract_num_and_name(toks, w)
+            floats=[(d['xc'], _parse_float_token_loose(d['t'], lo=10.0, hi=60.0)) for d in toks if d['xc']>=w*0.70]
+            floats=[(xc,v) for xc,v in floats if v is not None and 10.0 <= v <= 60.0]
+            if not num or not name or len(floats) < 2:
+                continue
+            fs=sorted(floats, key=lambda x:x[0])[-2:]
+            vals=[v for _,v in fs]
+            rows.append({'num':num,'name':name,'pred_first3f':float(vals[0]),'pred_last3f':float(vals[1])})
+    out=pd.DataFrame(rows)
+    if len(out)==0:
+        return pd.DataFrame(columns=['num','name','pred_first3f','pred_last3f'])
+    out=out.drop_duplicates(subset=['num'], keep='last').reset_index(drop=True)
+    return out
+
+
+def ocr_ai_time_summary_v10(image_path: str, lang: str = 'jpn+eng') -> Dict[str,str]:
+    """AI展開予測/タイム予測 画面から meta を抽出（簡易）。"""
+    require_ocr_deps()
+    pil = Image.open(image_path)
+    img = preprocess_for_ocr(pil)
+    txt = pytesseract.image_to_string(img, lang=lang, config='--psm 6')
+    s = str(txt).replace('　',' ')
+    out: Dict[str,str] = {}
+
+    def _find_loose_float(label_patterns: list[str], lo: float, hi: float) -> str | None:
+        """label_patterns に一致するラベルの直後から lo〜hi 範囲の浮動小数点数を探す。"""
+        for pat in label_patterns:
+            m = re.search(pat, s, flags=re.IGNORECASE)
+            if not m:
+                continue
+            tail = s[m.end():m.end() + 24]
+            cands = re.findall(r"[0-9OoIl\|SBZsbz][0-9OoIl\|SBZsbz,.:;' ]{1,8}", tail)
+            for cand in cands:
+                v = _parse_float_token_loose(cand, lo=lo, hi=hi)
+                if v is not None:
+                    return f"{float(v):.1f}"
+        return None
+
+    # pace: H/M/S
+    # NOTE(v10.12): 旧実装は "H/M/S の単独文字" を最初に拾うだけだったため、
+    # 画面内の別要素（例: "M" が別文脈で出る）を誤認しやすい。
+    # まずはラベル付き（ペース/pace）の近傍から抽出し、無ければフォールバック。
+    m = re.search(r"(?:ペース|PACE)\s*[:：]?\s*([HMS])\b", s, flags=re.IGNORECASE)
+    if m:
+        out['pace'] = m.group(1)
+        out['pace_conf'] = 'high'
+    else:
+        m = re.search(r"\b([HMS])\b", s)
+        if m:
+            out['pace'] = m.group(1)
+            out['pace_conf'] = 'low'
+    # bias
+    m = re.search(r"バイアス\s*\n?\s*([\u4e00-\u9fff\u3040-\u30ffー]+)", s)
+    if m:
+        out['bias'] = m.group(1).strip()
+    # times
+    m = re.search(r"推定タイム\s*([0-9]:[0-9]{2}\.[0-9])", s)
+    if m:
+        out['est_time'] = m.group(1)
+
+    m = re.search(r"(?:推定)?前半\s*3F\s*([0-9]{2}\.[0-9])", s)
+    if m:
+        out['est_first3f'] = m.group(1)
+    else:
+        v = _find_loose_float([r"(?:推定)?前半\s*3F", r"(?:推定)?前半"], lo=10.0, hi=60.0)
+        if v is not None:
+            out['est_first3f'] = v
+
+    m = re.search(r"(?:推定)?後半\s*3F\s*([0-9]{2}\.[0-9])", s)
+    if m:
+        out['est_last3f'] = m.group(1)
+    else:
+        v = _find_loose_float([r"(?:推定)?後半\s*3F", r"(?:推定)?後半"], lo=10.0, hi=60.0)
+        if v is not None:
+            out['est_last3f'] = v
+    # course line
+    m = re.search(r"コース情報\s*([^\n]+)", s)
+    if m:
+        out['course_info'] = m.group(1).strip()
+    return out
+
+
+def _merge_entries_base(dfs: List[pd.DataFrame]) -> pd.DataFrame:
+    """Merge multiple horse-level dfs by num (string). Prefer non-empty name."""
+    base=None
+    for df in dfs:
+        if df is None or len(df)==0:
+            continue
+        tmp=df.copy()
+        if 'num' not in tmp.columns:
+            continue
+        tmp['num']=tmp['num'].astype(str)
+        if base is None:
+            base=tmp
+        else:
+            base=base.merge(tmp, on='num', how='outer', suffixes=('','_r'))
+            # name resolve
+            if 'name_r' in base.columns:
+                base['name'] = base['name'].astype(str)
+                base['name_r'] = base['name_r'].astype(str)
+                base['name'] = base.apply(lambda r: r['name'] if r['name'].strip() not in ['', 'nan', 'None'] else r['name_r'], axis=1)
+                base=base.drop(columns=['name_r'])
+            # cpu_mark resolve
+            if 'cpu_mark_r' in base.columns:
+                base['cpu_mark'] = base.get('cpu_mark','').astype(str)
+                base['cpu_mark_r'] = base['cpu_mark_r'].astype(str)
+                base['cpu_mark'] = base.apply(lambda r: r['cpu_mark'] if r['cpu_mark'].strip() not in ['', 'nan', 'None'] else r['cpu_mark_r'], axis=1)
+                base=base.drop(columns=['cpu_mark_r'])
+    if base is None:
+        return pd.DataFrame(columns=['num','name'])
+    base=base.sort_values('num').reset_index(drop=True)
+    return base
+
+
+# =========================
+# Odds OCR (JRA-VAN screenshots)
+# =========================
+
+def _to_bgr_from_path(image_path: str) -> np.ndarray:
+    """画像ファイルを PIL で開き、BGR 形式の numpy 配列として返す（OpenCV 互換）。"""
+    pil = Image.open(image_path).convert("RGB")
+    rgb = np.array(pil)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+def _ocr_words_basic(image_bgr: np.ndarray, lang: str = "jpn+eng") -> pd.DataFrame:
+    """OCR words with bbox using existing preproc pipeline."""
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    th = preprocess_for_ocr(pil)
+    return ocr_words(th, lang=lang)
+
+
+def _cluster_rows(words: pd.DataFrame, y_tol: int = 18) -> pd.DataFrame:
+    """cluster_rows_by_y の内部エイリアスラッパ。y_tol ピクセル以内を同一行に統合する。"""
+    return cluster_rows_by_y(words, y_tol=y_tol)
+
+
+# [REMOVED] parse_market_range_text: market OCR/input removed for stability
+
+
+# [REMOVED] _ocr_place_market_rows_single: market OCR/input removed for stability
+
+
+# [REMOVED] ocr_place_market_jravan: market OCR/input removed for stability
+
+
+# [REMOVED] _ocr_wide_market_rows_single: market OCR/input removed for stability
+
+
+# [REMOVED] ocr_wide_market_jravan: market OCR/input removed for stability
+
+
+# [REMOVED] _ocr_win_market_rows_single: market OCR/input removed for stability
+
+
+# [REMOVED] ocr_win_market_jravan: market OCR/input removed for stability
+
+# =========================
+# Track conditions -> numeric (v1.1 add-on)
+# =========================
+
+
+
+# -------------------------
+# -------------------------
+
+
+
+
+
+
+
+
+
+
+
+# -------------------------
+# -------------------------
+
+
+
+
+
+def _safe_float(x: str) -> Optional[float]:
+    """文字列を float に変換する。変換失敗時は None を返す。"""
+    try:
+        return float(str(x).strip())
+    except Exception:
+        return None
+
+
+def going_to_firmness_score(going: str) -> Optional[float]:
+    """馬場状態（良/稍重/重/不良）を『硬さ(=乾き)スコア 0-100』に変換。
+
+    - 良=100
+    - 稍重=70
+    - 重=40
+    - 不良=20
+
+    ※数値化の主目的は監査ログ・分析用の特徴量。
+    """
+    if going is None:
+        return None
+    s = str(going).strip()
+    mp = {"良": 100.0, "稍重": 70.0, "重": 40.0, "不良": 20.0}
+    return mp.get(s)
+
+
+def cushion_to_score(cushion: Optional[float]) -> Optional[float]:
+    """芝クッション値を 0-100 に正規化（6〜12を想定レンジ）。"""
+    if cushion is None or not np.isfinite(cushion):
+        return None
+    return clamp((float(cushion) - 6.0) / (12.0 - 6.0) * 100.0, 0.0, 100.0)
+
+
+def moisture_to_wetness_score(moisture_pct: Optional[float], lo: float = 6.0, hi: float = 20.0) -> Optional[float]:
+    """含水率(%)を『濡れスコア 0-100（高いほどウェット）』に変換。
+
+    lo/hi は一般的なレンジの目安。用途は特徴量なので過度に意味付けしない。
+
+    NOTE:
+    - JRAの芝は競馬場ごとに含水率レンジが異なり得るため、
+      本スコアは "参考特徴量" として扱う。
+    """
+    if moisture_pct is None or not np.isfinite(moisture_pct):
+        return None
+    if hi <= lo:
+        return 0.0
+    return clamp((float(moisture_pct) - lo) / (hi - lo) * 100.0, 0.0, 100.0)
+
+
+# =========================
+# JRA moisture reference (from JRA public guide screenshots)
+# - Turf differs by racecourse
+# - Dirt is common across racecourses
+# =========================
+
+TURF_MOISTURE_REF = {
+    # unit: percent
+    # good_max / slightly_min..slightly_max / heavy_min..heavy_max / bad_min
+    '札幌': {'good_max': 15.0, 'slightly_min': 14.0, 'slightly_max': 18.0, 'heavy_min': 17.0, 'heavy_max': 21.0, 'bad_min': 20.0},
+    '函館': {'good_max': 15.0, 'slightly_min': 14.0, 'slightly_max': 18.0, 'heavy_min': 17.0, 'heavy_max': 21.0, 'bad_min': 20.0},
+    '福島': {'good_max': 15.0, 'slightly_min': 13.0, 'slightly_max': 17.0, 'heavy_min': 15.0, 'heavy_max': 19.0, 'bad_min': 17.0},
+    '新潟': {'good_max': 15.0, 'slightly_min': 13.0, 'slightly_max': 17.0, 'heavy_min': 15.0, 'heavy_max': 19.0, 'bad_min': 17.0},
+    '中山': {'good_max': 13.0, 'slightly_min': 11.0, 'slightly_max': 15.0, 'heavy_min': 14.0, 'heavy_max': 18.0, 'bad_min': 17.0},
+    '東京': {'good_max': 19.0, 'slightly_min': 17.0, 'slightly_max': 21.0, 'heavy_min': 18.0, 'heavy_max': 23.0, 'bad_min': 20.0},
+    '中京': {'good_max': 14.0, 'slightly_min': 12.0, 'slightly_max': 16.0, 'heavy_min': 14.0, 'heavy_max': 17.0, 'bad_min': 16.0},
+    '京都': {'good_max': 13.0, 'slightly_min': 11.0, 'slightly_max': 14.0, 'heavy_min': 13.0, 'heavy_max': 16.0, 'bad_min': 14.0},
+    '阪神': {'good_max': 14.0, 'slightly_min': 12.0, 'slightly_max': 16.0, 'heavy_min': 14.0, 'heavy_max': 18.0, 'bad_min': 16.0},
+    '小倉': {'good_max': 10.0, 'slightly_min': 8.0, 'slightly_max': 12.0, 'heavy_min': 10.0, 'heavy_max': 14.0, 'bad_min': 12.0},
+}
+
+DIRT_MOISTURE_REF = {
+    'good_max': 9.0,
+    'slightly_min': 7.0,
+    'slightly_max': 13.0,
+    'heavy_min': 11.0,
+    'heavy_max': 16.0,
+    'bad_min': 14.0,
+}
+
+
+COURSE_PROFILE_NEUTRAL = {
+    'style_bias': {'FRONT': 0.0, 'MIDDLE': 0.0, 'REAR': 0.0},
+    'straight': 0.50,
+    'corner': 0.50,
+    'stamina': 0.50,
+    'power': 0.50,
+    'speed': 0.50,
+    'gate': 0.50,
+    'agility': 0.50,
+}
+
+JRA_COURSE_PROFILE_DATA = {
+    '東京': {
+        'turf': {'style_bias': {'FRONT': -0.28, 'MIDDLE': 0.18, 'REAR': 0.78}, 'straight': 0.95, 'corner': 0.35, 'stamina': 0.62, 'power': 0.50, 'speed': 0.48, 'gate': 0.32, 'agility': 0.36},
+        'dirt': {'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.30, 'REAR': 0.12}, 'straight': 0.74, 'corner': 0.40, 'stamina': 0.58, 'power': 0.56, 'speed': 0.60, 'gate': 0.50, 'agility': 0.38},
+    },
+    '中山': {
+        'turf': {'style_bias': {'FRONT': 0.18, 'MIDDLE': 0.36, 'REAR': 0.08}, 'straight': 0.20, 'corner': 0.84, 'stamina': 0.88, 'power': 0.72, 'speed': 0.40, 'gate': 0.46, 'agility': 0.78},
+        'dirt': {'style_bias': {'FRONT': 0.26, 'MIDDLE': 0.30, 'REAR': -0.08}, 'straight': 0.18, 'corner': 0.78, 'stamina': 0.80, 'power': 0.74, 'speed': 0.48, 'gate': 0.54, 'agility': 0.70},
+    },
+    '阪神': {
+        'turf': {'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.26, 'REAR': 0.36}, 'straight': 0.72, 'corner': 0.60, 'stamina': 0.76, 'power': 0.74, 'speed': 0.46, 'gate': 0.40, 'agility': 0.58},
+        'dirt': {'style_bias': {'FRONT': 0.18, 'MIDDLE': 0.28, 'REAR': 0.00}, 'straight': 0.42, 'corner': 0.56, 'stamina': 0.72, 'power': 0.76, 'speed': 0.48, 'gate': 0.46, 'agility': 0.50},
+    },
+    '中京': {
+        'turf': {'style_bias': {'FRONT': -0.08, 'MIDDLE': 0.24, 'REAR': 0.52}, 'straight': 0.78, 'corner': 0.56, 'stamina': 0.82, 'power': 0.80, 'speed': 0.50, 'gate': 0.38, 'agility': 0.54},
+        'dirt': {'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.28, 'REAR': 0.18}, 'straight': 0.76, 'corner': 0.52, 'stamina': 0.78, 'power': 0.82, 'speed': 0.56, 'gate': 0.48, 'agility': 0.48},
+    },
+    '京都': {
+        'turf': {'style_bias': {'FRONT': 0.28, 'MIDDLE': 0.22, 'REAR': 0.10}, 'straight': 0.58, 'corner': 0.78, 'stamina': 0.54, 'power': 0.38, 'speed': 0.60, 'gate': 0.44, 'agility': 0.78},
+        'dirt': {'style_bias': {'FRONT': 0.22, 'MIDDLE': 0.28, 'REAR': 0.00}, 'straight': 0.36, 'corner': 0.62, 'stamina': 0.54, 'power': 0.44, 'speed': 0.72, 'gate': 0.52, 'agility': 0.58},
+    },
+    '新潟': {
+        'turf': {'style_bias': {'FRONT': -0.20, 'MIDDLE': 0.10, 'REAR': 0.88}, 'straight': 1.00, 'corner': 0.30, 'stamina': 0.52, 'power': 0.34, 'speed': 0.62, 'gate': 0.26, 'agility': 0.40},
+        'dirt': {'style_bias': {'FRONT': 0.28, 'MIDDLE': 0.20, 'REAR': -0.10}, 'straight': 0.48, 'corner': 0.40, 'stamina': 0.50, 'power': 0.44, 'speed': 0.66, 'gate': 0.52, 'agility': 0.42},
+    },
+    '福島': {
+        'turf': {'style_bias': {'FRONT': 0.16, 'MIDDLE': 0.28, 'REAR': 0.04}, 'straight': 0.18, 'corner': 0.84, 'stamina': 0.62, 'power': 0.60, 'speed': 0.44, 'gate': 0.42, 'agility': 0.80},
+        'dirt': {'style_bias': {'FRONT': 0.32, 'MIDDLE': 0.18, 'REAR': -0.18}, 'straight': 0.16, 'corner': 0.82, 'stamina': 0.58, 'power': 0.58, 'speed': 0.56, 'gate': 0.56, 'agility': 0.72},
+    },
+    '札幌': {
+        'turf': {'style_bias': {'FRONT': 0.18, 'MIDDLE': 0.34, 'REAR': -0.04}, 'straight': 0.10, 'corner': 0.86, 'stamina': 0.60, 'power': 0.72, 'speed': 0.46, 'gate': 0.36, 'agility': 0.82},
+        'dirt': {'style_bias': {'FRONT': 0.26, 'MIDDLE': 0.28, 'REAR': -0.16}, 'straight': 0.10, 'corner': 0.82, 'stamina': 0.56, 'power': 0.58, 'speed': 0.52, 'gate': 0.48, 'agility': 0.74},
+    },
+    '函館': {
+        'turf': {'style_bias': {'FRONT': 0.30, 'MIDDLE': 0.30, 'REAR': -0.24}, 'straight': 0.06, 'corner': 0.84, 'stamina': 0.68, 'power': 0.84, 'speed': 0.44, 'gate': 0.42, 'agility': 0.80},
+        'dirt': {'style_bias': {'FRONT': 0.34, 'MIDDLE': 0.24, 'REAR': -0.20}, 'straight': 0.08, 'corner': 0.80, 'stamina': 0.60, 'power': 0.72, 'speed': 0.54, 'gate': 0.50, 'agility': 0.72},
+    },
+    '小倉': {
+        'turf': {'style_bias': {'FRONT': 0.26, 'MIDDLE': 0.32, 'REAR': -0.10}, 'straight': 0.16, 'corner': 0.82, 'stamina': 0.58, 'power': 0.54, 'speed': 0.64, 'gate': 0.38, 'agility': 0.78},
+        'dirt': {'style_bias': {'FRONT': 0.34, 'MIDDLE': 0.20, 'REAR': -0.22}, 'straight': 0.14, 'corner': 0.80, 'stamina': 0.52, 'power': 0.50, 'speed': 0.70, 'gate': 0.50, 'agility': 0.74},
+    },
+}
+
+
+def _normalize_racecourse_name(name: Optional[str]) -> str:
+    """競馬場名をJRA10場の標準名へ正規化する。"""
+    s = str(name or '').strip().replace('競馬場', '')
+    for k in JRA_COURSE_PROFILE_DATA.keys():
+        if k and (k in s):
+            return k
+    return ''
+
+
+
+def _course_profile_distance_bucket(dist: float) -> str:
+    """距離(m)を大まかなコース特性バケットへ変換する。"""
+    if not np.isfinite(dist):
+        return 'unknown'
+    if dist <= 1400:
+        return 'sprint'
+    if dist <= 1800:
+        return 'mile'
+    if dist <= 2400:
+        return 'middle'
+    return 'long'
+
+
+
+def _course_profile_adjust(profile: Dict[str, object], key: str, delta: float) -> None:
+    """0-1スケールのコースプロファイル要素を安全に補正する。"""
+    try:
+        profile[key] = clamp(float(profile.get(key, 0.5) or 0.5) + float(delta), 0.0, 1.0)
+    except Exception:
+        pass
+
+
+
+def _course_style_adjust(profile: Dict[str, object], label: str, delta: float) -> None:
+    """脚質バイアスを安全に補正する。"""
+    try:
+        sb = dict(profile.get('style_bias', {}) or {})
+        sb[label] = clamp(float(sb.get(label, 0.0) or 0.0) + float(delta), -1.0, 1.0)
+        profile['style_bias'] = sb
+    except Exception:
+        pass
+
+
+
+def _resolve_course_profile(meta: Dict[str, str]) -> tuple[str, str, dict]:
+    """metaから競馬場・馬場種別に応じたコースプロファイルを返す。"""
+    meta = meta or {}
+    venue = ''
+    for k in ['racecourse_inferred', 'venue', 'racecourse', 'place_name', 'track_name', 'race', 'course_info']:
+        venue = _normalize_racecourse_name(meta.get(k, ''))
+        if venue:
+            break
+    if not venue:
+        venue = _normalize_racecourse_name(infer_racecourse_from_meta(meta) or '')
+
+    dist, surface = _meta_distance_surface(meta)
+    profile = dict(COURSE_PROFILE_NEUTRAL)
+    profile['style_bias'] = dict(COURSE_PROFILE_NEUTRAL.get('style_bias', {}) or {})
+
+    raw = ((JRA_COURSE_PROFILE_DATA.get(venue, {}) or {}).get(surface, {}) or {}) if venue else {}
+    for k, v in raw.items():
+        if k == 'style_bias':
+            sb = dict(profile.get('style_bias', {}) or {})
+            sb.update(dict(v or {}))
+            profile['style_bias'] = sb
+        else:
+            try:
+                profile[k] = float(v)
+            except Exception:
+                profile[k] = v
+
+    bucket = _course_profile_distance_bucket(dist)
+    if venue == '東京' and surface == 'turf' and bucket in {'mile', 'middle', 'long'}:
+        _course_profile_adjust(profile, 'straight', 0.05)
+        _course_style_adjust(profile, 'REAR', 0.06)
+    elif venue == '中山' and surface == 'turf' and bucket in {'mile', 'middle', 'long'}:
+        _course_profile_adjust(profile, 'stamina', 0.08)
+        _course_profile_adjust(profile, 'corner', 0.06)
+    elif venue == '阪神' and surface == 'turf':
+        if bucket in {'mile', 'middle', 'long'}:
+            _course_profile_adjust(profile, 'straight', 0.08)
+            _course_style_adjust(profile, 'REAR', 0.05)
+        else:
+            _course_profile_adjust(profile, 'corner', 0.06)
+            _course_profile_adjust(profile, 'agility', 0.05)
+            _course_style_adjust(profile, 'FRONT', 0.08)
+    elif venue == '京都' and surface == 'turf':
+        if bucket in {'sprint', 'mile'}:
+            _course_profile_adjust(profile, 'corner', 0.08)
+            _course_profile_adjust(profile, 'agility', 0.08)
+            _course_style_adjust(profile, 'FRONT', 0.08)
+        else:
+            _course_profile_adjust(profile, 'straight', 0.05)
+            _course_style_adjust(profile, 'REAR', 0.05)
+    elif venue == '新潟' and surface == 'turf' and bucket in {'mile', 'middle', 'long'}:
+        _course_profile_adjust(profile, 'straight', 0.10)
+        _course_style_adjust(profile, 'REAR', 0.06)
+    elif venue == '小倉' and surface == 'turf' and bucket in {'middle', 'long'}:
+        _course_profile_adjust(profile, 'corner', 0.05)
+        _course_style_adjust(profile, 'MIDDLE', 0.06)
+        _course_style_adjust(profile, 'REAR', 0.03)
+    elif venue in {'札幌', '函館'} and surface == 'turf':
+        _course_profile_adjust(profile, 'power', 0.06)
+        _course_profile_adjust(profile, 'agility', 0.04)
+    elif venue == '福島' and surface == 'turf':
+        _course_profile_adjust(profile, 'corner', 0.04)
+        _course_style_adjust(profile, 'MIDDLE', 0.04)
+
+    return venue, surface, profile
+
+
+
+def enrich_meta_with_course_profile(meta: Dict[str, str]) -> Dict[str, str]:
+    """metaへ競馬場コース特性の補助データを付与する。"""
+    meta = dict(meta or {})
+    venue, surface, profile = _resolve_course_profile(meta)
+    if venue:
+        meta['course_profile_venue'] = venue
+        meta.setdefault('venue', venue)
+    if surface:
+        meta['course_profile_surface'] = surface
+    if venue and surface:
+        meta['course_profile_key'] = f'{venue}_{surface}'
+    try:
+        sb = dict(profile.get('style_bias', {}) or {})
+        meta['course_profile_style_bias'] = 'F={:.2f},M={:.2f},R={:.2f}'.format(
+            float(sb.get('FRONT', 0.0) or 0.0),
+            float(sb.get('MIDDLE', 0.0) or 0.0),
+            float(sb.get('REAR', 0.0) or 0.0),
+        )
+        for k in ['straight', 'corner', 'stamina', 'power', 'speed', 'gate', 'agility']:
+            meta[f'course_profile_{k}'] = f"{float(profile.get(k, 0.5) or 0.5):.2f}"
+    except Exception:
+        pass
+    return meta
+
+
+
+def infer_racecourse_from_meta(meta: Dict[str, str]) -> Optional[str]:
+    """meta内の文字列から競馬場名を推定。
+
+    参照順:
+    - meta['venue']
+    - meta['race']
+    - meta['course_info']
+
+    NOTE: 失敗した場合は None。
+    """
+    hay = ' '.join([
+        str(meta.get('venue', '') or ''),
+        str(meta.get('race', '') or ''),
+        str(meta.get('course_info', '') or ''),
+        str(meta.get('racecourse', '') or ''),
+        str(meta.get('place_name', '') or ''),
+    ])
+    hay = hay.replace('競馬場', '')
+    for k in JRA_COURSE_PROFILE_DATA.keys():
+        if k and (k in hay):
+            return k
+    return None
+
+
+def moisture_to_wetness_score_by_ref(moisture_pct: Optional[float], ref: Dict[str, float]) -> Optional[float]:
+    """JRA早見表レンジ(参考)を使い、含水率→濡れスコア(0-100)へ正規化。
+
+    - 0  : 良の上限（good_max）以下
+    - 100: 不良の下限（bad_min）以上
+
+    NOTE: Turfは競馬場ごとにレンジが違うため、このスコアは特徴量としてのみ利用する。
+    """
+    if moisture_pct is None or (not np.isfinite(float(moisture_pct))):
+        return None
+    lo = float(ref.get('good_max', 0.0))
+    hi = float(ref.get('bad_min', lo + 1.0))
+    if hi <= lo:
+        return 0.0
+    return clamp((float(moisture_pct) - lo) / (hi - lo) * 100.0, 0.0, 100.0)
+
+
+def estimate_going_from_moisture(moisture_pct: Optional[float], ref: Dict[str, float]) -> Optional[str]:
+    """JRAの早見表レンジ(参考)から、含水率→馬場状態を推定。
+
+    IMPORTANT:
+    - JRA公式にもある通り、馬場状態は含水率で自動決定ではない。
+      ここでの推定は、OCR値欠損時の補助/監査用。
+    """
+    if moisture_pct is None or (not np.isfinite(float(moisture_pct))):
+        return None
+    x = float(moisture_pct)
+    if x >= float(ref.get('bad_min', 1e9)):
+        return '不良'
+    if x >= float(ref.get('heavy_min', 1e9)):
+        return '重'
+    if x >= float(ref.get('slightly_min', 1e9)):
+        return '稍重'
+    return '良'
+
+
+def enrich_meta_with_jra_moisture_refs(meta: Dict[str, str]) -> Dict[str, str]:
+    """metaに含水率がある場合、JRA早見表(参考)で補助特徴量を追加。
+
+    追加するもの:
+    - racecourse_inferred: 札幌/函館/... の推定（取れない場合は空）
+    - turf_going_est / dirt_going_est: 含水率からの推定（goingが既にあれば出しても上書きしない）
+    - wetness_score_*: 早見表レンジ由来のスコア（既存があっても上書き）
+
+    NOTE:
+    - wet_mode判定などで使うのは「特徴量としてのwetness_score」であり、
+      going自体（芝/ダの良稍重重不良）はOCRで取れたものが最優先。
+    """
+    meta = dict(meta or {})
+
+    rc = infer_racecourse_from_meta(meta)
+    if rc:
+        meta['racecourse_inferred'] = rc
+
+    # --- turf ---
+    turf_ref = TURF_MOISTURE_REF.get(rc) if rc else None
+    # fallback: if unknown, pick a moderate default (Tokyo-like) to avoid extreme scaling
+    if turf_ref is None:
+        turf_ref = TURF_MOISTURE_REF.get('東京')
+
+    # --- dirt (common) ---
+    dirt_ref = DIRT_MOISTURE_REF
+
+    def _get_float(k: str) -> Optional[float]:
+        """メタデータ辞書からキー k の値を float に変換する。無効・有限外の場合は None を返す。"""
+        try:
+            v = float(str(meta.get(k, '')).replace('%','').strip())
+            return v if np.isfinite(v) else None
+        except Exception:
+            return None
+
+    # compute wetness scores from moisture (JRA ref)
+    for k, ref in [
+        ('moisture_turf_goal', turf_ref),
+        ('moisture_turf_4c', turf_ref),
+        ('moisture_dirt_goal', dirt_ref),
+        ('moisture_dirt_4c', dirt_ref),
+    ]:
+        v = _get_float(k)
+        if v is None:
+            continue
+        meta[k] = f'{v:.1f}'
+        ws = moisture_to_wetness_score_by_ref(v, ref)
+        if ws is not None:
+            meta[k.replace('moisture_', 'wetness_score_')] = f'{float(ws):.1f}'
+
+    # going estimation (only if OCR going missing)
+    if ('turf_going' not in meta) or (str(meta.get('turf_going','')).strip() == ''):
+        v = _get_float('moisture_turf_goal') or _get_float('moisture_turf_4c')
+        ge = estimate_going_from_moisture(v, turf_ref) if v is not None else None
+        if ge:
+            meta['turf_going_est'] = ge
+
+    if ('dirt_going' not in meta) or (str(meta.get('dirt_going','')).strip() == ''):
+        v = _get_float('moisture_dirt_goal') or _get_float('moisture_dirt_4c')
+        ge = estimate_going_from_moisture(v, dirt_ref) if v is not None else None
+        if ge:
+            meta['dirt_going_est'] = ge
+
+    return meta
+
+
+def parse_track_conditions_text(txt: str) -> Dict[str, str]:
+    """複数スクショのOCR全文から、馬場関連のキーを抽出（テキストベース）。
+
+    ※OCRの揺れが大きいので、単発regexに依存しすぎないようにする。
+    """
+    s = str(txt)
+    out: Dict[str, str] = {}
+
+    # 天候
+    m = re.search(r"天候\s*[:：]?\s*(晴|曇|雨|雪)", s)
+    if m:
+        out["weather"] = m.group(1)
+
+    # 馬場状態（芝/ダ）: OCR誤読（相重など）も吸収
+    def _norm_going(g: str) -> str:
+        """馬場状態文字列を統一表記に正規化する（例: '稍' → '稍重'）。"""
+        g = str(g).strip()
+        g = g.replace("相重", "稍重")
+        if g == "稍":
+            g = "稍重"
+        return g
+
+    m = re.search(r"芝\s*[:：]?\s*(良|稍重|相重|稍|重|不良)", s)
+    if m:
+        out["turf_going"] = _norm_going(m.group(1))
+
+    m = re.search(r"(ダート|ダ)\s*[:：]?\s*(良|稍重|相重|稍|重|不良)", s)
+    if m:
+        out["dirt_going"] = _norm_going(m.group(2))
+
+    # ラベル無しパターン（例: "天候 : 晴  相重  重" のように2つ並ぶ）
+    if "turf_going" not in out or "dirt_going" not in out:
+        mm = re.search(r"天候\s*[:：]?\s*(晴|曇|雨|雪)\s+([良稍重相重稍重不良]{1,3})\s+([良稍重相重稍重不良]{1,3})", s)
+        if mm:
+            # 2つ目=芝, 3つ目=ダ の前提（JRAの表示に合わせる）
+            out.setdefault("turf_going", _norm_going(mm.group(2)))
+            out.setdefault("dirt_going", _norm_going(mm.group(3)))
+
+    # クッション値: 直後に複数数字が出ることがあるため「6〜12」優先で選ぶ
+    if "クッション" in s:
+        idx = s.find("クッション")
+        win = s[max(0, idx - 40) : idx + 80]
+        nums = re.findall(r"([0-9]+(?:\.[0-9]+)?)", win)
+        cands: List[float] = []
+        for x in nums:
+            try:
+                cands.append(float(x))
+            except Exception:
+                pass
+        picked = None
+        in_range = [v for v in cands if 6.0 <= v <= 12.0]
+        # prefer a decimal value (OCRで 8.8 のようなケース)
+        decs = [v for v in in_range if abs(v - round(v)) > 1e-6]
+        if decs:
+            picked = decs[0]
+        elif in_range:
+            picked = in_range[0]
+        elif cands:
+            picked = cands[0]
+        if picked is not None:
+            out["cushion_value"] = f"{picked:.1f}" if abs(picked - round(picked)) > 1e-6 else str(int(round(picked)))
+
+    # 含水率（ゴール前/4コーナー）
+    def _moist(key: str, pat: str) -> float:
+        """文字列 s に対して pat の正規表現を探し、マッチ時に out[key] へ格納する。"""
+        mm = re.search(pat, s)
+        if mm:
+            out[key] = mm.group(1)
+
+    # 直接表記（最優先）
+    _moist("moisture_turf_goal", r"芝\s*ゴール前\s*([0-9]+(?:\.[0-9]+)?)%")
+    _moist("moisture_turf_4c", r"芝\s*4コーナー\s*([0-9]+(?:\.[0-9]+)?)%")
+    _moist("moisture_dirt_goal", r"(ダート|ダ)\s*ゴール前\s*([0-9]+(?:\.[0-9]+)?)%")
+    if "moisture_dirt_goal" in out:
+        # 上のパターンはgroup(2)が数値なので補正
+        out["moisture_dirt_goal"] = re.search(r"([0-9]+(?:\.[0-9]+)?)", out["moisture_dirt_goal"]).group(1)
+    _moist("moisture_dirt_4c", r"(ダート|ダ)\s*4コーナー\s*([0-9]+(?:\.[0-9]+)?)%")
+    if "moisture_dirt_4c" in out:
+        out["moisture_dirt_4c"] = re.search(r"([0-9]+(?:\.[0-9]+)?)", out["moisture_dirt_4c"]).group(1)
+
+    # 使用コース
+    m = re.search(r"(A|B|C)コース", s)
+    if m:
+        out["rail_course"] = m.group(1)
+
+    # 内柵の移動（例: 内柵3m）
+    m = re.search(r"内柵\s*([0-9]+(?:\.[0-9]+)?)\s*m", s)
+    if m:
+        out["rail_offset_m_text"] = m.group(1)
+
+    # 内側傷み
+    if re.search(r"内側に傷み", s):
+        out["inside_damage"] = "1"
+
+    # 芝丈（表記ゆれ対応）
+    m = re.search(r"野芝\s*([0-9]+)\s*(?:から|〜|～|\-|—|‐)\s*([0-9]+)", s)
+    if m:
+        out["grass_nosh_cm"] = f"{m.group(1)}-{m.group(2)}"
+    m = re.search(r"洋芝\s*([0-9]+)\s*(?:から|〜|～|\-|—|‐)\s*([0-9]+)", s)
+    if m:
+        out["grass_yosh_cm"] = f"{m.group(1)}-{m.group(2)}"
+
+    return out
+
+
+def ocr_track_images(track_img_paths: List[str], lang: str = "jpn") -> Dict[str, str]:
+    """馬場スクショ群から『数値化した特徴量』をmetaに詰める。
+
+    返す値は meta 辞書にそのまま merge できる形。
+    - *_score は 0-100
+    - *_pct は % 実数（文字列ではなく数値にしたいが、metaはdict[str,str]前提のため文字列）
+    """
+    if not track_img_paths:
+        return {}
+
+    texts = []
+    for p in track_img_paths:
+        try:
+            pil = Image.open(p)
+            img = preprocess_for_ocr(pil)
+            t = pytesseract.image_to_string(img, lang=lang, config="--psm 6")
+            texts.append(t)
+        except Exception:
+            pass
+
+    joined = "\n".join(texts)
+    raw = parse_track_conditions_text(joined)
+
+    # numeric conversions
+    out: Dict[str, str] = dict(raw)
+
+    # goings -> firmness score
+    if "turf_going" in raw:
+        v = going_to_firmness_score(raw["turf_going"])
+        if v is not None:
+            out["turf_firmness_score"] = f"{v:.1f}"
+
+    if "dirt_going" in raw:
+        v = going_to_firmness_score(raw["dirt_going"])
+        if v is not None:
+            out["dirt_firmness_score"] = f"{v:.1f}"
+
+    # cushion
+    cv = _safe_float(raw.get("cushion_value", "")) if "cushion_value" in raw else None
+    if cv is not None:
+        out["cushion_score"] = f"{cushion_to_score(cv):.1f}"
+
+    # moisture -> wetness score
+    for k in ["moisture_turf_goal", "moisture_turf_4c", "moisture_dirt_goal", "moisture_dirt_4c"]:
+        v = _safe_float(raw.get(k, ""))
+        if v is None:
+            continue
+        out[k] = f"{v:.1f}"
+        out[k.replace("moisture_", "wetness_score_")] = f"{moisture_to_wetness_score(v):.1f}"
+
+    # inside damage score (0/1 -> 100/80)
+    inside_damage = int(str(raw.get("inside_damage", "0")) == "1")
+    out["inside_damage"] = str(inside_damage)
+    out["inside_quality_score"] = f"{(80.0 if inside_damage else 100.0):.1f}"
+
+    # rail course -> numeric offset meter
+    # Bコース（Aから3m外）と画像に出る想定。Cも便宜上 +6m とする。
+    rail = raw.get("rail_course", "")
+    out["rail_course"] = rail
+    rail_offset = {"A": 0.0, "B": 3.0, "C": 6.0}.get(rail)
+    if rail_offset is not None:
+        out["rail_offset_m"] = f"{rail_offset:.1f}"
+
+    return out
+
+
+
+
+# =========================
+# keibabook 調教 OCR (multi-image) + scoring (v1)
+# - 全体時計(4F) + 終い(3F/1F) の両方を相対評価で使用
+# - 市場データ（市場等）は一切使用しない
+# =========================
+
+def _fw_to_hw_digits(text: str) -> str:
+    """全角数字や記号を半角へ寄せる（OCR揺れ対策）。"""
+    if text is None:
+        return ''
+    tbl = str.maketrans({
+        '０':'0','１':'1','２':'2','３':'3','４':'4','５':'5','６':'6','７':'7','８':'8','９':'9',
+        '．':'.','。':'.','，':',','－':'-','ー':'-'
+    })
+    return str(text).translate(tbl)
+
+
+def _merge_training_ocr_results(results: list) -> dict:
+    """複数ページOCR結果を統合。馬番ごとに works を結合し重複除去する。"""
+    out = {'horses': {}, 'meta': {'pages': 0, 'rows': 0}}
+    for r in list(results or []):
+        if not isinstance(r, dict):
+            continue
+        out['meta']['pages'] += 1
+        horses = r.get('horses', {}) or {}
+        for num, ent in horses.items():
+            num = str(num)
+            if num not in out['horses']:
+                out['horses'][num] = {'name': ent.get('name',''), 'works': []}
+            out['horses'][num]['works'].extend(list(ent.get('works', []) or []))
+
+    # de-dup works by (date, t4, t3, t1)
+    for num, ent in (out.get('horses', {}) or {}).items():
+        uniq = []
+        seen = set()
+        for w in ent.get('works', []) or []:
+            try:
+                k = (str(w.get('date','')), float(w.get('t4', float('nan'))), float(w.get('t3', float('nan'))), float(w.get('t1', float('nan'))))
+            except Exception:
+                k = (str(w.get('date','')), str(w.get('t4','')), str(w.get('t3','')), str(w.get('t1','')))
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(w)
+        ent['works'] = uniq
+        out['meta']['rows'] += len(uniq)
+
+    return out
+
+
+def _ocr_kb_crop(pil) -> object:
+    """keibabook OCR 用に画像の UI 余白をクロップして返す。失敗時は元画像をそのまま返す。"""
+    try:
+        w, h = pil.size
+        left   = int(w * 0.00)
+        right  = int(w * 1.00)
+        top    = int(h * 0.12)
+        bottom = int(h * (1.0 - 0.06))
+        if right > left and bottom > top:
+            return pil.crop((left, top, right, bottom))
+    except Exception:
+        pass
+    return pil
+
+
+def _ocr_kb_patterns() -> dict:
+    """keibabook OCR 用の正規表現パターン辞書を返す。"""
+    import re as _re
+    return {
+        'slope4': _re.compile(
+            r'(\d{2,3}\.\d)\s+(\d{2}\.\d)\s+(\d{2}\.\d)\s+(\d{2}\.\d)'
+        ),
+        'wcw5': _re.compile(
+            r'(\d{2,3}\.\d)\s+(\d{2}\.\d)\s+(\d{2}\.\d)\s+(\d{2}\.\d)\s+(\d{2}\.\d)(?:\s+\[(\d)\])?'
+        ),
+        'f7': _re.compile(
+            r'7F\s+(\d{2,3}\.\d)\s+(\d{2}\.\d)\s+(\d{2}\.\d)\s+(\d{2}\.\d)\s+(\d{2}\.\d)(?:\s+\[(\d)\])?'
+        ),
+        'horse_hdr': _re.compile(
+            r'^(\d{1,2})\s+(\d{1,2})\s+(\S+)'
+        ),
+        'date': _re.compile(r'(\d{1,2})[/\-](\d{1,2})'),
+    }
+
+def ocr_training_keibabook_v1(image_path: str, lang: str = 'jpn+eng') -> dict:
+    """keibabook調教スクショから馬番ごとの時計を抽出（坂路4点 + W/CW 5点 + 7F対応）。
+
+    対応フォーマット（例）:
+    - 坂路: 55.5 39.9 25.6 12.6  -> (t4,t3,t2,t1)
+    - W/CW: 83.1 66.7 52.0 37.0 11.9 [5] -> (t6,t5,t4,t3,t1) ※t2なし
+    - 7F : 7F 98.2 66.5 51.9 37.2 12.3 [4] -> (t7,t5,t4,t3,t1) ※t2なし
+
+    返却 works は scoring 側で使う (t4,t3,t1) を必ず埋める設計。
+    サブ関数: _ocr_kb_crop / _ocr_kb_patterns
+    """
+    if not image_path:
+        return {'horses': {}, 'meta': {'warn': 'no_image'}}
+
+    try:
+        pil = Image.open(image_path)
+    except Exception as e:
+        return {'horses': {}, 'meta': {'warn': f'open_failed:{e}'}}
+
+    # crop UI parts
+    pil = _ocr_kb_crop(pil)
+
+    try:
+        raw = pytesseract.image_to_string(pil, lang=lang)
+    except Exception as e:
+        return {'horses': {}, 'meta': {'warn': f'ocr_failed:{e}'}}
+
+    raw_lines = raw.splitlines()
+    patterns  = _ocr_kb_patterns()
+    pat_slope = patterns['slope4']
+    pat_wcw   = patterns['wcw5']
+    pat_7f    = patterns['f7']
+    pat_horse = patterns['horse_hdr']
+    pat_date  = patterns['date']
+
+    horses = {}
+    current = None
+    fmt     = 'unknown'
+
+    def _join_if_needed(i, raw_lines) -> str:
+        """7F / W/CW が行分割された場合に次行を結合して返す。"""
+        ln = raw_lines[i]
+        if '7F' in ln and len(re.findall(r'\d+\.\d', ln)) < 5:
+            if i + 1 < len(raw_lines):
+                ln = ln.rstrip() + ' ' + raw_lines[i+1].strip()
+        elif any(t in ln for t in ['W','CW']) and len(re.findall(r'\d+\.\d', ln)) == 4:
+            if i + 1 < len(raw_lines):
+                ln = ln.rstrip() + ' ' + raw_lines[i+1].strip()
+        return ln
+
+    for idx, _raw_ln in enumerate(raw_lines):
+        ln = _join_if_needed(idx, raw_lines)
+
+        # detect horse header
+        mh = pat_horse.match(ln.strip())
+        if mh:
+            frame_n = mh.group(1)
+            horse_n = mh.group(2)
+            current = horse_n
+            fmt     = 'unknown'
+            if current not in horses:
+                horses[current] = {'works': [], 'frame': frame_n}
+            continue
+
+        if current is None:
+            continue
+
+        # date guess
+        md = pat_date.search(ln)
+        date_str = f"{md.group(1)}/{md.group(2)}" if md else ''
+
+        # parse clock line
+        work = None
+        m7f = pat_7f.search(ln)
+        if m7f:
+            t7,t5,t4,t3,t1 = [float(m7f.group(k)) for k in range(1,6)]
+            rank = int(m7f.group(6)) if m7f.group(6) else None
+            work = {'fmt':'7F','t7':t7,'t5':t5,'t4':t4,'t3':t3,'t1':t1,'rank':rank,'date':date_str}
+            fmt  = '7F'
+        else:
+            mw = pat_wcw.search(ln)
+            if mw:
+                t6,t5,t4,t3,t1 = [float(mw.group(k)) for k in range(1,6)]
+                rank = int(mw.group(6)) if mw.group(6) else None
+                work = {'fmt':'W5','t6':t6,'t5':t5,'t4':t4,'t3':t3,'t1':t1,'rank':rank,'date':date_str}
+                fmt  = 'W5'
+            else:
+                ms = pat_slope.search(ln)
+                if ms:
+                    t4_,t3_,t2_,t1_ = [float(ms.group(k)) for k in range(1,5)]
+                    work = {'fmt':'SLOPE4','t4':t4_,'t3':t3_,'t2':t2_,'t1':t1_,'rank':None,'date':date_str}
+                    fmt  = 'SLOPE4'
+
+        if work is None:
+            continue
+
+        # fill t4/t3/t1 for uniform downstream scoring
+        work.setdefault('t4', work.get('t4', None))
+        work.setdefault('t3', work.get('t3', None))
+        work.setdefault('t1', work.get('t1', None))
+
+        # extract tags for quantitative scoring
+        course = 'W' if fmt in ('W5','7F') else 'SLOPE'
+        load_m = re.search(r'\b(5[456789]|6[0-9])\b', ln)
+        load   = float(load_m.group(0)) if load_m else None
+        pair_m = re.search(r'(一[緒同]|併せ|併走)', ln)
+        pair   = pair_m.group(0) if pair_m else ''
+
+        horses[current]['works'].append({
+            'fmt': fmt,
+            'course': course,
+            'load': load,
+            'pair': pair,
+            'raw': ln[:180],
+            **{k: v for k, v in work.items() if k not in ('fmt',)},
+        })
+
+    return {'horses': horses, 'meta': {'lines': len(raw_lines), 'crop': '0.12/0.06'}}
+
+def ocr_training_keibabook_v1_cached(img_path: str, lang: str, cache_dir: Optional[str], force: bool = False) -> dict:
+    """調教ページ画像を OCR しキャッシュ付きで調教データ dict を返す。"""
+    key = _ocr_cache_key('training_keibabook', img_path, lang)
+    if (not force):
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, dict) and len(hit):
+            return hit
+    obj = ocr_training_keibabook_v1(img_path, lang=lang)
+    _ocr_cache_save_json(cache_dir, key, obj)
+    return obj
+
+
+def _robust_z_from_series(x: pd.Series) -> pd.Series:
+    """IQR ベースのロバスト z スコアを計算する。IQR が微小な場合は 0 を返す。"""
+    x = _num_series(x, index=getattr(x, 'index', None))
+    med = float(np.nanmedian(x.values))
+    q1 = float(np.nanpercentile(x.values, 25))
+    q3 = float(np.nanpercentile(x.values, 75))
+    iqr = float(q3 - q1)
+    if not (iqr > 1e-6):
+        return pd.Series(np.zeros(len(x)), index=x.index)
+    return (med - x) / iqr
+
+
+def _kbs_raw_workout_score(work: dict, w4: float, w3: float, w1: float) -> float:
+    """単回調教 (work dict) の生スコア（0-100基準）を計算して返す。"""
+    t4 = work.get('t4') or work.get('t7') or work.get('t6')
+    t3 = work.get('t3')
+    t1 = work.get('t1')
+    if t4 is None or t3 is None or t1 is None:
+        return float('nan')
+    try:
+        # lower is faster; invert to higher=better; anchor at typical baseline
+        base = w4 * (55.0 - float(t4)) + w3 * (40.0 - float(t3)) + w1 * (12.5 - float(t1))
+        return base
+    except Exception:
+        return float('nan')
+
+
+def _kbs_course_normalize(dfa, tr: dict) -> object:
+    """コース別ロバスト正規化を dfa に適用して 'WorkoutScore_latest' を更新する。"""
+    import numpy as np
+    import pandas as pd
+    try:
+        for course_val in dfa['course_latest'].unique():
+            mask = dfa['course_latest'] == course_val
+            sub  = _num_series(dfa.loc[mask, 'WorkoutScore_latest'], index=dfa.loc[mask].index)
+            med  = float(sub.median()) if len(sub) >= 3 else float(sub.mean())
+            iqr  = float(sub.quantile(0.75) - sub.quantile(0.25)) if len(sub) >= 3 else 1.0
+            iqr  = max(iqr, 1.0)
+            dfa.loc[mask, 'WorkoutScore_latest'] = ((sub - med) / iqr * 10 + 50).clip(0, 100)
+    except Exception:
+        pass
+    return dfa
+
+
+def _kbs_shape_score(dfa) -> object:
+    """坂路（加速形）と W/CW（3F配分）の形スコアを計算して dfa に追加する。"""
+    import numpy as np
+    import pandas as pd
+    try:
+        # 坂路: lap復元 (t4,t3,t2,t1 → lap4..lap1)
+        for c in ['t4_latest','t3_latest','t2_latest','t1_latest']:
+            if c not in dfa.columns:
+                dfa[c] = np.nan
+        t4 = _num_series(dfa['t4_latest'], index=dfa.index)
+        t3 = _num_series(dfa['t3_latest'], index=dfa.index)
+        t1 = _num_series(dfa['t1_latest'], index=dfa.index)
+        lap1 = t1
+        lap3 = t3 - t1
+        lap4 = t4 - t3
+        # 坂路: 加速（lap3→lap1で速くなるほど良い）
+        accel_last  = (lap3 - lap1).clip(lower=-5.0, upper=5.0)
+        accel_count = ((lap4 > lap3).astype(float) + (lap3 > lap1).astype(float))
+        dfa['shape_latest'] = (accel_last * 0.7 + accel_count * 0.3).fillna(0.0)
+    except Exception:
+        dfa['shape_latest'] = 0.0
+    return dfa
+
+def compute_training_scores_keibabook(entries: pd.DataFrame, ocr_all: dict, params: Optional[dict] = None) -> pd.DataFrame:
+    """entries(num) と keibabook OCR結果(horses) から TrainingScore(0-100) と delta_train を算出。
+
+    サブ関数: _kbs_raw_workout_score / _kbs_course_normalize / _kbs_shape_score
+    """
+    import numpy as np
+    params = params or DEFAULT_PARAMS
+    tr = (params.get('training_rules', {}) or {})
+
+    max_works = int(tr.get('max_works', 3) or 3)
+    w_recent = list(tr.get('recent_weights', [0.55, 0.30, 0.15]) or [0.55, 0.30, 0.15])
+    w_recent = [float(x) for x in w_recent[:max_works]]
+    sw = sum(w_recent) if sum(w_recent) > 0 else 1.0
+    w_recent = [x / sw for x in w_recent]
+
+    w4 = float(tr.get('w_t4', 0.55) or 0.55)
+    w3 = float(tr.get('w_t3', 0.27) or 0.27)
+    w1 = float(tr.get('w_t1', 0.18) or 0.18)
+
+    delta_scale = float(tr.get('delta_scale', 0.08) or 0.08)
+    delta_cap   = float(tr.get('delta_cap', 3.0) or 3.0)
+
+    horses = (ocr_all or {}).get('horses', {}) or {}
+
+    rows = []
+    for _, row in entries.iterrows():
+        num = str(row.get('num', ''))
+        works = horses.get(num, {}).get('works', []) if num in horses else []
+        works = works[:max_works]
+
+        raw_scores = [_kbs_raw_workout_score(w, w4, w3, w1) for w in works]
+        raw_scores = [s for s in raw_scores if s == s]  # drop NaN
+
+        if not raw_scores:
+            rows.append({'num': num, 'WorkoutScore_latest': np.nan,
+                         't4_latest': np.nan, 't3_latest': np.nan, 't1_latest': np.nan,
+                         'shape_latest': 0.0, 'course_latest': '',
+                         'load_latest': np.nan, 'pair_latest': '',
+                         'TrainingScore': 50.0, 'delta_train': 0.0, 'TrainingRank': 999})
+            continue
+
+        blended = sum(s * w for s, w in zip(raw_scores, w_recent[:len(raw_scores)]))
+        latest  = works[0] if works else {}
+        rows.append({
+            'num': num,
+            'WorkoutScore_latest': blended,
+            't4_latest': latest.get('t4', np.nan),
+            't3_latest': latest.get('t3', np.nan),
+            't1_latest': latest.get('t1', np.nan),
+            'course_latest': latest.get('course', ''),
+            'load_latest':   latest.get('load', np.nan),
+            'pair_latest':   latest.get('pair', ''),
+            'shape_latest': 0.0,
+        })
+
+    if not rows:
+        return entries[['num']].copy()
+
+    dfa = pd.DataFrame(rows)
+
+    # course normalization
+    dfa = _kbs_course_normalize(dfa, tr)
+
+    # shape score
+    dfa = _kbs_shape_score(dfa)
+
+    # 負荷差・併せ差ボーナス
+    try:
+        load_bonus = (_num_series(dfa['load_latest'], index=dfa.index) - 55.0).clip(-2, 3) * 0.5
+        pair_bonus = dfa['pair_latest'].apply(lambda p: 1.5 if str(p).strip() else 0.0)
+        dfa['WorkoutScore_latest'] = (dfa['WorkoutScore_latest'] + load_bonus + pair_bonus).clip(0, 100)
+    except Exception:
+        pass
+
+    # 全体TrainingScore
+    try:
+        dfa['TrainingScore'] = (
+            0.70 * _num_series(dfa['WorkoutScore_latest'], 50.0, index=dfa.index)
+            + 0.30 * (_num_series(dfa['shape_latest'], 0.0, index=dfa.index) * 10 + 50).clip(0, 100)
+        ).clip(0, 100)
+    except Exception:
+        dfa['TrainingScore'] = 50.0
+
+    # delta (最新 vs 直前)
+    try:
+        dfa['delta_train'] = 0.0
+    except Exception:
+        pass
+
+    # rank
+    try:
+        dfa['TrainingRank'] = _num_series(_num_series(dfa['TrainingScore'], index=dfa.index).rank(method='min', ascending=False), 999, index=dfa.index, dtype=int)
+    except Exception:
+        dfa['TrainingRank'] = 999
+
+    out_cols = ['num','TrainingScore','TrainingRank','delta_train','WorkoutScore_latest',
+                't4_latest','t3_latest','t1_latest','shape_latest',
+                'course_latest','load_latest','pair_latest']
+    return dfa[[c for c in out_cols if c in dfa.columns]]
+
+
+# =========================
+# Heatmap -> map_summary(F/M/R)
+# =========================
+
+def _default_heatmap_roi(img: np.ndarray) -> Tuple[int, int, int, int]:
+    """Fallback ROI (x1,y1,x2,y2) as ratios for typical smartphone screenshots."""
+    h, w = img.shape[:2]
+    x1 = int(w * 0.07)
+    x2 = int(w * 0.93)
+    y1 = int(h * 0.33)
+    y2 = int(h * 0.70)
+    return x1, y1, x2, y2
+
+
+def detect_heatmap_roi(img: np.ndarray) -> Tuple[int, int, int, int]:
+    """Detect heatmap region by saturation mask; fallback to default ROI."""
+    h, w = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    # colored region tends to have higher saturation
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    mask = ((sat > 35) & (val > 40)).astype(np.uint8) * 255
+    # focus on central area to avoid header/footer
+    mask[: int(h * 0.18), :] = 0
+    mask[int(h * 0.85) :, :] = 0
+
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
+
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return _default_heatmap_roi(img)
+
+    # pick largest area contour
+    cnt = max(cnts, key=cv2.contourArea)
+    x, y, ww, hh = cv2.boundingRect(cnt)
+
+    # sanity check: heatmap should be reasonably large
+    if ww * hh < (w * h) * 0.05:
+        return _default_heatmap_roi(img)
+
+    # pad a bit
+    pad_x = int(ww * 0.05)
+    pad_y = int(hh * 0.08)
+    x1 = max(0, x - pad_x)
+    y1 = max(0, y - pad_y)
+    x2 = min(w, x + ww + pad_x)
+    y2 = min(h, y + hh + pad_y)
+    return x1, y1, x2, y2
+
+
+def extract_map_rates_from_heatmap(
+    heatmap_path: str,
+    lang: str = "jpn+eng",
+    band_mode: str = "thirds",
+) -> Tuple[Optional[Dict[str, float]], Dict[str, str]]:
+    """Extract FRONT/MIDDLE/REAR rates from heatmap screenshot.
+
+    Spec (practical/fast):
+    - detect heatmap ROI
+    - OCR percentage texts inside ROI (e.g., 24%) with coordinates
+    - aggregate by vertical bands (default: top/middle/bottom thirds)
+
+    Returns:
+    - map_rates: {'FRONT': rF, 'MIDDLE': rM, 'REAR': rR} where r in [0,1]
+    - meta_additions: {'map_summary': 'F=.. M=.. R=.. (heatmap_ocr)', 'map_roi': 'x1,y1,x2,y2', 'map_points': 'n=..'}
+
+    If extraction fails, returns (None, meta_additions with reason).
+    """
+    pil = Image.open(heatmap_path).convert("RGB")
+    rgb = np.array(pil)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+    x1, y1, x2, y2 = detect_heatmap_roi(bgr)
+    roi = rgb[y1:y2, x1:x2]
+
+    # For OCR, avoid hard binarization; just enlarge + mild threshold
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    thr = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 9
+    )
+
+    data = pytesseract.image_to_data(
+        thr,
+        lang=lang,
+        output_type=pytesseract.Output.DATAFRAME,
+        config="--psm 6",
+    )
+    data = data.dropna(subset=["text"])
+    data["text"] = data["text"].astype(str).str.strip()
+    data = data[data["text"] != ""]
+
+    pts = []  # (y_center, value)
+    for _, r in data.iterrows():
+        t = str(r["text"]).replace("％", "%")
+        m = re.fullmatch(r"(\d{1,3})%", t)
+        if not m:
+            continue
+        v = int(m.group(1))
+        if v < 0 or v > 100:
+            continue
+        y_center = float(r["top"] + r["height"] / 2.0)
+        pts.append((y_center, v))
+
+    meta_add = {
+        "map_roi": f"{x1},{y1},{x2},{y2}",
+        "map_points": f"n={len(pts)}",
+    }
+
+    if len(pts) < 3:
+        meta_add["map_summary"] = "Unknown (heatmap_ocr_failed)"
+        return None, meta_add
+
+    # banding
+    roi_h = thr.shape[0]
+    if band_mode == "thirds":
+        b1 = roi_h / 3.0
+        b2 = 2.0 * roi_h / 3.0
+        bands = {
+            "FRONT": [v for y, v in pts if y < b1],
+            "MIDDLE": [v for y, v in pts if b1 <= y < b2],
+            "REAR": [v for y, v in pts if y >= b2],
+        }
+    else:
+        # fallback to thirds
+        b1 = roi_h / 3.0
+        b2 = 2.0 * roi_h / 3.0
+        bands = {
+            "FRONT": [v for y, v in pts if y < b1],
+            "MIDDLE": [v for y, v in pts if b1 <= y < b2],
+            "REAR": [v for y, v in pts if y >= b2],
+        }
+
+    # fill missing band with overall mean
+    all_vals = [v for _, v in pts]
+    overall = float(np.mean(all_vals))
+
+    def band_mean(vals: List[int]) -> float:
+        """バンド内の値の平均を返す内部ヘルパ。"""
+        if len(vals) == 0:
+            return overall
+        return float(np.mean(vals))
+
+    f = band_mean(bands["FRONT"]) / 100.0
+    m_ = band_mean(bands["MIDDLE"]) / 100.0
+    r_ = band_mean(bands["REAR"]) / 100.0
+
+    map_rates = {
+        "FRONT": clamp(f, 0.0, 1.0),
+        "MIDDLE": clamp(m_, 0.0, 1.0),
+        "REAR": clamp(r_, 0.0, 1.0),
+    }
+
+    meta_add["map_summary"] = f"F={map_rates['FRONT']:.2f} M={map_rates['MIDDLE']:.2f} R={map_rates['REAR']:.2f} (heatmap_ocr)"
+    return map_rates, meta_add
+
+
+# =========================
+# 2) v1.1 scoring
+# =========================
+
+@dataclass
+class AuditFlags:
+    audit_flag: str
+    reason: str
+
+
+def compute_ai_rear_confirmed(df: pd.DataFrame) -> pd.Series:
+    """3コーナー zone が REAR 系であることを確認した boolean Series を返す。"""
+    z3 = df["zone_3c"].astype(str).str.upper().str.strip()
+    z4 = df["zone_4c"].astype(str).str.upper().str.strip()
+    return (z3 == "REAR") & (z4 == "REAR")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# R27: 走法分類ロジック  classify_running_style
+# ──────────────────────────────────────────────────────────────────────
+
+def _rsc_zone_score_row(row: "pd.Series", weights: dict) -> dict:
+    """1頂の zone 列値から各ラベルの加重和を返す。
+
+    Returns:
+        {'FRONT': float, 'MIDDLE': float, 'REAR': float}
+    """
+    scores = {'FRONT': 0.0, 'MIDDLE': 0.0, 'REAR': 0.0}
+    total_w = 0.0
+    for col, w in weights.items():
+        if col not in row.index:
+            continue
+        z = normalize_zone_token(str(row[col]))
+        if z in scores:
+            scores[z] += w
+            total_w += w
+    if total_w > 0:
+        for k in scores:
+            scores[k] /= total_w
+    else:
+        scores['MIDDLE'] = 1.0
+    return scores
+
+
+def _rsc_apply_pred_boost(
+    scores: dict,
+    row: "pd.Series",
+    pf_rank: int,
+    pl_rank: int,
+    n: int,
+    cfg: dict,
+) -> dict:
+    """pred_first3f / pred_last3f の順位に応じて FRONT/REAR スコアを補正する。"""
+    top_f = int(cfg.get('first3f_top_n', 3))
+    top_l = int(cfg.get('last3f_top_n', 3))
+    boost_f = float(cfg.get('first3f_front_boost', 0.15))
+    boost_l = float(cfg.get('last3f_rear_boost', 0.10))
+    # pred_first3f 順位が top_f 以内 → FRONT 補正
+    if pf_rank is not None and pf_rank <= top_f:
+        scores['FRONT'] = min(1.0, scores['FRONT'] + boost_f)
+    # pred_last3f 順位が top_l 以内 → REAR 補正
+    if pl_rank is not None and pl_rank <= top_l:
+        scores['REAR'] = min(1.0, scores['REAR'] + boost_l)
+    return scores
+
+
+def _rsc_label_from_scores(scores: dict, cfg: dict) -> tuple:
+    """scores 辞書から (label, confidence) を返す。
+
+    Returns:
+        label: 'FRONT' | 'MIDDLE' | 'REAR'
+        confidence: 'HIGH' | 'MEDIUM' | 'LOW'
+    """
+    front_thr = float(cfg.get('front_threshold', 0.45))
+    rear_thr  = float(cfg.get('rear_threshold',  0.40))
+    high_min  = float(cfg.get('high_confidence_min_score', 0.60))
+    best      = max(scores, key=scores.get)
+    best_val  = scores[best]
+    if best == 'FRONT' and best_val >= front_thr:
+        label = 'FRONT'
+    elif best == 'REAR' and best_val >= rear_thr:
+        label = 'REAR'
+    else:
+        label = 'MIDDLE'
+    confidence = 'HIGH' if best_val >= high_min else ('MEDIUM' if best_val >= 0.40 else 'LOW')
+    return label, confidence
+
+
+def classify_running_style(
+    df: "pd.DataFrame",
+    params: Optional[dict] = None,
+) -> "pd.DataFrame":
+    """R27: 過去 zone 履歴 + pred_first3f/last3f の順位から走法分類を行う。
+
+    出力列名:
+        RunningStyleLabel: 'FRONT' | 'MIDDLE' | 'REAR'
+        RunningStyleConf:  'HIGH' | 'MEDIUM' | 'LOW'
+        RunningStyleScore: FRONT スコア (0-100, 高いほど先行傾向)
+
+    利用列:
+        zone_4c, zone_3c, zone_2c, zone_1c  (存在する列のみ使用)
+        pred_first3f, pred_last3f            (存在する場合のみ利用)
+    """
+    cfg = ((params or {}).get('running_style_classify', {}) or {})
+    if not bool(cfg.get('enabled', True)):
+        df['RunningStyleLabel'] = 'MIDDLE'
+        df['RunningStyleConf']  = 'LOW'
+        df['RunningStyleScore'] = 50.0
+        return df
+
+    weights_cfg = cfg.get('zone_weights',
+        {'zone_4c': 0.40, 'zone_3c': 0.30, 'zone_2c': 0.20, 'zone_1c': 0.10})
+    # 存在する zone 列のみ使用（總和を再正規化するため _rsc_zone_score_row 内で実施済み）
+    active_weights = {c: w for c, w in weights_cfg.items() if c in df.columns}
+    if not active_weights:
+        active_weights = {'zone_4c': 1.0} if 'zone_4c' in df.columns else {}
+
+    # pred_first3f / pred_last3f の順位を事先計算（小さいほど速い = 順位高い）
+    n = len(df)
+    pf_ser = _num_series(df.get('pred_first3f', pd.Series([np.nan] * n, index=df.index)), np.nan, index=df.index)
+    pl_ser = _num_series(df.get('pred_last3f',  pd.Series([np.nan] * n, index=df.index)), np.nan, index=df.index)
+    pf_rank_ser = pf_ser.rank(method='min', ascending=True) if pf_ser.notna().sum() > 1 else pd.Series([None] * n, index=df.index)
+    pl_rank_ser = pl_ser.rank(method='min', ascending=True) if pl_ser.notna().sum() > 1 else pd.Series([None] * n, index=df.index)
+
+    labels, confs, fscores = [], [], []
+    for idx in df.index:
+        row = df.loc[idx]
+        sc  = _rsc_zone_score_row(row, active_weights)
+        pf_r = int(pf_rank_ser.loc[idx]) if pd.notna(pf_rank_ser.loc[idx]) else None
+        pl_r = int(pl_rank_ser.loc[idx]) if pd.notna(pl_rank_ser.loc[idx]) else None
+        sc   = _rsc_apply_pred_boost(sc, row, pf_r, pl_r, n, cfg)
+        lbl, conf = _rsc_label_from_scores(sc, cfg)
+        labels.append(lbl)
+        confs.append(conf)
+        # RunningStyleScore: FRONT 偉向度を 0-100 に変換
+        front_raw = sc.get('FRONT', 0.0) - sc.get('REAR', 0.0)
+        fscores.append(float(np.clip(50.0 + front_raw * 100.0, 0.0, 100.0)))
+
+    df['RunningStyleLabel'] = labels
+    df['RunningStyleConf']  = confs
+    df['RunningStyleScore'] = fscores
+    return df
+
+
+def compute_position_fit_v1_1(zone_4c: str) -> float:
+    """ベースの位置取り適性（天候補正なし）。"""
+    z = normalize_zone_token(zone_4c)
+    if z == "FRONT":
+        return 90.0
+    if z == "MIDDLE":
+        return 85.0
+    if z == "REAR":
+        return 35.0
+    return 85.0
+
+
+def compute_winshape_v1_1(zone_4c: str) -> float:
+    """ベースの勝ち形（天候補正なし）。"""
+    z = normalize_zone_token(zone_4c)
+    if z == "FRONT":
+        return 95.0
+    if z == "MIDDLE":
+        return 85.0
+    if z == "REAR":
+        return 60.0
+    return 85.0
+
+
+def _track_context(meta: Dict[str, str]) -> Dict[str, float]:
+    """metaから天候・馬場の数値特徴を取り出して返す（欠損はnan）。"""
+    def _f(k: str) -> float:
+        """meta 辞書からキー k の値を float に変換するショートハンド。失敗時は nan。"""
+        try:
+            return float(str(meta.get(k, "")).strip())
+        except Exception:
+            return float("nan")
+
+    inside_damage = 1.0 if str(meta.get("inside_damage", "0")) == "1" else 0.0
+    cushion_score = _f("cushion_score")
+    turf_firm = _f("turf_firmness_score")
+    dirt_firm = _f("dirt_firmness_score")
+
+    return {
+        "inside_damage": inside_damage,
+        "cushion_score": cushion_score,
+        "turf_firmness_score": turf_firm,
+        "dirt_firmness_score": dirt_firm,
+    }
+
+
+def compute_position_fit_adjusted(zone_4c: str, meta: Dict[str, str]) -> float:
+    """位置取り(PosFit)を天候/馬場で補正。
+
+    目的: ユーザー要望の「馬場/天候に関わる所は補正」
+    - 道悪: 先行有利寄り（REARは減点）
+    - 内側傷み: 内を避けられる想定で MIDDLE を上げる（枠が無いのでゾーンで近似）
+
+    ※補正は小さめにして破壊しない。
+    """
+    base = compute_position_fit_v1_1(zone_4c)
+    z = normalize_zone_token(zone_4c)
+
+    wet_mode = _is_wet_track(meta)
+    ctx = _track_context(meta)
+
+    delta = 0.0
+    if wet_mode:
+        if z == "FRONT":
+            delta += 3.0
+        elif z == "MIDDLE":
+            delta += 1.0
+        else:  # REAR
+            delta -= 5.0
+
+    if ctx.get("inside_damage", 0.0) >= 1.0:
+        if z == "FRONT":
+            delta -= 3.0
+        elif z == "MIDDLE":
+            delta += 3.0
+
+    return clamp(base + delta, 0.0, 100.0)
+
+
+def compute_winshape_adjusted(zone_4c: str, meta: Dict[str, str]) -> float:
+    """勝ち形(WinShape)を天候/馬場で補正。"""
+    base = compute_winshape_v1_1(zone_4c)
+    z = normalize_zone_token(zone_4c)
+
+    wet_mode = _is_wet_track(meta)
+    ctx = _track_context(meta)
+
+    delta = 0.0
+    if wet_mode:
+        if z == "FRONT":
+            delta += 3.0
+        elif z == "MIDDLE":
+            delta += 1.0
+        else:
+            delta -= 5.0
+
+    if ctx.get("inside_damage", 0.0) >= 1.0:
+        if z == "FRONT":
+            delta -= 2.0
+        elif z == "MIDDLE":
+            delta += 2.0
+
+    return clamp(base + delta, 0.0, 100.0)
+
+
+def compute_consistency_from_speed_hist(df: pd.DataFrame) -> pd.Series:
+    """過去速度ヒストリから安定性スコア (0–100) の Series を返す。"""
+    ranges = []
+    counts = []
+    for s in df["speed_hist"].tolist():
+        vals = parse_speed_hist(s)
+        counts.append(len(vals))
+        if len(vals) >= 2:
+            ranges.append(max(vals) - min(vals))
+        else:
+            ranges.append(np.nan)
+
+    r = pd.Series(ranges, index=df.index, dtype=float)
+    # R36: 全要素 NaN の場合 np.nanmax が RuntimeWarning を出すため事前にガード
+    _r_vals = r.values
+    rmax = float(np.nanmax(_r_vals)) if (len(_r_vals) > 0 and not np.all(np.isnan(_r_vals)) and np.isfinite(np.nanmax(_r_vals))) else np.nan
+
+    out = []
+    for i in df.index:
+        c = counts[i]
+        if c == 0:
+            out.append(70.0)  # v1.1: 欠損は70
+            continue
+        if not np.isfinite(rmax) or rmax == 0 or not np.isfinite(r.loc[i]):
+            out.append(70.0)
+            continue
+        out.append(100.0 * (1.0 - float(r.loc[i]) / rmax))
+    return pd.Series(out, index=df.index, dtype=float)
+
+
+def parse_map_summary_to_rates(map_summary: str) -> Optional[Dict[str, float]]:
+    """ポジションマップサマリ文字列をゾーン比率 dict に変換する。解析失敗時は None。"""
+    if map_summary is None:
+        return None
+    s = str(map_summary).strip()
+    if s == "" or s.lower() == "unknown":
+        return None
+
+    rates: Dict[str, float] = {}
+    patterns = {
+        "FRONT": r"(FRONT|F)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
+        "MIDDLE": r"(MIDDLE|M)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
+        "REAR": r"(REAR|R)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
+    }
+    for k, pat in patterns.items():
+        m = re.search(pat, s, flags=re.IGNORECASE)
+        if m:
+            v = float(m.group(2))
+            if v > 1.0:
+                v = v / 100.0
+            rates[k] = v
+
+    return rates if len(rates) else None
+
+
+def compute_mapfit_v1_1(
+    df: pd.DataFrame,
+    map_summary: str,
+    map_rates: Optional[Dict[str, float]] = None,
+) -> pd.Series:
+    """MapFit (v1.1)
+
+    Priority:
+    1) map_rates (from heatmap extraction): {'FRONT':0..1,'MIDDLE':0..1,'REAR':0..1}
+    2) parse from map_summary text like 'F=0.24 M=0.30 R=0.19'
+    3) Unknown fallback: FRONT/MIDDLE=80, REAR=30
+    """
+    rates = map_rates if map_rates is not None else parse_map_summary_to_rates(map_summary)
+    z4 = df["zone_4c"].astype(str).str.upper().str.strip()
+
+    if rates is None:
+        out = []
+        for v in z4.tolist():
+            out.append(30.0 if normalize_zone_token(v) == "REAR" else 80.0)  # Unknown既定
+        return pd.Series(out, index=df.index, dtype=float)
+
+    out = []
+    for v in z4.tolist():
+        key = normalize_zone_token(v)
+        r = float(rates.get(key, rates.get("MIDDLE", 0.20)))
+        # rates may be already 0..1 (heatmap) or 0..100 (if someone passes percent)
+        if r > 1.0:
+            r = r / 100.0
+        out.append(clamp(100.0 * r, 0.0, 100.0))
+    return pd.Series(out, index=df.index, dtype=float)
+
+
+def compute_timefit_v1_1(df: pd.DataFrame) -> pd.Series:
+    """前後3Fタイム予測値からタイムフィットスコア (0–100) を計算する。"""
+    f = _num_series(df, 'pred_first3f', np.nan, index=df.index)
+    l = _num_series(df, 'pred_last3f', np.nan, index=df.index)
+
+    out = []
+    for i in df.index:
+        if not np.isfinite(f.loc[i]) or not np.isfinite(l.loc[i]):
+            out.append(0.0)  # v1.1: 欠損は0
+            continue
+        diff = abs(float(f.loc[i]) - float(l.loc[i]))
+        score = 100.0 * np.exp(-diff)
+        out.append(float(score))
+    return pd.Series(out, index=df.index, dtype=float)
+
+
+def compute_upside_v1_1(speed_max: pd.Series) -> pd.Series:
+    """最高速度 Series からアップサイドスコア (0–100) を計算する。"""
+    s = _num_series(speed_max, index=getattr(speed_max, 'index', None))
+    order = s.rank(ascending=False, method="average")
+    n = len(s)
+    if n <= 1:
+        return pd.Series([50.0] * n, index=s.index, dtype=float)
+    return ((n - order) / (n - 1) * 100.0).fillna(50.0).astype(float)
+
+
+def _meta_distance_surface(meta: Dict[str, str]) -> tuple[float, str]:
+    """    メタデータ辞書から距離（float）と馬場種別文字列を取り出す。
+
+    Returns:
+        tuple[float, str]: (distance_m, surface)  surface は 'turf'/'dirt'/'障害' 等。
+
+    """
+    meta = meta or {}
+    dist = float('nan')
+    try:
+        dist = float(meta.get('distance', np.nan))
+    except Exception:
+        try:
+            s = ' '.join(str(meta.get(k, '')) for k in ['race', 'course_info', 'surface'])
+            m = re.search(r'(\d{3,4})\s*m', s, flags=re.IGNORECASE)
+            if not m:
+                m = re.search(r'(\d{3,4})', s)
+            if m:
+                dist = float(m.group(1))
+        except Exception:
+            dist = float('nan')
+    surface_txt = ' '.join(str(meta.get(k, '')) for k in ['surface', 'race', 'course_info']).lower()
+    if ('ダート' in surface_txt) or ('ダ' in surface_txt):
+        surface = 'dirt'
+    elif ('芝' in surface_txt) or ('turf' in surface_txt):
+        surface = 'turf'
+    else:
+        surface = 'unknown'
+    return dist, surface
+
+
+def compute_gatefit_v1_1(df: pd.DataFrame, meta: Dict[str, str]) -> pd.Series:
+    """ゲート適性スコア (0–100) を計算する。コメントゲート評価とコース条件を合算。"""
+    cg = _num_series(df, 'CommentGate', 50.0)
+    f = _num_series(df, 'pred_first3f', np.nan, index=df.index)
+    if f.notna().sum() > 1 and float(f.max()) != float(f.min()):
+        f01 = ((float(f.max()) - f) / (float(f.max()) - float(f.min()))).clip(lower=0.0, upper=1.0)
+    else:
+        f01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
+    dist, surface = _meta_distance_surface(meta)
+    if surface == 'dirt' and np.isfinite(dist) and dist <= 1200:
+        gate_mult = 1.60
+        w_comment = 0.88
+    elif surface == 'dirt' and np.isfinite(dist) and dist <= 1400:
+        gate_mult = 1.35
+        w_comment = 0.84
+    else:
+        gate_mult = 1.00
+        w_comment = 0.72
+    gate_base = (50.0 + (cg - 50.0) * gate_mult).clip(lower=0.0, upper=100.0)
+    out = (w_comment * gate_base + (1.0 - w_comment) * (f01 * 100.0)).clip(lower=0.0, upper=100.0)
+    return _num_series(out, 50.0, index=df.index)
+
+
+def compute_conditionfit_v1_1(df: pd.DataFrame, meta: Dict[str, str]) -> pd.Series:
+    """馬場・距離条件適性スコア (0–100) を計算する。"""
+    cc = _num_series(df, 'CommentCondition', 50.0)
+    mf = _num_series(df, 'MapFit', 50.0)
+    pf = _num_series(df, 'PosFit', 50.0)
+    ff = _num_series(df, 'FactorFit', 50.0)
+    dist, surface = _meta_distance_surface(meta)
+    base = 0.55 * cc + 0.25 * mf + 0.20 * pf
+    if _is_wet_track(meta):
+        base = base + 0.05 * (ff - 50.0)
+    if surface == 'dirt' and np.isfinite(dist) and dist <= 1200:
+        base = base + 0.20 * (cc - 50.0)
+    elif surface == 'dirt' and np.isfinite(dist) and dist <= 1400:
+        base = base + 0.10 * (cc - 50.0)
+    return _num_series(base, 50.0, index=df.index, lower=0.0, upper=100.0)
+
+
+
+def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> pd.DataFrame:
+    """競馬場コース特性を既存特徴量へ落とし込み、CourseProfileFit 系列を付与する。"""
+    _ = params or {}
+    d = df.copy()
+    if d is None or len(d) == 0:
+        return d
+
+    venue, surface, profile = _resolve_course_profile(meta)
+    dist, _ = _meta_distance_surface(meta)
+    style_bias = dict(profile.get('style_bias', {}) or {})
+
+    if 'RunningStyleLabel' in d.columns:
+        style_col = d['RunningStyleLabel'].astype(str).apply(normalize_zone_token)
+    else:
+        style_col = d.get('zone_4c', pd.Series(['MIDDLE'] * len(d), index=d.index)).astype(str).apply(normalize_zone_token)
+
+    style_fit = style_col.map(
+        lambda z: clamp(50.0 + 24.0 * float(style_bias.get(z, 0.0) or 0.0), 0.0, 100.0)
+    ).astype(float)
+
+    pf = _num_series(d.get('pred_first3f', np.nan), index=d.index)
+    pl = _num_series(d.get('pred_last3f', np.nan), index=d.index)
+    early_speed = (_series_norm01(pf, lower_is_better=True, neutral=0.5) * 100.0).astype(float)
+    late_speed = (_series_norm01(pl, lower_is_better=True, neutral=0.5) * 100.0).astype(float)
+
+    ability = _num_series(d.get('Ability', 50.0), 50.0, index=d.index)
+    posfit = _num_series(d.get('PosFit', 50.0), 50.0, index=d.index)
+    mapfit = _num_series(d.get('MapFit', 50.0), 50.0, index=d.index)
+    gatefit = _num_series(d.get('GateFit', 50.0), 50.0, index=d.index)
+    pacefit = _num_series(d.get('PaceFit', 50.0), 50.0, index=d.index)
+    condfit = _num_series(d.get('ConditionFit', 50.0), 50.0, index=d.index)
+    factorfit = _num_series(d.get('FactorFit', 50.0), 50.0, index=d.index)
+    michfit = _num_series(d.get('MichiakuFit', factorfit), 50.0, index=d.index)
+    consist = _num_series(d.get('Consist', 50.0), 50.0, index=d.index)
+    comment_trend = _num_series(d.get('CommentTrend', 50.0), 50.0, index=d.index)
+
+    straight_fit = (0.56 * late_speed + 0.24 * ability + 0.10 * pacefit + 0.10 * comment_trend).clip(lower=0.0, upper=100.0)
+    corner_fit = (0.44 * posfit + 0.30 * mapfit + 0.16 * gatefit + 0.10 * pacefit).clip(lower=0.0, upper=100.0)
+    stamina_fit = (0.46 * consist + 0.30 * condfit + 0.14 * factorfit + 0.10 * ability).clip(lower=0.0, upper=100.0)
+    power_fit = (0.40 * condfit + 0.30 * factorfit + 0.20 * ability + 0.10 * michfit).clip(lower=0.0, upper=100.0)
+    speed_fit = (0.42 * ability + 0.28 * early_speed + 0.20 * pacefit + 0.10 * gatefit).clip(lower=0.0, upper=100.0)
+    agility_fit = (0.36 * posfit + 0.34 * mapfit + 0.20 * gatefit + 0.10 * late_speed).clip(lower=0.0, upper=100.0)
+
+    if _is_wet_track(meta):
+        wet_boost = 3.5 + 2.5 * float(profile.get('power', 0.5) or 0.5)
+        power_fit = (power_fit + ((michfit - 50.0) / 50.0) * wet_boost + ((factorfit - 50.0) / 50.0) * 2.0).clip(lower=0.0, upper=100.0)
+    if venue in {'札幌', '函館'} and surface == 'turf':
+        power_fit = (power_fit + 0.10 * (factorfit - 50.0)).clip(lower=0.0, upper=100.0)
+    if venue == '東京' and surface == 'turf':
+        straight_fit = (straight_fit + 0.08 * (late_speed - 50.0)).clip(lower=0.0, upper=100.0)
+    if venue == '中山' and surface == 'turf':
+        stamina_fit = (stamina_fit + 0.08 * (consist - 50.0)).clip(lower=0.0, upper=100.0)
+    if venue in {'福島', '小倉', '札幌', '函館'}:
+        agility_fit = (agility_fit + 0.08 * (mapfit - 50.0)).clip(lower=0.0, upper=100.0)
+    if surface == 'dirt' and np.isfinite(dist) and dist <= 1400:
+        speed_fit = (0.60 * speed_fit + 0.40 * early_speed).clip(lower=0.0, upper=100.0)
+
+    style_w = 0.22
+    straight_w = 0.12 + 0.10 * float(profile.get('straight', 0.5) or 0.5)
+    corner_w = 0.10 + 0.10 * float(profile.get('corner', 0.5) or 0.5)
+    stamina_w = 0.10 + 0.08 * float(profile.get('stamina', 0.5) or 0.5)
+    power_w = 0.08 + 0.08 * float(profile.get('power', 0.5) or 0.5) + (0.03 if _is_wet_track(meta) else 0.0)
+    speed_w = 0.08 + 0.08 * float(profile.get('speed', 0.5) or 0.5)
+    gate_w = 0.05 + 0.05 * float(profile.get('gate', 0.5) or 0.5)
+    agility_w = 0.07 + 0.08 * float(profile.get('agility', 0.5) or 0.5)
+    total_w = style_w + straight_w + corner_w + stamina_w + power_w + speed_w + gate_w + agility_w
+
+    d['CourseStyleFit'] = _num_series(style_fit, 50.0, index=d.index)
+    d['CourseStraightFit'] = _num_series(straight_fit, 50.0, index=d.index)
+    d['CourseCornerFit'] = _num_series(corner_fit, 50.0, index=d.index)
+    d['CourseStaminaFit'] = _num_series(stamina_fit, 50.0, index=d.index)
+    d['CoursePowerFit'] = _num_series(power_fit, 50.0, index=d.index)
+    d['CourseSpeedFit'] = _num_series(speed_fit, 50.0, index=d.index)
+    d['CourseAgilityFit'] = _num_series(agility_fit, 50.0, index=d.index)
+    d['CourseProfileFit'] = (
+        style_w * d['CourseStyleFit']
+        + straight_w * d['CourseStraightFit']
+        + corner_w * d['CourseCornerFit']
+        + stamina_w * d['CourseStaminaFit']
+        + power_w * d['CoursePowerFit']
+        + speed_w * d['CourseSpeedFit']
+        + gate_w * gatefit
+        + agility_w * d['CourseAgilityFit']
+    ) / max(1e-9, float(total_w))
+    d['CourseProfileFit'] = _num_series(d['CourseProfileFit'], 50.0, index=d.index, lower=0.0, upper=100.0)
+    d['CourseBiasDelta'] = (d['CourseProfileFit'] - 50.0).clip(lower=-20.0, upper=20.0).astype(float)
+    d['CourseProfileVenue'] = venue if venue else ''
+    d['CourseProfileSurface'] = surface if surface else ''
+    return d
+
+
+def _resolve_pace_mix(
+    pace: str, front_count: int, good_pos_count: int, can_hold_count: int,
+    lead_gap: float, n: int, lap_meta: dict, wp: dict,
+) -> tuple[dict, str]:
+    """ペース区分・頭数条件から pace_mix と pace_eval_mode を決定する。"""
+    high_gap = float(wp.get('pace_high_fixed_gap_threshold', 0.25) or 0.25)
+    human_mid_goodpos_thr = max(4, int(np.ceil(n * 0.38))) if n > 0 else 4
+    human_hold_thr = max(3, int(np.ceil(n * 0.22))) if n > 0 else 3
+    lap_closing_bias = float(lap_meta.get('closing_bias', 0.0) or 0.0)
+    lap_goodpos_bias = float(lap_meta.get('goodpos_bias', 0.0) or 0.0)
+
+    pace_mix = {'M': 1.0}
+    pace_eval_mode = 'mid'
+
+    if pace == 'H':
+        if (front_count >= 3) and (good_pos_count < human_mid_goodpos_thr) and (can_hold_count <= human_hold_thr) and (not np.isfinite(lead_gap) or lead_gap <= high_gap):
+            pace_mix = {'H': 0.62, 'M': 0.30, 'S': 0.08}
+            pace_eval_mode = 'high'
+        elif (front_count >= 2) and (can_hold_count <= max(4, int(np.ceil(n * 0.28)))):
+            pace_mix = {'H': 0.46, 'M': 0.40, 'S': 0.14}
+            pace_eval_mode = 'high-mid'
+        else:
+            pace_mix = {'M': 0.64, 'H': 0.24, 'S': 0.12}
+            pace_eval_mode = 'mid'
+        if (good_pos_count >= human_mid_goodpos_thr) and (can_hold_count >= human_hold_thr):
+            pace_mix = {'M': 0.68, 'H': 0.20, 'S': 0.12}
+            pace_eval_mode = 'mid'
+    elif pace == 'S':
+        pace_mix = {'S': 0.68, 'M': 0.24, 'H': 0.08}
+        pace_eval_mode = 'slow'
+    else:
+        if (front_count >= 3) and (good_pos_count <= max(3, int(np.ceil(n * 0.32)))) and (can_hold_count <= human_hold_thr):
+            pace_mix = {'H': 0.34, 'M': 0.54, 'S': 0.12}
+            pace_eval_mode = 'high-mid'
+        else:
+            pace_mix = {'M': 0.74, 'H': 0.16, 'S': 0.10}
+            pace_eval_mode = 'mid'
+
+    if lap_goodpos_bias >= 3.0 and pace_eval_mode in {'high', 'high-mid'}:
+        pace_mix = {'M': max(0.52, pace_mix.get('M', 0.0)), 'H': min(0.34, pace_mix.get('H', 0.0) + 0.0), 'S': max(0.08, pace_mix.get('S', 0.0))}
+        total = sum(pace_mix.values())
+        pace_mix = {k: v / total for k, v in pace_mix.items()}
+        pace_eval_mode = 'high-mid' if pace_eval_mode == 'high' else pace_eval_mode
+    if lap_closing_bias >= 3.0 and pace_eval_mode == 'mid' and pace == 'H':
+        pace_mix = {'H': 0.42, 'M': 0.42, 'S': 0.16}
+        pace_eval_mode = 'high-mid'
+
+    if wp and pace in {'M', 'S'}:
+        mw = max(0.0, float(wp.get('long_maiden_pace_m_weight', 0.65) or 0.65))
+        sw = max(0.0, float(wp.get('long_maiden_pace_s_weight', 0.35) or 0.35))
+        if wp.get('_long_maiden_mode'):
+            denom = mw + sw
+            if denom > 0:
+                pace_mix = {'M': mw / denom, 'S': sw / denom}
+                pace_eval_mode = 'long-maiden-mix'
+
+    return pace_mix, pace_eval_mode
+
+
+def _write_pace_meta(
+    meta: dict,
+    pace_eval_mode: str,
+    pace_mix: dict,
+    front_count: int,
+    good_pos_count: int,
+    can_hold_count: int,
+    lead_gap: float,
+    lap_meta: dict,
+) -> None:
+    """ペース評価結果を meta dict に書き込む。"""
+    try:
+        human_line = (
+            f"front={front_count},goodpos={good_pos_count},hold={can_hold_count},lead_gap={lead_gap:.3f}"
+            if np.isfinite(lead_gap)
+            else f"front={front_count},goodpos={good_pos_count},hold={can_hold_count}"
+        )
+        meta['pace_eval_mode'] = str(pace_eval_mode)
+        meta['pace_mix_detail'] = ','.join(f"{k}:{float(v):.2f}" for k, v in pace_mix.items())
+        meta['pace_front_count'] = str(front_count)
+        meta['pace_goodpos_count'] = str(good_pos_count)
+        meta['pace_can_hold_count'] = str(can_hold_count)
+        meta['pace_lead_gap'] = '' if not np.isfinite(lead_gap) else f"{lead_gap:.3f}"
+        meta['pace_human_check'] = human_line
+        if lap_meta.get('laps'):
+            meta['lap_shape_detail'] = ','.join(f"{x:.1f}" for x in lap_meta['laps'])
+        if np.isfinite(float(lap_meta.get('avg_sf', float('nan')))):
+            meta['avg_sec_per_furlong'] = f"{float(lap_meta['avg_sf']):.2f}"
+    except Exception:
+        pass
+
+
+def _score_one_horse_pacefit(
+    zz: str,
+    ff: float,
+    lf: float,
+    pace_mix: dict,
+    pace_eval_mode: str,
+    base_map: dict,
+    long_maiden_mode: bool,
+    maiden_zone_bias: dict,
+    lap_goodpos_bias: float,
+    lap_closing_bias: float,
+    sustain_bias: float,
+    is_leader: bool,
+    good_reaccel: bool,
+    lead_gap: float,
+    front_count: int,
+    leader_bonus_mid: float,
+    leader_bonus_high_mid: float,
+    leader_relief: float,
+    lead_gap_relief_thr: float,
+    reaccel_bonus_mid: float,
+    reaccel_bonus_highmid: float,
+) -> float:
+    """1頭分のペースフィットスコアを計算する。"""
+    sc = 0.0
+    for pk, w in pace_mix.items():
+        bm = base_map.get(pk, {'FRONT': 62.0, 'MIDDLE': 70.0, 'REAR': 64.0})
+        part = float(bm.get(zz, 68.0))
+        if pk == 'H':
+            if zz == 'FRONT':
+                part -= 8.0 * ff
+            elif zz == 'MIDDLE':
+                part += 7.5 * ff + 2.0 * lf + max(0.0, lap_goodpos_bias) * 0.45
+            else:
+                part += 4.0 * (1.0 - abs(ff - 0.50) * 1.1) + max(0.0, lap_closing_bias) * 0.55
+        elif pk == 'S':
+            if zz == 'FRONT':
+                part += 8.0 * ff + max(0.0, lap_goodpos_bias) * 0.30
+            elif zz == 'REAR':
+                part -= 6.0 * (1.0 - ff)
+            else:
+                part += 2.5 * lf
+        else:
+            if zz == 'MIDDLE':
+                part += 5.2 * (1.0 - abs(ff - 0.55) * 1.6) + 3.2 * lf + max(0.0, lap_goodpos_bias) * 0.55
+            elif zz == 'FRONT':
+                part += 3.2 * ff + 1.2 * lf + max(0.0, lap_goodpos_bias) * 0.20
+            else:
+                part += 2.0 * lf + max(0.0, lap_closing_bias) * 0.40
+        sc += float(w) * float(clamp(part, 0.0, 100.0))
+
+    leader_bonus = 0.0
+    if zz == 'FRONT' and is_leader:
+        if pace_eval_mode == 'mid':
+            leader_bonus += leader_bonus_mid
+        elif pace_eval_mode == 'high-mid':
+            leader_bonus += leader_bonus_high_mid
+        if np.isfinite(lead_gap) and lead_gap >= lead_gap_relief_thr:
+            leader_bonus += leader_relief
+        if front_count <= 1:
+            leader_bonus += 2.0
+    if good_reaccel:
+        if pace_eval_mode == 'mid':
+            leader_bonus += reaccel_bonus_mid
+        elif pace_eval_mode == 'high-mid':
+            leader_bonus += reaccel_bonus_highmid
+
+    if long_maiden_mode:
+        sc += maiden_zone_bias.get(zz, 0.0)
+    sc += leader_bonus + sustain_bias * (0.12 if zz in {'FRONT', 'MIDDLE'} else 0.08)
+    return float(clamp(sc, 0.0, 100.0))
+
+
+def compute_pacefit_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> pd.Series:
+    """ペース区分・ゾーン・ラップ形状からペースフィットスコア (0–100) の Series を返す。
+    
+    サブ関数 _resolve_pace_mix / _write_pace_meta / _score_one_horse_pacefit を呼び出す。
+    """
+    meta = meta or {}
+    wp = ((params or {}).get('win_pattern_rules', {}) or {})
+    pace = str(meta.get('pace', '') or '').upper().strip()[:1]
+    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    f = _num_series(df, 'pred_first3f', np.nan)
+    l = _num_series(df, 'pred_last3f', np.nan)
+    st = _num_series(df, ['StabilityComposite', 'SAS'], 50.0)
+    pos = _num_series(df, 'PosFit', 50.0)
+    gate = _num_series(df, 'GateFit', 50.0)
+    lap_meta = _lap_shape_meta_features(meta)
+
+    n = int(len(df))
+    if f.notna().sum() > 1 and float(f.max()) != float(f.min()):
+        f01 = ((float(f.max()) - f) / (float(f.max()) - float(f.min()))).clip(lower=0.0, upper=1.0)
+    else:
+        f01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
+    if l.notna().sum() > 1 and float(l.max()) != float(l.min()):
+        l01 = ((float(l.max()) - l) / (float(l.max()) - float(l.min()))).clip(lower=0.0, upper=1.0)
+    else:
+        l01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
+    pf_rank = f.rank(method='min', ascending=True)
+    pl_rank = l.rank(method='min', ascending=True)
+
+    long_maiden_mode = _is_long_maiden_race(meta, df)
+
+    front_count = int((z == 'FRONT').sum()) if len(z) else 0
+    good_pos_mask = z.isin(['FRONT', 'MIDDLE'])
+    good_pos_count = int(good_pos_mask.sum()) if len(good_pos_mask) else 0
+    can_hold_mask = good_pos_mask & (((pl_rank <= max(3, int(np.ceil(n * 0.35)))) | (st >= 56.0) | (pos >= 58.0) | (gate >= 58.0))).fillna(False)
+    can_hold_count = int(can_hold_mask.sum()) if len(can_hold_mask) else 0
+    fs = _num_series(f, index=f.index).dropna().sort_values()
+    lead_gap = float(fs.iloc[min(len(fs) - 1, 1)] - fs.iloc[0]) if len(fs) >= 2 else float('nan')
+
+    _wp_lm = dict(wp)
+    _wp_lm['_long_maiden_mode'] = long_maiden_mode
+    pace_mix, pace_eval_mode = _resolve_pace_mix(
+        pace, front_count, good_pos_count, can_hold_count, lead_gap, n, lap_meta, _wp_lm,
+    )
+
+    _write_pace_meta(meta, pace_eval_mode, pace_mix, front_count, good_pos_count, can_hold_count, lead_gap, lap_meta)
+
+    base_map = {
+        'H': {'FRONT': 46.0, 'MIDDLE': 81.0, 'REAR': 67.0},
+        'M': {'FRONT': 67.0, 'MIDDLE': 79.0, 'REAR': 59.0},
+        'S': {'FRONT': 80.0, 'MIDDLE': 72.0, 'REAR': 54.0},
+    }
+    maiden_zone_bias = {
+        'FRONT': float(wp.get('long_maiden_pace_front_bias', -3.0) or -3.0),
+        'MIDDLE': float(wp.get('long_maiden_pace_middle_bias', 2.0) or 2.0),
+        'REAR': float(wp.get('long_maiden_pace_rear_bias', 4.0) or 4.0),
+    }
+    leader_bonus_mid = float(wp.get('pace_front_auto_promote_bonus', 5.0) or 5.0)
+    leader_bonus_high_mid = float(wp.get('pace_front_keep_bonus', 3.0) or 3.0)
+    leader_relief = float(wp.get('pace_high_front_lead_gap_relief', 4.0) or 4.0)
+    leader_rank_max = int(wp.get('pace_front_auto_promote_rank_max', 2) or 2)
+    reaccel_bonus_mid = float(wp.get('pace_reaccel_goodpos_bonus_mid', 5.5) or 5.5)
+    reaccel_bonus_highmid = float(wp.get('pace_reaccel_goodpos_bonus_highmid', 3.0) or 3.0)
+    lead_gap_relief_thr = float(wp.get('pace_high_front_lead_gap_threshold', 0.45) or 0.45)
+    lap_closing_bias = float(lap_meta.get('closing_bias', 0.0) or 0.0)
+    lap_goodpos_bias = float(lap_meta.get('goodpos_bias', 0.0) or 0.0)
+    sustain_bias = float(lap_meta.get('sustain_bias', 0.0) or 0.0)
+
+    out = []
+    for i in df.index:
+        zz = z.loc[i] if i in z.index else 'MIDDLE'
+        ff = float(f01.loc[i]) if i in f01.index and np.isfinite(f01.loc[i]) else 0.5
+        lf = float(l01.loc[i]) if i in l01.index and np.isfinite(l01.loc[i]) else 0.5
+        try:
+            is_leader = bool(np.isfinite(pf_rank.loc[i]) and float(pf_rank.loc[i]) <= float(leader_rank_max))
+        except Exception:
+            is_leader = False
+        try:
+            good_reaccel = bool(zz in {'FRONT', 'MIDDLE'} and np.isfinite(pl_rank.loc[i]) and float(pl_rank.loc[i]) <= float(max(5, int(np.ceil(n * 0.45)))))
+        except Exception:
+            good_reaccel = False
+        sc = _score_one_horse_pacefit(
+            zz, ff, lf, pace_mix, pace_eval_mode, base_map,
+            long_maiden_mode, maiden_zone_bias,
+            lap_goodpos_bias, lap_closing_bias, sustain_bias,
+            is_leader, good_reaccel, lead_gap, front_count,
+            leader_bonus_mid, leader_bonus_high_mid, leader_relief, lead_gap_relief_thr,
+            reaccel_bonus_mid, reaccel_bonus_highmid,
+        )
+        out.append(sc)
+    return pd.Series(out, index=df.index, dtype=float)
+
+def detect_tight_race_v1_1(df: pd.DataFrame) -> tuple[bool, float]:
+    """前半タイムの分散からハイペース競合レースを検出する。
+    
+    Returns:
+        (is_tight: bool, lead_gap: float)
+    """
+    f = _num_series(df, 'pred_first3f', np.nan, index=df.index)
+    l = _num_series(df, 'pred_last3f', np.nan, index=df.index)
+    total = _num_series(f + l, index=df.index)
+    total = total[total.notna() & np.isfinite(total)]
+    if len(total) < 3:
+        return False, float('nan')
+    top = total.sort_values().head(4)
+    spread = float(top.max() - top.min()) if len(top) >= 2 else float('nan')
+    return bool(np.isfinite(spread) and spread <= 0.50), spread
+
+
+def _series_norm01(x: pd.Series, lower_is_better: bool = False, neutral: float = 0.5) -> pd.Series:
+    """    系列 x を [0, 1] の範囲に最小最大正規化する。
+    lower_is_better=True の場合は反転する。有効値が 1 以下の場合は neutral を返す。
+    """
+    v = _num_series(x, index=getattr(x, 'index', None))
+    ok = v.notna() & np.isfinite(v)
+    if int(ok.sum()) <= 1:
+        return pd.Series([neutral] * len(v), index=v.index, dtype=float)
+    lo = float(v[ok].min())
+    hi = float(v[ok].max())
+    if not (hi > lo):
+        return pd.Series([neutral] * len(v), index=v.index, dtype=float)
+    out = ((hi - v) / (hi - lo)) if lower_is_better else ((v - lo) / (hi - lo))
+    return _num_series(out, neutral, index=v.index, lower=0.0, upper=1.0)
+
+
+def _comment_tag_mask(series: pd.Series, keywords: list[str]) -> pd.Series:
+    """コメントタグ系列 series に対し、keywords の少なくとも 1 語を含む行を True にしたマスクを返す。"""
+    if series is None or len(series) == 0:
+        return pd.Series([], dtype=bool)
+    keys = [str(k) for k in (keywords or []) if str(k).strip()]
+    if not keys:
+        return pd.Series([False] * len(series), index=series.index, dtype=bool)
+    pat = '|'.join(re.escape(k) for k in keys)
+    return series.astype(str).str.contains(pat, regex=True, na=False)
+
+
+def _meta_race_text(meta: Optional[Dict[str, str]]) -> str:
+    """meta dict からレース関連テキストフィールドを連結して返す。"""
+    meta = meta or {}
+    parts = []
+    for k in ['race', 'course_info', 'surface', 'class', 'race_name', 'note']:
+        try:
+            v = str(meta.get(k, '') or '').strip()
+        except Exception:
+            v = ''
+        if v:
+            parts.append(v)
+    return ' '.join(parts)
+
+
+def _is_young_maiden_race(meta: Optional[Dict[str, str]], df: Optional[pd.DataFrame] = None) -> bool:
+    """3歳未勝利・新馬戦かどうかを判定する。"""
+    txt = _meta_race_text(meta)
+    try:
+        txt += ' ' + ' '.join(str(c) for c in (df.columns.tolist() if isinstance(df, pd.DataFrame) else []))
+    except Exception:
+        pass
+    txt = str(txt)
+    is_age3 = ('3歳' in txt) or ('三歳' in txt) or ('3才' in txt)
+    is_maiden = ('未勝利' in txt) or ('新馬' in txt)
+    return bool(is_age3 and is_maiden)
+
+
+
+def _is_long_maiden_race(meta: Optional[Dict[str, str]], df: Optional[pd.DataFrame] = None) -> bool:
+    """3歳未勝利 1800–2000m の長距離未勝利戦かどうかを判定する。"""
+    if not _is_young_maiden_race(meta, df):
+        return False
+    dist, _surface = _meta_distance_surface(meta or {})
+    return bool(np.isfinite(dist) and 1800.0 <= float(dist) <= 2000.0)
+
+
+def compute_distance_comment_profile_v1_1(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """コメントと距離条件からフロント・リアプロファイルスコアを返す。
+    
+    Returns:
+        (score: pd.Series, risk: pd.Series)
+    """
+    short = df.get('comment_short', pd.Series([''] * len(df), index=df.index)).infer_objects(copy=False).fillna('').astype(str)
+    tags = df.get('comment_tags', pd.Series([''] * len(df), index=df.index)).infer_objects(copy=False).fillna('').astype(str)
+    txt = (short + ' ' + tags).astype(str)
+    pos_pat = r'折り合いスムーズ|折り合い面に進境|距離延長歓迎|しまい確実|余力|持続|リズム良|バテない|長く脚'
+    neg_pat = (r'終い甘い|かかる|力む|行きたがる|単調|直線で甘い|距離課題|最後苦しく|距離長'
+              r'|折り合い難|折り合い課題'
+              r'|もう少し短め|短めの距離|距離長い印象|距離が長い'  # R19追加
+              r'|1400あたりが|1600あたりが|1800あたりが|このくらいが上限'
+              r'|短距離向き|マイラー向き|短めが向')
+    pos_hits = txt.str.count(pos_pat).infer_objects(copy=False).fillna(0.0).astype(float)
+    neg_hits = txt.str.count(neg_pat).infer_objects(copy=False).fillna(0.0).astype(float)
+    score = (50.0 + 8.0 * pos_hits - 7.0 * neg_hits).clip(lower=0.0, upper=100.0)
+    risk = (2.2 * neg_hits).clip(lower=0.0, upper=8.0)
+    return _num_series(score, 50.0, index=df.index), _num_series(risk, 0.0, index=df.index)
+
+
+def compute_distance_suit_score_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> pd.Series:
+    """距離適性スコア (0–100) を ConditionFit / CommentDistance 等から計算する。"""
+    cc = _num_series(df, 'ConditionFit', 50.0)
+    mf = _num_series(df, 'MapFit', 50.0)
+    pf = _num_series(df, 'PosFit', 50.0)
+    tf = _num_series(df, 'TimeFit', 50.0)
+    tr = _num_series(df, 'TrainingScore', 50.0)
+    dcs = _num_series(df, 'DistanceCommentScore', 50.0)
+    out = 0.28 * cc + 0.18 * mf + 0.18 * pf + 0.18 * tf + 0.08 * tr + 0.10 * dcs
+    if _is_long_maiden_race(meta, df):
+        pl = _num_series(df, 'pred_last3f', np.nan)
+        if pl.notna().sum() > 1 and float(pl.max()) != float(pl.min()):
+            l01 = ((float(pl.max()) - pl) / (float(pl.max()) - float(pl.min()))).clip(lower=0.0, upper=1.0)
+        else:
+            l01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
+        out = out + 6.0 * (l01 - 0.5)
+    return _num_series(out, 50.0, index=df.index, lower=0.0, upper=100.0)
+
+def compute_stability_composite_v1_1(df: pd.DataFrame, params: Optional[dict] = None) -> pd.Series:
+    """安定性複合スコア (0–100) を Consist / SAS 等から計算する。"""
+    cs = _num_series(df, 'Consist', 50.0)
+    pf = _num_series(df, 'PosFit', 50.0)
+    ab = _num_series(df, 'Ability', 50.0)
+    ds = _num_series(df, 'DistanceSuitScore', 50.0)
+    cf = _num_series(df, 'CommentFit', 50.0)
+    out = 0.30 * cs + 0.25 * pf + 0.20 * ab + 0.15 * ds + 0.10 * cf
+    return _num_series(out, 50.0, index=df.index, lower=0.0, upper=100.0)
+
+def compute_long_front_fade_risk_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> pd.Series:
+    """長距離未勝利戦における先行馬の失速リスクスコアを返す。非対象レースは 0 埋め。"""
+    if not _is_long_maiden_race(meta, df):
+        return pd.Series([0.0] * len(df), index=df.index, dtype=float)
+    wp = ((params or {}).get('win_pattern_rules', {}) or {})
+    base_pen = float(wp.get('long_maiden_frontfade_base_penalty', 6.0) or 6.0)
+    extra_pen = float(wp.get('long_maiden_frontfade_extra_penalty', 2.0) or 2.0)
+    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    pf = _num_series(df, 'pred_first3f', np.nan)
+    pl = _num_series(df, 'pred_last3f', np.nan)
+    tf = _num_series(df, 'TimeFit', 50.0)
+    ct = _num_series(df, 'CommentTrend', 50.0)
+    cr = _num_series(df, 'CommentRisk', 0.0)
+    pf_rank = pf.rank(method='min', ascending=True)
+    pl_rank = pl.rank(method='min', ascending=True)
+    out = pd.Series([0.0] * len(df), index=df.index, dtype=float)
+    mask = (z == 'FRONT') & (pf_rank <= 2.0) & ((pl_rank >= 6.0) | (tf < 52.0))
+    out.loc[mask] += base_pen
+    extra_mask = mask & ((ct < 50.0) | (cr > 55.0))
+    out.loc[extra_mask] += extra_pen
+    severe_mask = mask & (tf < 48.0) & (pl_rank >= 7.0)
+    out.loc[severe_mask] += 1.0
+    return _num_series(out, 0.0, index=df.index, lower=0.0, upper=9.0)
+
+def compute_distance_stamina_risk_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> pd.Series:
+    """長距離未勝利戦における距離スタミナリスクスコアを返す。非対象レースは 0 埋め。"""
+    if not _is_long_maiden_race(meta, df):
+        return pd.Series([0.0] * len(df), index=df.index, dtype=float)
+    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    tf = _num_series(df, 'TimeFit', 50.0)
+    dcr = _num_series(df, 'DistanceCommentRisk', 0.0)
+    pl = _num_series(df, 'pred_last3f', np.nan)
+    pl_rank = pl.rank(method='min', ascending=True)
+    late_weak = ((55.0 - tf) / 4.5).clip(lower=0.0, upper=4.0)
+    late_weak = late_weak + (pl_rank >= 6.0).astype(float) * 2.0
+    late_weak = late_weak + ((z == 'FRONT') & (pl_rank >= 6.0)).astype(float) * 1.0
+    out = 0.55 * dcr + 0.45 * late_weak
+    return _num_series(out, 0.0, index=df.index, lower=0.0, upper=8.0)
+
+def compute_recovery_signal_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """回復シグナル関連の4系列を返す。非対象レースは全て 0 埋め。
+    
+    Returns:
+        (signal, insurance_count, front_fade, stamina_risk)
+    """
+    if not _is_long_maiden_race(meta, df):
+        z = pd.Series([0] * len(df), index=df.index, dtype=int)
+        f = pd.Series([0.0] * len(df), index=df.index, dtype=float)
+        return z, z, f, f
+    wp = ((params or {}).get('win_pattern_rules', {}) or {})
+    dist_sig = (_num_series(df, 'DistanceSuitScore', 50.0) >= 60.0).astype(int)
+    train_sig = (_num_series(df, 'TrainingScore', 50.0) >= 58.0).astype(int)
+    delta_sig = (_num_series(df, 'delta_train', 0.0) >= 1.0).astype(int)
+    trend_sig = (_num_series(df, 'CommentTrend', 50.0) >= 55.0).astype(int)
+    count = (dist_sig + train_sig + delta_sig + trend_sig).astype(int)
+    flag = (count >= 3).astype(int)
+    rating_rank = _num_series(df, 'rating', np.nan).rank(method='min', ascending=False)
+    low_rank_thr = float(wp.get('long_maiden_recovery_rating_rank_threshold', 5) or 5)
+    low_rank = (rating_rank > low_rank_thr).fillna(True)
+    win_bonus_lo = float(wp.get('long_maiden_recovery_bonus_win', 3.5) or 3.5)
+    place_bonus_lo = float(wp.get('long_maiden_recovery_bonus_place', 5.0) or 5.0)
+    win_bonus_hi = float(wp.get('long_maiden_recovery_bonus_win_core', 1.5) or 1.5)
+    place_bonus_hi = float(wp.get('long_maiden_recovery_bonus_place_core', 2.5) or 2.5)
+    bonus_win = pd.Series(0.0, index=df.index, dtype=float)
+    bonus_place = pd.Series(0.0, index=df.index, dtype=float)
+    bonus_win.loc[flag > 0] = np.where(low_rank.loc[flag > 0], win_bonus_lo, win_bonus_hi)
+    bonus_place.loc[flag > 0] = np.where(low_rank.loc[flag > 0], place_bonus_lo, place_bonus_hi)
+    return count.astype(int), flag.astype(int), _num_series(bonus_win, 0.0, index=df.index), _num_series(bonus_place, 0.0, index=df.index)
+
+def compute_maintenance_run_relief_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> tuple[pd.Series, pd.Series]:
+    """メンテナンス出走緩和フラグと理由文字列 Series を返す。
+    
+    Returns:
+        (flag: pd.Series[int], reason: pd.Series[str])
+    """
+    fr = ((params or {}).get('favorite_logic_rules', {}) or {})
+    dist = _num_series(df, 'DistanceSuitScore', 50.0)
+    tr = _num_series(df, 'TrainingScore', 50.0)
+    dt = _num_series(df, 'delta_train', 0.0)
+    ct = _num_series(df, 'CommentTrend', 50.0)
+    rf = _num_series(df, 'RecentFormScore', 50.0)
+    short = df.get('comment_short', pd.Series([''] * len(df), index=df.index)).infer_objects(copy=False).fillna('').astype(str)
+    tags = df.get('comment_tags', pd.Series([''] * len(df), index=df.index)).infer_objects(copy=False).fillna('').astype(str)
+    txt = (short + ' ' + tags).astype(str)
+    maintain_tag = txt.str.contains(r'ひと叩き|叩いて|叩き良化|良化余地|軽め|維持|次走|上積み', regex=True, na=False)
+    base = ((dist >= 60.0) & (tr >= 55.0) & (dt >= -0.30) & (rf >= 49.0)).astype(float)
+    bonus = (base * 1.2 + maintain_tag.astype(float) * 1.0 + ((ct >= 55.0) & (dist >= 58.0)).astype(float) * 0.8).clip(lower=0.0, upper=4.0)
+    reason = pd.Series([''] * len(df), index=df.index, dtype=str)
+    reason.loc[bonus >= 1.0] = '軽い前走でも維持・上積み型'
+    return _num_series(bonus, 0.0, index=df.index), reason
+
+def compute_development_wait_risk_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> tuple[pd.Series, pd.Series]:
+    """成長待ちリスクフラグと理由文字列 Series を返す。
+    
+    Returns:
+        (flag: pd.Series[int], reason: pd.Series[str])
+    """
+    ab = _num_series(df, 'AbilityBaseScore', 50.0)
+    rc = _num_series(df, 'RaceConditionScore', 50.0)
+    rf = _num_series(df, 'RecentFormScore', 50.0)
+    pf = _num_series(df, 'PaceFit', 50.0)
+    ct = _num_series(df, 'CommentTrend', 50.0)
+    pos = _num_series(df, 'PosFit', 50.0)
+    risk = ((ab - rc - 4.0).clip(lower=0.0) / 4.5) + ((ab - rf - 2.0).clip(lower=0.0) / 7.0)
+    risk = risk + ((pf < 58.0) & (ct < 53.0)).astype(float) * 1.2 + ((pos < 56.0) & (ab >= 58.0)).astype(float) * 0.8
+    risk = _num_series(risk, 0.0, index=df.index, lower=0.0, upper=6.0)
+    reason = pd.Series([''] * len(df), index=df.index, dtype=str)
+    reason.loc[risk >= 3.0] = '展開待ち・相手向き'
+    reason.loc[(risk >= 1.5) & (risk < 3.0)] = '勝ち切りは展開待ち'
+    return risk, reason
+
+def compute_favorite_score_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """人気馬スコア・オーバーライドフラグ・理由文字列を返す。
+    
+    Returns:
+        (score: pd.Series[float], override_flag: pd.Series[int], reason: pd.Series[str])
+    """
+    fr = ((params or {}).get('favorite_logic_rules', {}) or {})
+    ab = _num_series(df, 'AbilityBaseScore', 50.0)
+    rf = _num_series(df, 'RecentFormScore', 50.0)
+    tr = _num_series(df, 'TrainingScore', 50.0)
+    cf = _num_series(df, 'CommentFit', 50.0)
+    ct = _num_series(df, 'CommentTrend', 50.0)
+    wps = _num_series(df, 'WPS', 50.0)
+    st = _num_series(df, ['StabilityComposite', 'SAS'], 50.0)
+    sr = _num_series(df, 'StartRiskShort', 0.0)
+    pf = _num_series(df, 'PaceFit', 50.0)
+    pos = _num_series(df, 'PosFit', 50.0)
+    rc = _num_series(df, 'RaceConditionScore', 50.0)
+    dwr = _num_series(df, 'DevelopmentWaitRisk', 0.0)
+
+    race_txt = _meta_race_text(meta)
+    large_field_thr = int(fr.get('favorite_large_field_threshold', 16) or 16)
+    graded_or_large = bool((len(df) >= large_field_thr) or re.search(r'G\s*[1-3]|GIII|GII|GI|重賞|オープン', race_txt, flags=re.I))
+
+    mismatch_thr = float(fr.get('favorite_mismatch_threshold', 56.0) or 56.0)
+    mismatch_scale_val = float(fr.get('favorite_mismatch_half_scale', 0.5) or 0.5)
+    mismatch_scale = pd.Series([1.0] * len(df), index=df.index, dtype=float)
+    mismatch_mask = (pf < mismatch_thr) | (pos < mismatch_thr) | (rc < mismatch_thr)
+    mismatch_scale.loc[mismatch_mask] = mismatch_scale_val
+
+    train_cap = float(fr.get('favorite_training_push_cap', 12.0) or 12.0)
+    comment_cap = float(fr.get('favorite_comment_push_cap', 10.0) or 10.0)
+    tr_adj = 50.0 + (tr - 50.0).clip(lower=-10.0, upper=train_cap) * mismatch_scale
+    cf_adj = 50.0 + (cf - 50.0).clip(lower=-10.0, upper=comment_cap) * mismatch_scale
+    ct_adj = 50.0 + (ct - 50.0).clip(lower=-10.0, upper=comment_cap) * mismatch_scale
+
+    win_axis = (0.34 * ab + 0.22 * pf + 0.16 * pos + 0.14 * st + 0.14 * rc).astype(float)
+    overall = (0.46 * win_axis + 0.18 * rf + 0.10 * tr_adj + 0.08 * cf_adj + 0.06 * ct_adj + 0.12 * wps).astype(float)
+    overall_rank = overall.rank(method='min', ascending=False)
+
+    override_recent = (
+        (rf >= float(fr.get('favorite_override_min_recent', 58.0) or 58.0))
+        & (tr >= float(fr.get('favorite_override_min_training', 58.0) or 58.0))
+        & ((cf >= float(fr.get('favorite_override_min_comment', 55.0) or 55.0)) | (ct >= float(fr.get('favorite_override_min_comment', 55.0) or 55.0)))
+    )
+    override_support = (pf >= 58.0) & (pos >= 58.0) & (st >= 56.0)
+    if graded_or_large:
+        override = ((overall_rank <= 1.0) & override_recent & override_support & (tr >= 62.0) & ((cf >= 56.0) | (ct >= 56.0))).astype(int)
+    else:
+        override = ((overall_rank <= 1.0) & override_recent & override_support).astype(int)
+
+    start_scale = float(fr.get('favorite_start_penalty_scale', 0.60) or 0.60)
+    start_cap = float(fr.get('favorite_start_penalty_cap', 1.8) or 1.8)
+    top_bonus = float(fr.get('favorite_top_bonus', 3.2) or 3.2)
+    if graded_or_large:
+        top_bonus *= 0.55
+
+    score = (
+        0.42 * win_axis
+        + 0.18 * rf
+        + 0.10 * tr_adj
+        + 0.08 * cf_adj
+        + 0.06 * ct_adj
+        + 0.08 * wps
+        + 0.08 * st
+        + override.astype(float) * top_bonus
+        - (sr * start_scale).clip(lower=0.0, upper=start_cap)
+        - 0.75 * dwr
+        - ((mismatch_scale < 0.99) & (tr >= 60.0)).astype(float) * 0.8
+    ).clip(lower=0.0, upper=100.0)
+
+    reason = pd.Series([''] * len(df), index=df.index, dtype=str)
+    reason.loc[override > 0] = '能力×展開×位置取り一致で本命維持'
+    reason.loc[(override <= 0) & (mismatch_scale < 0.99)] = '展開不一致で調教・コメント加点を半減'
+    return _num_series(score, 0.0, index=df.index), _num_series(override, 0, index=df.index, dtype=int), reason
+
+def compute_popularity_danger_v1_1(df: pd.DataFrame, params: Optional[dict] = None) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """人気馬危険度スコア・フラグ・理由を返す。
+    
+    Returns:
+        (danger_score: pd.Series, flag: pd.Series[int], reason: pd.Series[str])
+    """
+    fr = ((params or {}).get('favorite_logic_rules', {}) or {})
+    place_axis = _num_series(df, 'PlaceAxisScore', 50.0)
+    win_through = _num_series(df, ['WinThroughScore', 'WinCandidateScore'], 50.0)
+    dwr = _num_series(df, 'DevelopmentWaitRisk', 0.0)
+    fav = _num_series(df, 'FavoriteScore', 50.0)
+    gap = (place_axis - win_through).clip(lower=0.0)
+    score = (1.1 * dwr + 0.22 * gap + ((fav >= 60.0) & (gap >= 3.0)).astype(float) * 1.0).clip(lower=0.0, upper=10.0)
+    thr = float(fr.get('danger_flag_threshold', 3.0) or 3.0)
+    flag = (score >= thr).astype(int)
+    reason = pd.Series([''] * len(df), index=df.index, dtype=str)
+    reason.loc[flag > 0] = '人気先行リスクあり'
+    reason.loc[(score >= (thr * 0.66)) & (flag <= 0)] = '相手向き止まり注意'
+    return score, flag, reason
+
+def compute_value_hole_flags_v1_1(df: pd.DataFrame, params: Optional[dict] = None) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """穴馬フラグ・スコア・理由文字列を返す。
+    
+    Returns:
+        (flag: pd.Series[int], score: pd.Series[float], reason: pd.Series[str])
+    """
+    fr = ((params or {}).get('favorite_logic_rules', {}) or {})
+    place = _num_series(df, 'PlaceAxisScore', 50.0)
+    dist = _num_series(df, 'DistanceSuitScore', 50.0)
+    tr = _num_series(df, 'TrainingScore', 50.0)
+    ct = _num_series(df, 'CommentTrend', 50.0)
+    rel = _num_series(df, 'MaintenanceRunRelief', 0.0)
+    rec = _num_series(df, 'RecoverySignal', 0.0)
+    temp = _num_series(df, 'TemperamentRisk', 0.0)
+    win = _num_series(df, ['WinThroughScore', 'WinCandidateScore'], 50.0)
+    pace = _num_series(df, ['PaceScenarioAdvantage', 'PaceFit'], 50.0)
+    pos = _num_series(df, 'PosFit', 50.0)
+    zone = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    pf = _num_series(df, 'pred_first3f', np.nan)
+    pl = _num_series(df, 'pred_last3f', np.nan)
+    pf_rank = pf.rank(method='min', ascending=True)
+    pl_rank = pl.rank(method='min', ascending=True)
+
+    front_signal = ((zone == 'FRONT') & (pf_rank <= 3.0)).astype(float)
+    rear_signal = ((zone != 'FRONT') & (pl_rank <= 5.0)).astype(float)
+
+    front_score = (
+        0.34 * place
+        + 0.18 * pace
+        + 0.14 * pos
+        + 0.12 * dist
+        + 0.10 * tr
+        + 0.06 * ct
+        + rel * 1.2
+        + rec * 0.8
+        + front_signal * 4.0
+        - 0.22 * temp
+        - ((win >= place + 4.0).astype(float) * 1.8)
+    ).clip(lower=0.0, upper=100.0)
+
+    rear_score = (
+        0.34 * place
+        + 0.18 * dist
+        + 0.14 * pace
+        + 0.10 * tr
+        + 0.10 * ct
+        + rel * 0.8
+        + rec * 1.2
+        + rear_signal * 4.0
+        + ((pl_rank <= 3.0).astype(float) * 2.0)
+        - 0.24 * temp
+        - ((win >= place + 4.0).astype(float) * 1.6)
+    ).clip(lower=0.0, upper=100.0)
+
+    choose_front = front_score >= rear_score
+    score = pd.Series(np.where(choose_front, front_score, rear_score), index=df.index, dtype=float)
+    thr = float(fr.get('value_hole_score_min', 58.0) or 58.0)
+    flag = ((score >= thr) & (win <= place + 4.0)).astype(int)
+    reason = pd.Series([''] * len(df), index=df.index, dtype=str)
+    reason.loc[(flag > 0) & choose_front] = '前残り穴条件に合致'
+    reason.loc[(flag > 0) & (~choose_front)] = '差し込み穴条件に合致'
+    reason.loc[(flag <= 0) & choose_front & (front_score >= thr * 0.92)] = '前残り穴候補'
+    reason.loc[(flag <= 0) & (~choose_front) & (rear_score >= thr * 0.92)] = '差し込み穴候補'
+    return score, flag, reason
+
+def _nrr_load_weights(nr: dict) -> tuple[float, ...]:
+    """next_run_rules から8つの重みを読んで正規化し、タプルで返す。
+
+    Returns: (aw, rw, sw, dw, tw, cw, uw, pw) — 合計1.0に正規化済み
+    """
+    aw = float(nr.get('ability_weight',      0.22) or 0.22)
+    rw = float(nr.get('recent_weight',       0.18) or 0.18)
+    sw = float(nr.get('stability_weight',    0.16) or 0.16)
+    dw = float(nr.get('distance_weight',     0.14) or 0.14)
+    tw = float(nr.get('training_weight',     0.12) or 0.12)
+    cw = float(nr.get('comment_trend_weight',0.08) or 0.08)
+    uw = float(nr.get('upside_weight',       0.06) or 0.06)
+    pw = float(nr.get('place_axis_weight',   0.04) or 0.04)
+    ws = aw + rw + sw + dw + tw + cw + uw + pw
+    if ws <= 0:
+        aw, rw, sw, dw, tw, cw, uw, pw = 0.22, 0.18, 0.16, 0.14, 0.12, 0.08, 0.06, 0.04
+        ws = 1.0
+    return tuple(x / ws for x in (aw, rw, sw, dw, tw, cw, uw, pw))
+
+
+def _nrr_compute_score(
+    df: pd.DataFrame,
+    meta: dict,
+    nr: dict,
+    weights: tuple,
+    stability: 'pd.Series',
+    distance: 'pd.Series',
+    training: 'pd.Series',
+    trend: 'pd.Series',
+    recovery: 'pd.Series',
+    insurance_count: 'pd.Series',
+    train_rank: 'pd.Series',
+    delta_train: 'pd.Series',
+    front_fade: 'pd.Series',
+    start_risk: 'pd.Series',
+    temperament: 'pd.Series',
+    stamina_risk: 'pd.Series',
+) -> 'pd.Series':
+    """ベーススコア + ボーナス/ペナルティ → score Series (0–100) を計算する。"""
+    aw, rw, sw, dw, tw, cw, uw, pw = weights
+
+    base = (
+        aw * _num_series(df, 'AbilityBaseScore', 50.0)
+        + rw * _num_series(df, 'RecentFormScore', 50.0)
+        + sw * stability
+        + dw * distance
+        + tw * training
+        + cw * trend
+        + uw * _num_series(df, 'Upside', 50.0)
+        + pw * _num_series(df, ['PlaceAxisScore', 'SAS'], 50.0)
+    )
+
+    recovery_bonus        = recovery.astype(float) * float(nr.get('recovery_signal_bonus',        4.0) or 4.0)
+    insurance_bonus       = (insurance_count.clip(lower=0.0) - 1.0).clip(lower=0.0) * float(nr.get('insurance_signal_bonus', 1.2) or 1.2)
+    train_rank_bonus      = (train_rank <= 3.0).astype(float) * float(nr.get('training_rank_bonus',  2.0) or 2.0)
+    delta_bonus           = (delta_train >= 1.0).astype(float) * float(nr.get('delta_train_bonus',   1.0) or 1.0)
+    start_issue_bonus     = ((start_risk > 0.0) & (base >= 58.0)).astype(float) * float(nr.get('start_issue_bonus',     1.5) or 1.5)
+    temperament_relief_bonus = (
+        (temperament.between(2.0, 8.0, inclusive='both')) & (trend >= 55.0)
+    ).astype(float) * float(nr.get('temperament_relief_bonus', 1.0) or 1.0)
+
+    pace_mismatch_bonus = pd.Series([0.0] * len(df), index=df.index, dtype=float)
+    if _is_long_maiden_race(meta, df):
+        pace_mismatch_bonus = (
+            ((front_fade > 0.0) | (stamina_risk > 2.0)) & (base >= 60.0)
+        ).astype(float) * float(nr.get('pace_mismatch_bonus', 2.0) or 2.0)
+
+    severe_temp_pen    = (temperament - 10.0).clip(lower=0.0) * float(nr.get('severe_temp_penalty_scale',    1.2) or 1.2)
+    severe_stamina_pen = (stamina_risk -  6.0).clip(lower=0.0) * float(nr.get('severe_stamina_penalty_scale', 1.0) or 1.0)
+
+    return (
+        base
+        + recovery_bonus + insurance_bonus + train_rank_bonus + delta_bonus
+        + pace_mismatch_bonus + start_issue_bonus + temperament_relief_bonus
+        - severe_temp_pen - severe_stamina_pen
+    ).clip(lower=0.0, upper=100.0)
+
+
+def _nrr_build_reason_tags(
+    df: pd.DataFrame,
+    stability: 'pd.Series',
+    distance: 'pd.Series',
+    training: 'pd.Series',
+    train_rank: 'pd.Series',
+    trend: 'pd.Series',
+    recovery: 'pd.Series',
+    insurance_count: 'pd.Series',
+    front_fade: 'pd.Series',
+    start_risk: 'pd.Series',
+    stamina_risk: 'pd.Series',
+) -> tuple[list, list]:
+    """馬ごとに理由タグと短文コメントリストを構築して返す。
+
+    Returns: (reason_tags, reason_short) — df.index 順の list[str]
+    """
+    reason_tags: list[str] = []
+    reason_short: list[str] = []
+    for i in df.index:
+        tags: list[str] = []
+        short: list[str] = []
+        if float(stability.loc[i]) >= 60.0:
+            tags.append('安定')
+        if float(distance.loc[i]) >= 60.0:
+            tags.append('距離')
+        if float(training.loc[i]) >= 60.0 or float(train_rank.loc[i]) <= 3.0:
+            tags.append('調教')
+        if float(trend.loc[i]) >= 55.0:
+            tags.append('上昇')
+        if int(recovery.loc[i]) > 0:
+            tags.append('回復')
+        if int(insurance_count.loc[i]) >= 3:
+            tags.append('保険')
+        if float(front_fade.loc[i]) > 0.0:
+            short.append('今回前受け過信禁物→次走条件替わり注目')
+        if float(start_risk.loc[i]) > 0.0:
+            short.append('発馬ひとつで前進余地')
+        if float(stamina_risk.loc[i]) > 2.0:
+            short.append('距離・流れ替わりで見直し')
+        if not short:
+            if tags:
+                short.append('基礎点が高く次走も継続注目')
+            else:
+                short.append('総合点ベースで次走注意')
+        reason_tags.append('・'.join(tags[:6]))
+        reason_short.append(' / '.join(short[:2]))
+    return reason_tags, reason_short
+
+
+def compute_next_run_recommendation_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
+    """次走推奨スコアとフラグ・理由を返す。
+    
+    Returns:
+        (score, main_flag, watch_flag, reason_tags, reason_short)
+    """
+    nr = ((params or {}).get('next_run_rules', {}) or {})
+    if not bool(nr.get('enabled', True)):
+        zf = pd.Series([0.0] * len(df), index=df.index, dtype=float)
+        zi = pd.Series([0]   * len(df), index=df.index, dtype=int)
+        zs = pd.Series(['']  * len(df), index=df.index, dtype=str)
+        return zf, zi, zi, zs, zs
+
+    weights = _nrr_load_weights(nr)
+
+    stability       = _num_series(df, ['StabilityComposite', 'SAS'], 50.0)
+    distance        = _num_series(df, ['DistanceSuitScore', 'ConditionFit'], 50.0)
+    training        = _num_series(df, 'TrainingScore',        50.0)
+    trend           = _num_series(df, 'CommentTrend',         50.0)
+    recovery        = _num_series(df, 'RecoverySignal',        0.0)
+    insurance_count = _num_series(df, 'InsuranceSignalCount',  0.0)
+    train_rank      = _num_series(df, 'TrainingRank',        999.0)
+    delta_train     = _num_series(df, 'delta_train',           0.0)
+    front_fade      = _num_series(df, 'LongFrontFadeRisk',     0.0)
+    start_risk      = _num_series(df, 'StartRiskShort',        0.0)
+    temperament     = _num_series(df, 'TemperamentRisk',       0.0)
+    stamina_risk    = _num_series(df, 'DistanceStaminaRisk',   0.0)
+
+    score = _nrr_compute_score(
+        df, meta, nr, weights,
+        stability, distance, training, trend, recovery,
+        insurance_count, train_rank, delta_train,
+        front_fade, start_risk, temperament, stamina_risk,
+    )
+
+    main_min   = float(nr.get('main_score_min',  62.0) or 62.0)
+    watch_min  = float(nr.get('watch_score_min', 57.0) or 57.0)
+    main_flag  = (score >= main_min).astype(int)
+    watch_flag = (score >= watch_min).astype(int)
+
+    reason_tags, reason_short = _nrr_build_reason_tags(
+        df, stability, distance, training, train_rank, trend,
+        recovery, insurance_count, front_fade, start_risk, stamina_risk,
+    )
+
+    return (
+        _num_series(score,      0.0, index=df.index),
+        _num_series(main_flag,  0,   index=df.index, dtype=int),
+        _num_series(watch_flag, 0,   index=df.index, dtype=int),
+        pd.Series(reason_tags,  index=df.index, dtype=str),
+        pd.Series(reason_short, index=df.index, dtype=str),
+    )
+
+def compute_ability_base_score_v1_1(df: pd.DataFrame, params: Optional[dict] = None) -> pd.Series:
+    """能力ベーススコア (0–100) を時計・安定・主軸評価から計算する。"""
+    wp = ((params or {}).get('win_pattern_rules', {}) or {})
+    aw_time = float(wp.get('ability_time_weight', 0.18) or 0.18)
+    aw_cons = float(wp.get('ability_consist_weight', 0.12) or 0.12)
+    aw_main = float(max(0.0, 1.0 - aw_time - aw_cons))
+    ab = _num_series(df, 'Ability', 50.0)
+    tf = _num_series(df, 'TimeFit', 50.0)
+    cs = _num_series(df, 'Consist', 50.0)
+    out = (aw_main * ab + aw_time * tf + aw_cons * cs).clip(lower=0.0, upper=100.0)
+    return _num_series(out, 50.0, index=df.index)
+
+
+def compute_recent_form_score_v1_1(df: pd.DataFrame, params: Optional[dict] = None) -> pd.Series:
+    """近走フォームスコア (0–100) を計算する。"""
+    wp = ((params or {}).get('win_pattern_rules', {}) or {})
+    wt = float(wp.get('recent_training_weight', 0.58) or 0.58)
+    wr = float(wp.get('recent_trend_weight', 0.27) or 0.27)
+    wd = float(wp.get('recent_delta_weight', 0.15) or 0.15)
+    s = wt + wr + wd
+    if s <= 0:
+        wt, wr, wd = 0.58, 0.27, 0.15
+        s = 1.0
+    wt, wr, wd = wt / s, wr / s, wd / s
+    tr = _num_series(df, 'TrainingScore', 50.0)
+    ct = _num_series(df, 'CommentTrend', 50.0)
+    dt = _num_series(df, 'delta_train', 0.0)
+    dt01 = (50.0 + 12.0 * dt).clip(lower=0.0, upper=100.0)
+    out = (wt * tr + wr * ct + wd * dt01).clip(lower=0.0, upper=100.0)
+    return _num_series(out, 50.0, index=df.index)
+
+
+def compute_race_condition_score_v1_1(df: pd.DataFrame, params: Optional[dict] = None) -> pd.Series:
+    """レース条件適性スコア (0–100) を馬場・距離・コースから計算する。"""
+    wp = ((params or {}).get('win_pattern_rules', {}) or {})
+    ww = {
+        'PaceFit': float(wp.get('race_pace_weight', 0.30) or 0.30),
+        'GateFit': float(wp.get('race_gate_weight', 0.24) or 0.24),
+        'ConditionFit': float(wp.get('race_condition_weight', 0.26) or 0.26),
+        'MapFit': float(wp.get('race_map_weight', 0.12) or 0.12),
+        'PosFit': float(wp.get('race_pos_weight', 0.08) or 0.08),
+    }
+    s = sum(max(0.0, float(v)) for v in ww.values())
+    if s <= 0:
+        ww = {'PaceFit': 0.30, 'GateFit': 0.24, 'ConditionFit': 0.26, 'MapFit': 0.12, 'PosFit': 0.08}
+        s = 1.0
+    out = pd.Series([0.0] * len(df), index=df.index, dtype=float)
+    for k, v in ww.items():
+        out = out + (max(0.0, float(v)) / s) * _num_series(df, k, 50.0)
+    return _num_series(out, 50.0, index=df.index, lower=0.0, upper=100.0)
+
+
+def compute_temperament_risk_v1_1(df: pd.DataFrame, params: Optional[dict] = None) -> pd.Series:
+    """気性リスクスコアをコメントタグから計算する。"""
+    tags = df.get('comment_tags', pd.Series([''] * len(df), index=df.index)).astype(str)
+    short = df.get('comment_short', pd.Series([''] * len(df), index=df.index)).astype(str)
+    cr = _num_series(df, 'CommentRisk', 0.0)
+    kickback = short.str.contains(r'キックバック|砂を被|砂を嫌', regex=True, na=False)
+    focus = short.str.contains(r'集中|気難|イレ込|テンション|気持ち|ムラ|若さ|幼さ|掛か|行きたが', regex=True, na=False)
+    start = short.str.contains(r'出遅|スタート|ゲート|発馬|一歩目|二の脚|ダッシュ|行き脚', regex=True, na=False) | _comment_tag_mask(tags, ['G-出遅', 'G-スタートひと息', 'G-ゲートひと息', 'G-ゲート不安', 'G-1歩目は速くない', 'G-一歩目は速くない', 'G-ダッシュ付か', 'G-行き脚つか', 'G-モサッ', 'G-スタート課題', 'G-発馬課題'])
+    base = (cr / 100.0) * 4.0
+    risk = base + kickback.astype(float) * 3.5 + focus.astype(float) * 3.0 + start.astype(float) * 2.5
+    return _num_series(risk, 0.0, index=df.index, lower=0.0, upper=14.0)
+
+def compute_insurance_signals_v1_1(df: pd.DataFrame, params: Optional[dict] = None) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
+    """保険シグナル群を返す (count / flag / reason / delta_train / train_rank)。
+    
+    Returns:
+        (count, flag, reason, delta_train, train_rank)
+    """
+    ir = ((params or {}).get('insurance_rules', {}) or {})
+    rise_thr = float(ir.get('rise_trend_threshold', 58.0) or 58.0)
+    delta_thr = float(ir.get('delta_train_threshold', 1.0) or 1.0)
+    tr_thr = float(ir.get('training_score_threshold', 58.0) or 58.0)
+    tr_rank_thr = int(ir.get('training_rank_threshold', 4) or 4)
+    comment_thr = float(ir.get('comment_fit_threshold', 56.0) or 56.0)
+    track_thr = float(ir.get('track_adv_threshold', 58.0) or 58.0)
+
+    trend = _num_series(df, 'CommentTrend', 50.0)
+    delta = _num_series(df, 'delta_train', 0.0)
+    training_score = _num_series(df, 'TrainingScore', 50.0)
+    training_rank = _num_series(df, 'TrainingRank', 999.0)
+    comment_fit = _num_series(df, 'CommentFit', 50.0)
+    comment_condition = _num_series(df, 'CommentCondition', 50.0)
+    map_fit = _num_series(df, 'MapFit', 50.0)
+    condition_fit = _num_series(df, 'ConditionFit', 50.0)
+    pos_fit = _num_series(df, 'PosFit', 50.0)
+
+    rise = ((trend >= rise_thr) | (delta >= delta_thr)).astype(int)
+    training = ((training_score >= tr_thr) | (training_rank <= tr_rank_thr)).astype(int)
+    comment = ((comment_fit >= comment_thr) | (comment_condition >= track_thr) | (trend >= rise_thr)).astype(int)
+    track = ((map_fit >= track_thr) | (condition_fit >= track_thr) | (pos_fit >= track_thr)).astype(int)
+    count = (rise + training + comment + track).astype(int)
+    return count, rise.astype(int), training.astype(int), comment.astype(int), track.astype(int)
+
+def compute_front_collapse_risk_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> pd.Series:
+    """先行馬の崩れリスクスコア (0–100) を計算する。"""
+    params = params or {}
+    pace = str((meta or {}).get('pace', '') or '').upper().strip()[:1]
+    dist, surface = _meta_distance_surface(meta)
+    if pace != 'H':
+        return pd.Series([0.0] * len(df), index=df.index, dtype=float)
+
+    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    pf = _num_series(df, 'pred_first3f', np.nan)
+    pl = _num_series(df, 'pred_last3f', np.nan)
+    cg = _num_series(df, 'CommentGate', 50.0)
+    tags = df.get('comment_tags', pd.Series([''] * len(df), index=df.index)).astype(str)
+
+    try:
+        base_front = float(params.get('high_pace_front_base_penalty', 8.0) or 8.0)
+        fast_pen = float(params.get('high_pace_first3f_leader_penalty', 4.0) or 4.0)
+        bad_gate_pen = float(params.get('high_pace_bad_gate_penalty', 4.0) or 4.0)
+        last_relief = float(params.get('high_pace_last3f_relief', 5.0) or 5.0)
+        middle_relief = float(params.get('high_pace_middle_relief', 3.0) or 3.0)
+    except Exception:
+        base_front, fast_pen, bad_gate_pen, last_relief, middle_relief = 8.0, 4.0, 4.0, 5.0, 3.0
+
+    risk = pd.Series([0.0] * len(df), index=df.index, dtype=float)
+    risk.loc[z == 'FRONT'] += base_front
+    risk.loc[z == 'MIDDLE'] += 2.0
+
+    try:
+        pf_rank = pf.rank(method='min', ascending=True)
+        risk.loc[pf_rank <= 2.0] += fast_pen
+    except Exception:
+        pass
+
+    bad_gate_mask = (cg < 45.0) | _comment_tag_mask(tags, ['G-出遅', 'G-スタートひと息', 'G-ゲートひと息', 'G-ゲート不安', 'G-1歩目は速くない', 'G-一歩目は速くない', 'G-ダッシュ付か', 'G-行き脚つか', 'G-モサッ'])
+    risk.loc[bad_gate_mask] += bad_gate_pen
+
+    try:
+        pl_rank = pl.rank(method='min', ascending=True)
+        risk.loc[pl_rank <= 6.0] -= last_relief
+    except Exception:
+        pass
+    risk.loc[z == 'MIDDLE'] -= middle_relief
+
+    if surface == 'dirt' and np.isfinite(dist) and dist <= 1400:
+        risk = risk * 1.15
+
+    return _num_series(risk, 0.0, index=df.index, lower=0.0, upper=12.0)
+
+def compute_start_risk_short_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> pd.Series:
+    """短距離戦でのスタートリスクスコア (0–100) を計算する。"""
+    _ = params or {}
+    dist, surface = _meta_distance_surface(meta)
+    out = pd.Series([0.0] * len(df), index=df.index, dtype=float)
+    if surface != 'dirt' or not np.isfinite(dist):
+        return out
+
+    cg = _num_series(df, 'CommentGate', 50.0)
+    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    tags = df.get('comment_tags', pd.Series([''] * len(df), index=df.index)).astype(str)
+    bad_gate_mask = (cg < 45.0) | _comment_tag_mask(tags, ['G-出遅', 'G-スタートひと息', 'G-ゲートひと息', 'G-ゲート不安', 'G-1歩目は速くない', 'G-一歩目は速くない', 'G-ダッシュ付か', 'G-行き脚つか', 'G-モサッ'])
+
+    if dist <= 1200:
+        out.loc[cg < 45.0] += 4.0
+        out.loc[bad_gate_mask] += 4.0
+        out.loc[z == 'FRONT'] += 2.0
+    elif dist <= 1400:
+        out.loc[cg < 45.0] += 2.5
+        out.loc[bad_gate_mask] += 2.5
+
+    return _num_series(out, 0.0, index=df.index, lower=0.0, upper=10.0)
+
+def compute_factorfit(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """ファクター印を点数化。
+
+    v1.1 までは最初の列を "dirt" 扱いにしていたが、実データでは
+    ここが「道悪」になるケースが多い。
+
+    - michiaku (道悪) があればそれを優先
+    - なければ dirt を代用
+
+    Returns:
+      FactorPts: 合計点 (max 12)
+      FactorFit: 0-100
+      MichiakuFit: 道悪列のみ 0-100（max=◎=2.0 -> 100）
+    """
+    # 道悪列の優先順位
+    first_col = "michiaku" if "michiaku" in df.columns else ("dirt" if "dirt" in df.columns else None)
+
+    cols = [c for c in [first_col, "course", "distance", "last", "training", "record"] if c]
+
+    pts = []
+    mich = []
+    for i in df.index:
+        p = 0.0
+        mpt = 0.0
+        for c in cols:
+            series = df.get(c, pd.Series([""] * len(df)))
+            v = factor_mark_to_points(series.loc[i])
+            p += v
+            if c == first_col:
+                mpt = v
+        pts.append(p)
+        mich.append(mpt)
+
+    pts_s = pd.Series(pts, index=df.index, dtype=float)
+    fit_s = (pts_s / 12.0 * 100.0).astype(float)
+    mich_fit = (pd.Series(mich, index=df.index, dtype=float) / 2.0 * 100.0).astype(float)
+    return pts_s, fit_s, mich_fit
+
+
+def _is_wet_track(meta: Dict[str, str]) -> bool:
+    """馬場が『道悪寄り』かを判定（超簡易）。
+
+    - 芝/ダ の going が 稍重/重/不良
+    - or wetness_score_* が一定以上
+
+    目的: 道悪印（◎○△）を強めに効かせるスイッチ。
+    """
+    tg = str(meta.get("turf_going", "")).strip()
+    dg = str(meta.get("dirt_going", "")).strip()
+    if tg in ["稍重", "重", "不良"]:
+        return True
+    if dg in ["稍重", "重", "不良"]:
+        return True
+
+    def _f(k: str) -> float:
+        """meta 辞書からキー k の値を float に変換するショートハンド。失敗時は nan。"""
+        try:
+            return float(str(meta.get(k, "")).strip())
+        except Exception:
+            return float("nan")
+
+    # 含水率OCRが取れている場合
+    for k in ["wetness_score_turf_goal", "wetness_score_turf_4c", "wetness_score_dirt_goal", "wetness_score_dirt_4c"]:
+        v = _f(k)
+        if np.isfinite(v) and v >= 30.0:
+            return True
+
+    return False
+
+
+def weighted_geomean_0_100(row: pd.Series, keys: list[str], weights: dict[str, float], floor: float = 5.0, ceil: float = 95.0) -> float:
+    """0-100スコア群の重み付き幾何平均（掛算式）。
+
+    - 各要素を [floor, ceil] にクリップして log を取る
+    - weights の合計は1.0想定（多少ズレても内部で正規化はしない）
+
+    目的: どれか1要素が極端に悪いとスコアが伸びない（=弱点を隠しにくい）設計。
+    """
+    eps = 1e-9
+    z = 0.0
+    for k in keys:
+        w = float(weights.get(k, 0.0))
+        if w <= 0:
+            continue
+        try:
+            x = float(row.get(k, np.nan))
+        except Exception:
+            x = np.nan
+        if not np.isfinite(x):
+            x = 50.0
+        x = clamp(x, float(floor), float(ceil))
+        z += w * float(np.log(max(eps, x / 100.0)))
+    out = 100.0 * float(np.exp(z))
+    return float(clamp(out, 0.0, 100.0))
+
+
+def weighted_geomean_df_0_100(df: pd.DataFrame, keys: list[str], weights: dict[str, float], floor: float = 5.0, ceil: float = 95.0) -> pd.Series:
+    """DataFrame行方向に weighted_geomean_0_100 を適用。
+
+    NOTE: v9では compute_scores_v1_1 から参照されるが定義が欠けていたため追加。
+    """
+    if df is None or len(df) == 0:
+        return pd.Series([], dtype=float)
+    return df.apply(lambda r: weighted_geomean_0_100(r, keys, weights, floor=floor, ceil=ceil), axis=1).astype(float)
+
+
+
+
+# =========================
+# COMMENT FEATURES (厩舎コメント / 前走インタビュー)
+# =========================
+
+def _norm_jp_text(s: str) -> str:
+    """入力を str() で文字列化して返す。None や変換失敗の場合は空文字列を返す。"""
+    try:
+        s = str(s)
+    except Exception:
+        return ''
+    s = s.replace('　', ' ')
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _split_comment_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """入力コメントDFを正規化。
+
+    想定カラム（どれかあればOK）:
+      - num / horse_num / 馬番
+      - text / comment / コメント
+      - type / kind / source / 種別（厩舎/騎手/インタビュー/調教 等）
+
+    返却: columns=['num','type','text']
+    """
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=['num','type','text'])
+
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    ren = {
+        'horse_num': 'num',
+        '馬番': 'num',
+        '番号': 'num',
+        '#': 'num',
+        'comment': 'text',
+        'コメント': 'text',
+        '本文': 'text',
+        'source': 'type',
+        'kind': 'type',
+        '種別': 'type',
+        '分類': 'type',
+    }
+    for k, v in ren.items():
+        if k in df.columns and v not in df.columns:
+            df = df.rename(columns={k: v})
+
+    if 'num' not in df.columns:
+        df['num'] = df.iloc[:, 0]
+
+    if 'text' not in df.columns:
+        cols = [c for c in df.columns if c != 'num']
+        if len(cols) == 0:
+            df['text'] = ''
+        else:
+            df['text'] = df[cols].astype(str).agg(' '.join, axis=1)
+
+    if 'type' not in df.columns:
+        df['type'] = 'comment'
+
+    df['num'] = df['num'].astype(str).str.strip()
+    df['type'] = df['type'].astype(str).apply(_norm_jp_text)
+    df['text'] = df['text'].astype(str).apply(_norm_jp_text)
+
+    df = df[df['num'].str.len() > 0].copy()
+    df = df[df['text'].str.len() > 0].copy()
+
+    return df[['num','type','text']].reset_index(drop=True)
+
+
+def _cks_keyword_lists() -> dict:
+    """_comment_keyword_score 用キーワードリスト定義を返す。(R21: 分割)"""
+    return {
+        'pos_strong': [
+            '仕上がり良', '出来が良', '状態良', '絶好', '好調', '順調', '上々', '反応良', '動き良', '脚色良',
+            '余裕', '手応え', '自信', '万全', '力出せ', '勝ち負け', '一変', '気配上昇',
+        ],
+        'pos_soft': ['悪くない', 'まずまず', '順調だが', '良化', '上向', '前進', '変わり身', '戻ってきた', '上積'],
+        'neg_strong': [
+            '不安', '厳しい', '無理', '難しい', '痛', '疲れ', '反動', '体調落', '気配ひと息', '重い',
+            '息が', 'まだ', '太い', 'テンション高', 'イレ込', '気難', '折り合い', '行きたが', 'ズブい',
+            '砂を嫌', 'キックバック', '砂を被', '集中力続か', '集中できない', 'ムラ', '幼い', '若さ', '気持ちが続か', 'スタート課題',
+        ],
+        'neg_soft': ['もうひとつ', '課題', '様子見', '良くも悪くも', '変わらず', '気持ち次第', '気ムラ', '幼さ残', '若さ残'],
+        'up_words': ['上向', '良化', '反応良', '一段', '動き良', '前進', '成長', '上積', '良くなっている', '徐々に良く', '一変', '気配上昇'],
+        'down_words': ['重い', '息が', '疲れ', '反動', '不安', '太い', '平行線', '幼さ残', '若さ残'],
+        'gate_pos': ['スタート決め', 'ゲート出', '行き脚', '二の脚', 'ダッシュ', '発馬', 'しっかり出', '五分に出', '先手'],
+        'gate_neg': ['出遅', 'スタートひと息', 'ゲートひと息', 'ゲート不安', '1歩目は速くない', '一歩目は速くない',
+                     'ダッシュ付か', '行き脚つか', 'モサッ', 'スタート課題', '発馬課題', '二の脚ひと息', '出脚鈍'],
+        'cond_pos': ['短距離ダート', 'ダート短距離', '短距離のダート', '条件替わり', '条件合う', 'この条件',
+                     'ダート替わり', '距離短縮', '距離は合う', '適性', '合いそう', '良さが出', '舞台向く', 'いい勝負',
+                     '砂を被らず', '砂を被らない'],
+        'cond_neg': ['距離長', '距離忙しい', 'ダートどうか', 'ダートは未知',
+                     '条件が鍵', '条件微妙', '忙しい印象', '砂を被ると', 'キックバック嫌', '砂を嫌', '外を回したい',
+                     # R19: 距離ネガティブ
+                     'もう少し短め', '短めの距離', '短い方が', '距離長い印象', '距離が長い',
+                     '1400あたりが', '1600あたりが', '1800あたりが', 'このくらいが上限',
+                     '短距離向き', 'マイラー向き', '短めが向', 'もう少し短い距離'],
+        'trend_pos': ['良化', '上向', '前進', '変わり身', '一段', '上積', '成長', '徐々に良く', '良くなっている',
+                      '状態上向', '反応良', '一変', '気配上昇'],
+        'trend_neg': ['平行線', '変わらず', 'もうひとつ', '叩いてから', 'まだ重い', '良化途上', '若さ残', '幼さ残'],
+    }
+
+
+def _comment_keyword_score(text: str) -> dict:
+    """辞書ベースの超軽量スコア（NLPなし）。(R21: キーワードリストを _cks_keyword_lists に分離)"""
+    t = _norm_jp_text(text)
+    if not t:
+        return {
+            'pos': 0.0, 'neg': 0.0, 'up': 0.0, 'down': 0.0,
+            'gate_pos': 0.0, 'gate_neg': 0.0,
+            'cond_pos': 0.0, 'cond_neg': 0.0,
+            'trend_pos': 0.0, 'trend_neg': 0.0,
+            'sanko_gai': 0.0,  # R19
+            'tags': [],
+        }
+
+    kw = _cks_keyword_lists()
+    pos = neg = up = down = 0.0
+    gate_pos = gate_neg = 0.0
+    cond_pos = cond_neg = 0.0
+    trend_pos = trend_neg = 0.0
+    sanko_gai = 0.0
+    tags: list = []
+
+    for w in kw['pos_strong']:
+        if w in t:
+            pos += 2.0
+            tags.append(f'+{w}')
+    for w in kw['pos_soft']:
+        if w in t:
+            pos += 1.0
+            tags.append(f'+{w}')
+    for w in kw['neg_strong']:
+        if w in t:
+            neg += 2.0
+            tags.append(f'-{w}')
+    for w in kw['neg_soft']:
+        if w in t:
+            neg += 1.0
+            tags.append(f'-{w}')
+    for w in kw['up_words']:
+        if w in t:
+            up += 1.0
+    for w in kw['down_words']:
+        if w in t:
+            down += 1.0
+    for w in kw['gate_pos']:
+        if w in t:
+            gate_pos += 1.0
+            tags.append(f'G+{w}')
+    for w in kw['gate_neg']:
+        if w in t:
+            gate_neg += 1.0
+            tags.append(f'G-{w}')
+    for w in kw['cond_pos']:
+        if w in t:
+            cond_pos += 1.0
+            tags.append(f'C+{w}')
+    for w in kw['cond_neg']:
+        if w in t:
+            cond_neg += 1.0
+            tags.append(f'C-{w}')
+    for w in kw['trend_pos']:
+        if w in t:
+            trend_pos += 1.0
+            tags.append(f'T+{w}')
+    for w in kw['trend_neg']:
+        if w in t:
+            trend_neg += 1.0
+            tags.append(f'T-{w}')
+
+    # R19: 参考外 / 度外視 検出
+    if '参考外' in t or '度外視' in t:
+        sanko_gai = 1.0
+        tags.append('SANKO_GAI')
+
+    return {
+        'pos': pos, 'neg': neg, 'up': up, 'down': down,
+        'gate_pos': gate_pos, 'gate_neg': gate_neg,
+        'cond_pos': cond_pos, 'cond_neg': cond_neg,
+        'trend_pos': trend_pos, 'trend_neg': trend_neg,
+        'sanko_gai': sanko_gai,  # R19
+        'tags': tags,
+    }
+
+
+def build_comment_features(entries: pd.DataFrame, comments_df: pd.DataFrame, params: dict | None = None) -> pd.DataFrame:
+    """entries に CommentFit/comment_short/comment_tags を付与。"""
+    params = params or {}
+    cf = (params.get('comment_features', {}) or {})
+
+    def _neutral(base_df: pd.DataFrame) -> pd.DataFrame:
+        """        コメント関連スコア列（CommentFit/CommentRisk/CommentGate/CommentTags/CommentShort）を
+        中立値で埋めた DataFrame コピーを返す。
+        """
+        out = base_df.copy()
+        out['CommentFit'] = 50.0
+        out['CommentRisk'] = 0.0
+        out['CommentGate'] = 50.0
+        out['CommentCondition'] = 50.0
+        out['CommentTrend'] = 50.0
+        out['comment_short'] = ''
+        out['comment_tags'] = ''
+        return out
+
+    if not bool(cf.get('enabled', True)):
+        return _neutral(entries.copy())
+
+    base = entries.copy()
+    base['num'] = base.get('num', '').astype(str).str.strip()
+
+    cdf = _split_comment_rows(comments_df)
+    if cdf is None or len(cdf) == 0:
+        return _neutral(base)
+
+    def _w(t: str) -> float:
+        """コメントソース種別 t に応じた重み（厩舎=1.0, 騎手=0.8 等）を返す。"""
+        tt = str(t or '')
+        if any(k in tt for k in ['厩舎', '調教師', '厩舎コメント']):
+            return 1.0
+        if any(k in tt for k in ['騎手', 'ジョッキー']):
+            return 0.85
+        if any(k in tt for k in ['インタビュー', '取材', '談話']):
+            return 0.8
+        return 0.7
+
+    rows = []
+    for _, r in cdf.iterrows():
+        num = str(r['num']).strip()
+        typ = str(r.get('type','comment'))
+        txt = str(r.get('text',''))
+        sc = _comment_keyword_score(txt)
+        w = _w(typ)
+        rows.append({
+            'num': num,
+            'pos': sc['pos'] * w,
+            'neg': sc['neg'] * w,
+            'up': sc['up'] * w,
+            'down': sc['down'] * w,
+            'gate_pos': sc['gate_pos'] * w,
+            'gate_neg': sc['gate_neg'] * w,
+            'cond_pos': sc['cond_pos'] * w,
+            'cond_neg': sc['cond_neg'] * w,
+            'trend_pos': sc['trend_pos'] * w,
+            'trend_neg': sc['trend_neg'] * w,
+            'sanko_gai': float(sc.get('sanko_gai', 0.0)),  # R19
+            'tags': ' '.join(sc['tags'][:10]),
+            'text': txt,
+        })
+
+    agg = pd.DataFrame(rows)
+    if len(agg) == 0:
+        return _neutral(base)
+
+    g = agg.groupby('num', as_index=False).agg({
+        'pos':'sum','neg':'sum','up':'sum','down':'sum',
+        'gate_pos':'sum','gate_neg':'sum',
+        'cond_pos':'sum','cond_neg':'sum',
+        'trend_pos':'sum','trend_neg':'sum',
+        'sanko_gai': 'max',  # R19: 参考外フラグ最大値
+        'tags': lambda s: ' | '.join([x for x in s.tolist() if str(x).strip()][:3]),
+        'text': lambda s: ' / '.join([_norm_jp_text(x) for x in s.tolist() if _norm_jp_text(x)][:2]),
+    })
+
+    gate_scale = float(cf.get('gate_score_scale', 7.5) or 7.5)
+    cond_scale = float(cf.get('condition_score_scale', 8.5) or 8.5)
+    trend_scale = float(cf.get('trend_score_scale', 8.5) or 8.5)
+    temp_risk_scale = float(cf.get('temperament_risk_scale', 10.0) or 10.0)
+    start_risk_scale = float(cf.get('start_risk_scale', 6.0) or 6.0)
+
+    g['CommentFit'] = 50.0 + (g['pos'] - g['neg']) * 6.0 + (g['up'] - g['down']) * 3.0
+    g['CommentFit'] = g['CommentFit'].clip(lower=0.0, upper=100.0)
+    g['CommentGate'] = (50.0 + (g['gate_pos'] - g['gate_neg']) * gate_scale).clip(lower=0.0, upper=100.0)
+    g['CommentCondition'] = (50.0 + (g['cond_pos'] - g['cond_neg']) * cond_scale).clip(lower=0.0, upper=100.0)
+    g['CommentTrend'] = (50.0 + (g['trend_pos'] - g['trend_neg']) * trend_scale).clip(lower=0.0, upper=100.0)
+    try:
+        g['temp_hits'] = g['text'].astype(str).str.count(r'キックバック|砂を被|砂を嫌|集中|気難|イレ込|テンション|気持ち|ムラ|若さ|幼さ')
+        g['start_hits'] = g['text'].astype(str).str.count(r'出遅|スタート|ゲート|発馬|一歩目|二の脚|ダッシュ|行き脚')
+        # R22: 前走インタビューに「のっそり」「行き脚つかない」等が含まれる場合の追加ペナルティ
+        _prev_intvw_penalty = float(cf.get('start_risk_prev_interview_penalty', 3.0) or 3.0)
+        _apply_to_anchor   = bool(cf.get('start_risk_apply_to_anchor', True))
+        g['prev_interview_hits'] = g['text'].astype(str).str.count(
+            r'のっそり|もたもた|行き脚つかな|ひと息|スタートいまひとつ|出遅れ気味|1歩目|二の足'
+        )
+        g['StartRiskInterviewPenalty'] = (g['prev_interview_hits'] * _prev_intvw_penalty).clip(lower=0.0, upper=15.0)
+        # R26: 前走コメントに「出遅れ」「ゲート不利」等が含まれる場合のリカバリーボーナス
+        _gate_kws  = cf.get('gate_recovery_keywords',
+                            ['出遅れ', 'ゲート不利', '発走不利', '後手', 'スタートでつまずかれ', '出し遅れ'])
+        _gate_pat  = '|'.join([re.escape(k) for k in _gate_kws if k])
+        _gate_bon  = float(cf.get('gate_recovery_bonus', 2.5) or 2.5)
+        if _gate_pat:
+            g['gate_recovery_hits'] = g['text'].astype(str).str.count(_gate_pat)
+            _grb_max_raw = cf.get('gate_recovery_bonus_max', 7.5)
+            _grb_max = float(_grb_max_raw) if _grb_max_raw is not None else 7.5  # R37: パラメータ化 (0.0許容)
+            g['GateRecoveryBonus']  = (g['gate_recovery_hits'] * _gate_bon).clip(lower=0.0, upper=_grb_max)
+            g['CommentFit'] = (g['CommentFit'] + g['GateRecoveryBonus']).clip(lower=0.0, upper=100.0)
+        else:
+            g['GateRecoveryBonus'] = 0.0
+        g['CommentRisk'] = (
+            g['neg'] * 8.0
+            + g['down'] * 4.0
+            + g['gate_neg'] * 6.5
+            + g['cond_neg'] * 4.0
+            + g['trend_neg'] * 3.5
+            + g['temp_hits'] * temp_risk_scale
+            + g['start_hits'] * start_risk_scale
+            + g.get('StartRiskInterviewPenalty', 0.0)
+        ).clip(lower=0.0, upper=100.0)
+    except Exception:
+        g['CommentRisk'] = 0.0
+    g['comment_short'] = g['text'].astype(str).apply(lambda x: (x[:70] + '…') if len(x) > 70 else x)
+    g['comment_tags'] = g['tags'].astype(str)
+
+    # GateRecoveryBonus 列が存在しない場合のデフォルト補完
+    if 'GateRecoveryBonus' not in g.columns:
+        g['GateRecoveryBonus'] = 0.0
+
+    # R34修正: マージ列疵合修正
+    # base に comment 系列が存在する場合（事前初期化済みなど）、マージ時に _x/_y サフィックスで
+    # 新しく計算した値（_y）が無視されるバグを修正する。
+    # base からコメント系列を事前剤除して g の計算結果で上書きする。
+    _MERGE_COMMENT_COLS = [
+        'CommentFit', 'CommentRisk', 'CommentGate', 'CommentCondition', 'CommentTrend',
+        'comment_short', 'comment_tags', 'sanko_gai',
+        'StartRiskInterviewPenalty', 'GateRecoveryBonus',
+    ]
+    base_clean = base.drop(
+        columns=[c for c in _MERGE_COMMENT_COLS if c in base.columns],
+        errors='ignore'
+    )
+    out = base_clean.merge(
+        g[['num','CommentFit','CommentRisk','CommentGate','CommentCondition','CommentTrend',
+           'comment_short','comment_tags',
+           'sanko_gai',
+           'StartRiskInterviewPenalty', 'GateRecoveryBonus']].assign(
+               StartRiskInterviewPenalty=g.get('StartRiskInterviewPenalty', pd.Series([0.0]*len(g), index=g.index))
+           ),  # R19 / R22
+        on='num', how='left'
+    )
+    for col, default in [('CommentFit', 50.0), ('CommentRisk', 0.0), ('CommentGate', 50.0), ('CommentCondition', 50.0), ('CommentTrend', 50.0)]:
+        out[col] = _num_series(out.get(col, default), default, index=out.index)
+    out['comment_short'] = out['comment_short'].infer_objects(copy=False).fillna('').astype(str)
+    out['comment_tags'] = out['comment_tags'].infer_objects(copy=False).fillna('').astype(str)
+    # R19: SankoGaiFlag
+    out['SankoGaiFlag'] = _num_series(out.get('sanko_gai', 0.0), 0.0, index=out.index).clip(lower=0.0)
+    # R22: 前走インタビュー起因スタートリスクペナルティ列
+    out['StartRiskInterviewPenalty'] = _num_series(
+        out.get('StartRiskInterviewPenalty', 0.0), 0.0, index=out.index
+    ).clip(lower=0.0, upper=15.0)
+    # R26: ゲートリカバリーボーナス列  R37: clip上限をパラメータ参照に変更
+    # R37バグ修正: params.get (トップレベル) → cf.get (comment_features サブ辞書) に統一
+    #   修正前: _grb_max_final = float((params or {}).get('gate_recovery_bonus_max', 7.5) or 7.5)
+    #           → cf.gate_recovery_bonus_max=10.0 と設定しても line 5049 でのみ反映され、
+    #             最終クリップ (line 5110) は常にデフォルト 7.5 になるバグ
+    #   修正後: cf を直接参照することで line 5049 / 5110 双方で一貫した上限を使用
+    _grb_max_final_raw = cf.get('gate_recovery_bonus_max', 7.5)
+    _grb_max_final = float(_grb_max_final_raw) if _grb_max_final_raw is not None else 7.5  # R37fix: 0.0許容
+    out['GateRecoveryBonus'] = _num_series(
+        out.get('GateRecoveryBonus', 0.0), 0.0, index=out.index
+    ).clip(lower=0.0, upper=_grb_max_final)
+    return out
+
+
+def read_comments_csv(path: str, encoding: str = 'utf-8') -> pd.DataFrame:
+    """コメント CSV ファイルを読み込み DataFrame を返す。"""
+    try:
+        return pd.read_csv(path, encoding=encoding)
+    except Exception:
+        try:
+            return pd.read_csv(path, encoding='cp932')
+        except Exception:
+            return pd.DataFrame(columns=['num','type','text'])
+
+
+def read_comments_inline(csv_text: str) -> pd.DataFrame:
+    """インライン CSV テキストからコメント DataFrame を返す。"""
+    try:
+        return pd.read_csv(io.StringIO(str(csv_text)))
+    except Exception:
+        return pd.DataFrame(columns=['num','type','text'])
+
+
+def _csv_neutral_return(
+    df: pd.DataFrame,
+    meta: Dict[str, str],
+    params: dict,
+    rating_num: pd.Series,
+    speed_num: pd.Series,
+) -> Optional[Tuple[pd.DataFrame, Dict, "AuditFlags"]]:
+    """データ欠損時のニュートラルスコアを設定し (df, logs, AuditFlags) を返す。
+
+    コアデータ(rating/speed_max)が全欠損の場合に呼ばれる早期リターン用サブ関数。
+    欠損でない場合は None を返す。
+    """
+    _core_missing = (rating_num.notna().sum() == 0) or (speed_num.notna().sum() == 0)
+
+    if _core_missing:
+        # neutral norms
+        df["rating_norm"] = 50.0
+        df["speed_norm"] = 50.0
+        df["AI_REAR_CONFIRMED"] = compute_ai_rear_confirmed(df)
+        df["Ability"] = 50.0
+        df["PosFit"] = df["zone_4c"].apply(lambda z: compute_position_fit_adjusted(z, meta)).astype(float)
+        df["Consist"] = compute_consistency_from_speed_hist(df)
+        map_summary = meta.get("map_summary", "Unknown")
+        map_rates = meta.get("_map_rates", None)
+        df["MapFit"] = compute_mapfit_v1_1(df, map_summary, map_rates=map_rates)
+        df["FactorPts"], df["FactorFit"], df["MichiakuFit"] = compute_factorfit(df)
+        if 'CommentFit' not in df.columns:
+            df['CommentFit'] = 50.0
+        for _c in ['CommentFit','CommentGate','CommentCondition','CommentTrend']:
+            if _c not in df.columns:
+                df[_c] = 50.0
+            df[_c] = _num_series(df, _c, 50.0)
+        df['PaceFit'] = 50.0
+        df['GateFit'] = 50.0
+        df['ConditionFit'] = 50.0
+        df['CourseStyleFit'] = 50.0
+        df['CourseStraightFit'] = 50.0
+        df['CourseCornerFit'] = 50.0
+        df['CourseStaminaFit'] = 50.0
+        df['CoursePowerFit'] = 50.0
+        df['CourseSpeedFit'] = 50.0
+        df['CourseAgilityFit'] = 50.0
+        df['CourseProfileFit'] = 50.0
+        df['CourseBiasDelta'] = 0.0
+        df['FrontCollapseRisk'] = 0.0
+        df['StartRiskShort'] = 0.0
+        df['WinShape'] = 50.0
+        df['TimeFit'] = 50.0
+        df['Upside'] = 50.0
+        df['WPS'] = 50.0
+
+        # minimal SAS/AnchorScore (keep stable)
+        df["SAS"] = (0.45*df["Ability"] + 0.18*df["PosFit"] + 0.15*df["Consist"] + 0.08*df["MapFit"] + 0.07*df['GateFit'] + 0.07*df['ConditionFit']).astype(float)
+        df["PlaceAxisScore"] = df["SAS"].astype(float)
+        df["WinCandidateScore"] = df["SAS"].astype(float)
+        df["AnchorScore"] = df["PlaceAxisScore"].astype(float)
+        df['is_win_group'] = 0
+        df['is_place_group'] = 0
+
+        # place probability unavailable -> set zeros (report builder clamps anyway)
+        df["p_place_est"] = 0.0
+        df["p_place_est_pct"] = 0.0
+        df["p_place_low"] = np.nan
+        df["p_win_field"] = 0.0
+
+        logs = {"rating_min": None, "rating_max": None, "speed_min": None, "speed_max": None}
+        return df, logs, AuditFlags(audit_flag="NO_BET(data_missing)", reason="rating/speed_max missing")
+    return None
+
+
+
+def _cbf_apply_sp_weighting(df: "pd.DataFrame", speed_norm: "pd.Series") -> "pd.DataFrame":
+    """SP最高値重み付け改善を df に適用して返す。(R21: _csv_compute_base_features から分離)
+
+    sp_blended = 35% sp_max (歴代最高) + 65% sp_recent (直近平均)
+    R22追加: sp_max > class_up_point の場合 Ability にボーナス加算
+             ability_score += (sp_max - class_up_point) * 0.10
+    """
+    try:
+        _sp_recent_cols = [c for c in ['speed_last', 'speed_2ago', 'speed_3ago']
+                           if c in df.columns]
+        if _sp_recent_cols:
+            _sp_recent_raw = df[_sp_recent_cols].apply(
+                pd.to_numeric, errors='coerce').mean(axis=1)
+            _sp_recent_norm, _, _ = norm_minmax_to_0_100(_sp_recent_raw)
+            _sp_blended = (0.35 * speed_norm.fillna(50.0)
+                           + 0.65 * _sp_recent_norm.fillna(50.0))
+            df["speed_norm"] = _sp_blended.clip(0.0, 100.0)
+            # peak ボーナス列（WPS 等で参照可能）
+            df["SpeedPeakBonus"] = (speed_norm - _sp_recent_norm).clip(lower=0.0) * 0.35
+        else:
+            df["SpeedPeakBonus"] = 0.0
+    except Exception:
+        df["SpeedPeakBonus"] = 0.0
+
+    # R22: SP指数最高値 > 昇級点 → Ability ボーナス
+    # class_up_point 列（例: 76）が存在する場合のみ適用
+    # R29 fix: fillna(0.0) → valid_mask 方式に変更。
+    #          class_up_point=None/NaN の馬はボーナス 0 とする（誤加算を防ぐ）。
+    try:
+        if 'class_up_point' in df.columns and 'speed_max' in df.columns:
+            _smax       = pd.to_numeric(df['speed_max'],      errors='coerce')
+            _cup_raw    = pd.to_numeric(df['class_up_point'], errors='coerce')
+            # class_up_point が有効な行のみボーナス計算
+            _valid_mask = _cup_raw.notna() & _smax.notna()
+            _diff       = (_smax - _cup_raw).clip(lower=0.0)   # 負の差は 0
+            _bonus      = (_diff * 0.10).clip(lower=0.0, upper=10.0)
+            df['ClassUpBonus'] = _bonus.where(_valid_mask, other=0.0)
+        else:
+            df['ClassUpBonus'] = 0.0
+    except Exception:
+        df['ClassUpBonus'] = 0.0
+    return df
+
+
+def _cbf_apply_sanko_gai_override(df: "pd.DataFrame") -> "pd.DataFrame":
+    """参考外 + コース◎ の馬に effective_rating オーバーライドを適用して返す。(R21: _csv_compute_base_features から分離)
+
+    speed_hist の最新2走最大値を effective_rating として rating_norm/Ability を動的補正する。
+    """
+    try:
+        _sanko = df.get('SankoGaiFlag',
+                        pd.Series([0.0] * len(df), index=df.index)).fillna(0.0)
+        _course_col = df.get('course',
+                              pd.Series([''] * len(df), index=df.index)).astype(str).str.strip()
+        _sanko_mask = (_sanko > 0.5) & (_course_col == '◎')
+        if not _sanko_mask.any():
+            return df
+        _sh_col = df.get('speed_hist',
+                         pd.Series([''] * len(df), index=df.index)).astype(str)
+        _eff_speeds = []
+        for _sh_val in _sh_col:
+            _hist = parse_speed_hist(_sh_val)
+            if len(_hist) >= 2:
+                _eff_speeds.append(max(_hist[-2:]))
+            elif len(_hist) == 1:
+                _eff_speeds.append(_hist[-1])
+            else:
+                _eff_speeds.append(float('nan'))
+        _eff_speed_s = pd.Series(_eff_speeds, index=df.index, dtype=float)
+        _v_min = float(_eff_speed_s.min(skipna=True))
+        _v_max = float(_eff_speed_s.max(skipna=True))
+        if _v_max > _v_min and pd.notna(_v_min) and pd.notna(_v_max):
+            _eff_norm = ((_eff_speed_s - _v_min) / (_v_max - _v_min) * 100.0)
+        else:
+            _eff_norm = pd.Series([50.0] * len(df), index=df.index, dtype=float)
+        for idx in df.index[_sanko_mask]:
+            _en = float(_eff_norm.loc[idx])
+            if pd.notna(_en) and _en > 0:
+                _cur_r = float(df.loc[idx, 'rating_norm'])
+                df.loc[idx, 'rating_norm'] = min(100.0, max(_cur_r, _en))
+                df.loc[idx, 'Ability'] = min(100.0, (
+                    0.60 * df.loc[idx, 'rating_norm']
+                    + 0.40 * float(df.loc[idx, 'speed_norm'])
+                ))
+            else:
+                df.loc[idx, 'Ability'] = min(100.0, float(df.loc[idx, 'Ability']) + 8.0)
+                df.loc[idx, 'rating_norm'] = min(100.0, float(df.loc[idx, 'rating_norm']) + 5.0)
+    except Exception:
+        pass
+    return df
+
+
+def _csv_compute_base_features(
+    df: pd.DataFrame,
+    meta: Dict[str, str],
+    params: dict,
+) -> Tuple[pd.DataFrame, float, float, float, float]:
+    """rating_norm/speed_norm・基本フィット系列 (Ability/PosFit/Consist/MapFit 等) を計算して df に書き込む。(R21: SP加重/参考外処理をサブ関数に分離)
+
+    Returns:
+        (df, rating_min, rating_max, speed_min, speed_max)
+    """
+    rating_norm, rating_min, rating_max = norm_minmax_to_0_100(df["rating"])
+    speed_norm, speed_min, speed_max = norm_minmax_to_0_100(df["speed_max"])
+    df["rating_norm"] = rating_norm
+    df["speed_norm"] = speed_norm
+
+    # R19: SP最高値重み付け改善（サブ関数委譲）
+    df = _cbf_apply_sp_weighting(df, speed_norm)
+
+    df["AI_REAR_CONFIRMED"] = compute_ai_rear_confirmed(df)
+    df["Ability"] = (0.60 * df["rating_norm"].fillna(50.0) + 0.40 * df["speed_norm"].fillna(50.0)).astype(float)
+    # R22: ClassUpBonus（SP最高値が昇級点を上回る場合の加算）
+    if "ClassUpBonus" in df.columns:
+        df["Ability"] = (df["Ability"] + df["ClassUpBonus"]).clip(upper=100.0)
+
+    # 天候/馬場（道悪・内側傷み等）を反映した位置取り補正
+    df["PosFit"] = df["zone_4c"].apply(lambda z: compute_position_fit_adjusted(z, meta)).astype(float)
+    df["Consist"] = compute_consistency_from_speed_hist(df)
+    map_summary = meta.get("map_summary", "Unknown")
+    map_rates = meta.get("_map_rates", None)
+    df["MapFit"] = compute_mapfit_v1_1(df, map_summary, map_rates=map_rates)
+    df["FactorPts"], df["FactorFit"], df["MichiakuFit"] = compute_factorfit(df)
+
+    # COMMENT: default neutral if not provided
+    if 'CommentFit' not in df.columns:
+        df['CommentFit'] = 50.0
+    for _c in ['CommentFit', 'CommentGate', 'CommentCondition', 'CommentTrend']:
+        if _c not in df.columns:
+            df[_c] = 50.0
+        df[_c] = _num_series(df, _c, 50.0)
+
+    df['PaceFit'] = compute_pacefit_v1_1(df, meta, params)
+    df['GateFit'] = compute_gatefit_v1_1(df, meta)
+    df['ConditionFit'] = compute_conditionfit_v1_1(df, meta)
+
+    # ===== R30 案A: GateRecoveryBonus → GateFit 直接反映 =====
+    # build_comment_features経由で計算された GateRecoveryBonus を GateFit に加算する。
+    # 「出遅れ気味 + ゲート不利があった」馬のゲート適性を適切に評価するため。
+    try:
+        _cf_params = (params.get('comment_features', {}) or {})
+        _grb_gate_scale = float(_cf_params.get('gate_recovery_gate_scale', 0.6))
+        if _grb_gate_scale > 0.0 and 'GateRecoveryBonus' in df.columns:
+            _grb = pd.to_numeric(df['GateRecoveryBonus'], errors='coerce').fillna(0.0)
+            df['GateFit'] = (df['GateFit'] + _grb * _grb_gate_scale).clip(lower=0.0, upper=100.0).astype(float)
+    except Exception:
+        pass
+
+    # R27: 走法分類（RunningStyleLabel / RunningStyleConf / RunningStyleScore）
+    df = classify_running_style(df, params)
+
+    # R20: 参考外 + コース◎ → effective_rating オーバーライド（サブ関数委譲）
+    df = _cbf_apply_sanko_gai_override(df)
+
+    # コース特性由来の追加特徴量
+    df = add_course_profile_features(df, meta, params)
+
+    return df, rating_min, rating_max, speed_min, speed_max
+
+    # -------------------------
+
+
+
+def _sas_init_market(df) -> object:
+    """市場由来特徴カラムを NaN/50 で初期化した df を返す。"""
+    import numpy as np
+    df['p_win_mkt']       = np.nan
+    df['p_place_mkt']     = np.nan
+    df['MarketWinFit']    = 50.0
+    df['MarketPlaceFit']  = 50.0
+    return df
+
+
+def _sas_compute_weights(params: dict, wet_mode: bool) -> dict:
+    """SAS add式重みと comment 重みを計算・正規化して辞書で返す。"""
+    wp  = (params.get('wide_rules') or {})
+    w_a = float(wp.get('w_ability',   0.22) or 0.22)
+    w_p = float(wp.get('w_posfit',    0.18) or 0.18)
+    w_m = float(wp.get('w_mapfit',    0.12) or 0.12)
+    w_f = float(wp.get('w_factorfit', 0.12) or 0.12)
+    w_c = float(wp.get('w_consist',   0.30) or 0.30)
+    factor_w   = 0.06 if wet_mode else 0.03
+    michiaku_w = 0.03 if wet_mode else 0.00
+
+    raw_others = w_a + w_p + w_m + w_f + factor_w + michiaku_w
+    consist_fixed = 0.30
+    if raw_others > 0:
+        scale = (1.0 - consist_fixed) / raw_others
+        w_a *= scale; w_p *= scale; w_m *= scale; w_f *= scale
+        factor_w *= scale; michiaku_w *= scale
+
+    w_comment_target = float(wp.get('w_comment', 0.11) or 0.11)
+    return {
+        'w_ability': w_a, 'w_posfit': w_p, 'w_mapfit': w_m,
+        'w_factorfit': w_f, 'w_consist': consist_fixed,
+        'factor_w': factor_w, 'michiaku_w': michiaku_w,
+        'w_comment': w_comment_target,
+    }
+
+
+def _sas_apply_geo_blend(df, params: dict, sas_add_col: str = 'SAS') -> object:
+    """SAS_add と SAS_geo をブレンドして SAS 列を上書きした df を返す。"""
+    import numpy as np
+    wp  = (params.get('wide_rules') or {})
+    geo_blend = float(wp.get('sas_geo_blend', 0.35) or 0.35)
+    geo_blend = max(0.0, min(1.0, geo_blend))
+    try:
+        sas_add = _num_series(df[sas_add_col], 50.0, index=df.index)
+        geo_cols = ['AnchorScore', 'PosFit', 'Consist', 'MapFit']
+        avail = [c for c in geo_cols if c in df.columns]
+        if avail and geo_blend > 0.0:
+            stack = np.column_stack([
+                _num_series(df[c], 50.0, index=df.index).clip(1.0, 100.0)
+                for c in avail
+            ])
+            with np.errstate(all='ignore'):
+                sas_geo = np.exp(np.nanmean(np.log(stack + 1e-9), axis=1)) - 1e-9
+            sas_geo = np.clip(sas_geo, 0.0, 100.0)
+            df[sas_add_col] = ((1.0 - geo_blend) * sas_add + geo_blend * sas_geo).clip(0.0, 100.0)
+    except Exception:
+        pass
+    return df
+
+
+def _sas_apply_training_delta(df, params: dict) -> object:
+    """TrainingScore Δ を SAS / AnchorScore へ小さく反映した df を返す。"""
+    import numpy as np
+    wp = (params.get('wide_rules') or {})
+    td_enabled = bool(wp.get('training_delta_apply_enabled', True))
+    td_scale   = float(wp.get('training_delta_scale', 0.12) or 0.12)
+    td_cap     = float(wp.get('training_delta_cap', 2.0) or 2.0)
+    if not td_enabled or 'delta_train' not in df.columns:
+        return df
+    try:
+        delta = _num_series(df['delta_train'], 0.0, index=df.index).clip(-td_cap, td_cap)
+        df['SAS']         = (_num_series(df['SAS'],         50.0, index=df.index) + delta * td_scale).clip(0, 100)
+        df['AnchorScore'] = (_num_series(df['AnchorScore'], 50.0, index=df.index) + delta * td_scale).clip(0, 100)
+    except Exception:
+        pass
+    return df
+
+def _csv_compute_sas(
+    df: pd.DataFrame,
+    meta: Dict[str, str],
+    params: dict,
+) -> pd.DataFrame:
+    """道悪補正・SAS加算式・幾何平均ブレンド・コメントΔ・調教Δ・AnchorScore を計算して df に書き込む。
+
+    meta にも各重みを文字列で格納する。
+    サブ関数: _sas_init_market / _sas_compute_weights / _sas_apply_geo_blend / _sas_apply_training_delta
+    """
+    import numpy as np
+    # 1. 市場特徴初期化
+    df = _sas_init_market(df)
+
+    # 2. 道悪モード
+    wet_mode = _is_wet_track(meta)
+
+    # 3. SAS重み計算
+    wdict = _sas_compute_weights(params, wet_mode)
+    wp    = (params.get('wide_rules') or {})
+    w_a   = wdict['w_ability']
+    w_p   = wdict['w_posfit']
+    w_m   = wdict['w_mapfit']
+    w_f   = wdict['w_factorfit']
+    w_c   = wdict['w_consist']
+    factor_w   = wdict['factor_w']
+    michiaku_w = wdict['michiaku_w']
+    w_comment  = wdict['w_comment']
+
+    # audit
+    try:
+        meta['sas_wet_mode']    = str(int(wet_mode))
+        meta['sas_w_ability']   = f'{w_a:.3f}'
+        meta['sas_w_posfit']    = f'{w_p:.3f}'
+        meta['sas_w_consist']   = f'{w_c:.3f}'
+        meta['sas_w_comment']   = f'{w_comment:.3f}'
+    except Exception:
+        pass
+
+    # 4. SAS add式計算
+    try:
+        def _sc(col, default=50.0) -> object:
+            return _num_series(df.get(col, default), default, index=df.index)
+
+        sas_add = (
+            w_a * _sc('Ability')
+            + w_p * _sc('PosFit')
+            + w_m * _sc('MapFit')
+            + w_f * _sc('FactorFit')
+            + w_c * _sc('Consist')
+            + factor_w   * _sc('MichiakuFit', 50.0)
+            + michiaku_w * _sc('MichiakuScore', 50.0)
+        ).clip(0, 100)
+        df['SAS'] = sas_add
+    except Exception:
+        df['SAS'] = 50.0
+
+    # 5. コメントΔ適用
+    try:
+        cap   = float(wp.get('comment_delta_cap',   3.0) or 3.0)
+        scale = float(wp.get('comment_delta_scale', 0.10) or 0.10)
+        if 'comment_delta' in df.columns:
+            cd = _num_series(df['comment_delta'], 0.0, index=df.index).clip(-cap, cap)
+            df['SAS'] = (_num_series(df['SAS'], 50.0, index=df.index) + cd * scale).clip(0, 100)
+    except Exception:
+        pass
+
+    # 6. SAS_UNIFIED: 幾何平均ブレンド
+    df = _sas_apply_geo_blend(df, params)
+
+    # 7. AnchorScore backward compat
+    try:
+        if 'AnchorScore' not in df.columns:
+            df['AnchorScore'] = df['SAS'].copy()
+    except Exception:
+        pass
+
+    # 8. 調教Δ適用
+    df = _sas_apply_training_delta(df, params)
+
+    # audit
+    try:
+        sas_geo_blend = float(wp.get('sas_geo_blend', 0.35) or 0.35)
+        meta['sas_unified']          = '1'
+        meta['sas_geo_blend']        = f'{sas_geo_blend:.3f}'
+        meta['comment_delta_cap']    = str(wp.get('comment_delta_cap', 3.0))
+        meta['comment_delta_scale']  = str(wp.get('comment_delta_scale', 0.10))
+    except Exception:
+        pass
+    return df
+
+
+
+
+def _wps_init_training_cols(df) -> object:
+    """TrainingScore / TrainingRank / delta_train カラムを安全に数値化する。"""
+    for _c, _d in [('TrainingScore', 50.0), ('TrainingRank', 999.0), ('delta_train', 0.0)]:
+        if _c not in df.columns:
+            df[_c] = _d
+        df[_c] = _num_series(df.get(_c, _d), _d, index=df.index)
+    return df
+
+
+def _wps_surface_dist_bonus(df, meta: dict) -> object:
+    """馬場・距離ボーナスを WinCandidateScore / PlaceAxisScore に加算した df を返す。"""
+    import numpy as np
+    try:
+        surface = str((meta or {}).get('surface', '') or '').lower()
+        dist_raw = (meta or {}).get('distance', (meta or {}).get('dist', ''))
+        try:
+            dist = float(str(dist_raw).replace('m','').strip())
+        except Exception:
+            dist = float('nan')
+
+        trend_bonus = 0.0
+        try:
+            trend_bonus = float((meta or {}).get('trend_bonus', 0.0) or 0.0)
+        except Exception:
+            trend_bonus = 0.0
+
+        if surface == 'dirt' and np.isfinite(dist) and dist <= 1200:
+            df['WinCandidateScore'] = (df['WinCandidateScore'] + 2.0 * trend_bonus).astype(float)
+            df['PlaceAxisScore']    = (df['PlaceAxisScore']    + 1.0 * trend_bonus).astype(float)
+        elif surface == 'dirt' and np.isfinite(dist) and dist <= 1400:
+            df['WinCandidateScore'] = (df['WinCandidateScore'] + 1.0 * trend_bonus).astype(float)
+            df['PlaceAxisScore']    = (df['PlaceAxisScore']    + 0.5 * trend_bonus).astype(float)
+    except Exception:
+        pass
+    return df
+
+def _wps_compute_wps_weights(
+    df: "pd.DataFrame",
+    meta: "Dict[str, str]",
+    params: dict,
+) -> "pd.DataFrame":
+    """WinShape/TimeFit/UpsideおよびWPS正規化重みスコアをdfに書き込む。"""
+    df = _wps_init_training_cols(df)
+
+    # 天候/馬場（道悪・内側傷み等）を反映した勝ち形補正
+    df["WinShape"] = df["zone_4c"].apply(lambda z: compute_winshape_adjusted(z, meta)).astype(float)
+    df["TimeFit"] = compute_timefit_v1_1(df)
+    df["Upside"] = compute_upside_v1_1(df["speed_max"])
+
+    # WPS weights (strict normalization)
+    wps_fixed_key = "Ability"
+    wps_fixed_w = 0.45
+
+    wps_raw = {
+        "Ability": 0.45,
+        "WinShape": 0.18,
+        "PaceFit": 0.16,
+        "GateFit": 0.10,
+        "ConditionFit": 0.07,
+        "TimeFit": 0.02,
+        "Upside": 0.02,
+    }
+
+    # ===== R30 案C + IMPROVE-①B: ペース別 WPS重み動的変更 (v1.33) =====
+    # H: 末脚重視, MH: 中間, M: ミドル前残り, ML/S: 先行重視
+    try:
+        _pace_raw = str((meta or {}).get('pace', '')).upper().strip()
+        _pace_for_wps = _pace_raw[:1]  # H / M / L / S
+        _pace_full    = _pace_raw      # MH / ML 判定用
+        if _pace_for_wps == 'H':
+            wps_raw["TimeFit"] = float(params.get('h_pace_timefit_weight', 0.06))
+            wps_raw["PaceFit"] = float(params.get('h_pace_pacefit_weight', 0.12))
+        elif _pace_full in ('MH',):
+            # IMPROVE-①B: MHペース（ミドルハイ）中間重み
+            wps_raw["TimeFit"] = float(params.get('mh_pace_timefit_weight', 0.04))
+            wps_raw["PaceFit"] = float(params.get('mh_pace_pacefit_weight', 0.14))
+        elif _pace_full in ('ML',):
+            # IMPROVE-①B: MLペース（ミドルロー）スロー寄り重み
+            wps_raw["TimeFit"] = float(params.get('ml_pace_timefit_weight', 0.02))
+            wps_raw["PaceFit"] = float(params.get('ml_pace_pacefit_weight', 0.18))
+        # M（通常ミドル）はデフォルト重みのまま
+    except Exception:
+        pass
+
+    other_keys = [k for k in wps_raw.keys() if k != wps_fixed_key]
+    raw_other_sum = float(sum(wps_raw[k] for k in other_keys))
+    scale = (1.0 - wps_fixed_w) / raw_other_sum if raw_other_sum > 0 else 0.0
+    wps_w = {k: (wps_fixed_w if k == wps_fixed_key else float(wps_raw[k]) * scale) for k in wps_raw.keys()}
+
+    try:
+        meta["wps_fixed_key"] = wps_fixed_key
+        meta["wps_fixed_weight"] = f"{wps_fixed_w:.3f}"
+        meta["wps_norm_scale"] = f"{scale:.6f}"
+        meta["wps_raw_weights"] = (
+            f"A={wps_raw['Ability']:.3f} W={wps_raw['WinShape']:.3f} P={wps_raw['PaceFit']:.3f} G={wps_raw['GateFit']:.3f} C={wps_raw['ConditionFit']:.3f} T={wps_raw['TimeFit']:.3f} U={wps_raw['Upside']:.3f}"
+        )
+        meta["wps_weights_norm"] = (
+            f"A={wps_w['Ability']:.6f} W={wps_w['WinShape']:.6f} P={wps_w['PaceFit']:.6f} G={wps_w['GateFit']:.6f} C={wps_w['ConditionFit']:.6f} T={wps_w['TimeFit']:.6f} U={wps_w['Upside']:.6f}"
+        )
+        meta["wps_w_total"] = f"{(sum(wps_w.values())):.6f}"
+    except Exception:
+        pass
+
+    df["WPS"] = (
+        wps_w["Ability"] * df["Ability"]
+        + wps_w["WinShape"] * df["WinShape"]
+        + wps_w["PaceFit"] * df['PaceFit']
+        + wps_w["GateFit"] * df['GateFit']
+        + wps_w["ConditionFit"] * df['ConditionFit']
+        + wps_w["TimeFit"] * df["TimeFit"]
+        + wps_w["Upside"] * df["Upside"]
+    ).astype(float)
+
+    return df
+
+
+def _wps_compute_risk_signals(
+    df: "pd.DataFrame",
+    meta: "Dict[str, str]",
+    params: dict,
+) -> "pd.DataFrame":
+    """FrontCollapseRisk〜DevelopmentWaitRiskなどリスク系シグナルをdfに書き込む。"""
+    df['FrontCollapseRisk'] = compute_front_collapse_risk_v1_1(df, meta, params)
+    df['StartRiskShort'] = compute_start_risk_short_v1_1(df, meta, params)
+    # R22: 前走インタビューペナルティを StartRiskShort に加算（SAS.前処理ステップとして統合）
+    _cf2 = (params.get('comment_features', {}) or {})
+    if bool(_cf2.get('start_risk_apply_to_anchor', True)):
+        _srip = _num_series(df.get('StartRiskInterviewPenalty', 0.0), 0.0, index=df.index)
+        df['StartRiskShort'] = (df['StartRiskShort'] + _srip).clip(lower=0.0, upper=15.0)
+    df['TemperamentRisk'] = compute_temperament_risk_v1_1(df, params)
+    df['AbilityBaseScore'] = compute_ability_base_score_v1_1(df, params)
+    df['RecentFormScore'] = compute_recent_form_score_v1_1(df, params)
+    df['RaceConditionScore'] = compute_race_condition_score_v1_1(df, params)
+    df['DistanceCommentScore'], df['DistanceCommentRisk'] = compute_distance_comment_profile_v1_1(df)
+    df['DistanceSuitScore'] = compute_distance_suit_score_v1_1(df, meta, params)
+    df['StabilityComposite'] = compute_stability_composite_v1_1(df, params)
+    df['LongFrontFadeRisk'] = compute_long_front_fade_risk_v1_1(df, meta, params)
+    df['DistanceStaminaRisk'] = compute_distance_stamina_risk_v1_1(df, meta, params)
+    rec_count, rec_flag, rec_bonus_win, rec_bonus_place = compute_recovery_signal_v1_1(df, meta, params)
+    df['RecoverySignalCount'] = _num_series(rec_count, 0, index=df.index, dtype=int)
+    df['RecoverySignal'] = _num_series(rec_flag, 0, index=df.index, dtype=int)
+    df['RecoveryBonusWin'] = _num_series(rec_bonus_win, 0.0, index=df.index)
+    df['RecoveryBonusPlace'] = _num_series(rec_bonus_place, 0.0, index=df.index)
+    fav_score, fav_override, fav_reason = compute_favorite_score_v1_1(df, meta, params)
+    maint_relief, maint_reason = compute_maintenance_run_relief_v1_1(df, meta, params)
+    dev_wait_risk, dev_wait_reason = compute_development_wait_risk_v1_1(df, meta, params)
+    df['FavoriteScore'] = _num_series(fav_score, 0.0, index=df.index)
+    df['FavoriteOverrideFlag'] = _num_series(fav_override, 0, index=df.index, dtype=int)
+    df['FavoriteReason'] = fav_reason.infer_objects(copy=False).fillna('').astype(str)
+    df['MaintenanceRunRelief'] = _num_series(maint_relief, 0.0, index=df.index)
+    df['MaintenanceReason'] = maint_reason.infer_objects(copy=False).fillna('').astype(str)
+    df['DevelopmentWaitRisk'] = _num_series(dev_wait_risk, 0.0, index=df.index)
+    df['DevelopmentWaitReason'] = dev_wait_reason.infer_objects(copy=False).fillna('').astype(str)
+
+    trend_bonus = ((_num_series(df, 'CommentTrend', 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0)
+    comment_trend = _num_series(df, 'CommentTrend', 50.0)
+    dist, surface = _meta_distance_surface(meta)
+
+    return df
+
+
+def _wps_compute_pattern_scores(
+    df: "pd.DataFrame",
+    meta: "Dict[str, str]",
+    params: dict,
+) -> "pd.DataFrame":
+    """WinPatternScore・InsuranceSignal・WinPatternBoost/PlaceAxisBoostをdfに書き込む。"""
+    wp = (params.get('win_pattern_rules', {}) or {})
+    maiden_mode = _is_young_maiden_race(meta, df)
+    long_maiden_mode = _is_long_maiden_race(meta, df)
+    if long_maiden_mode:
+        aw = float(wp.get('long_maiden_ability_weight', 0.34) or 0.34)
+        rw = float(wp.get('long_maiden_recent_weight', 0.28) or 0.28)
+        cw = float(wp.get('long_maiden_race_weight', 0.38) or 0.38)
+    else:
+        aw = float(wp.get('young_maiden_ability_weight', 0.35) if maiden_mode else wp.get('general_ability_weight', 0.40))
+        rw = float(wp.get('young_maiden_recent_weight', 0.35) if maiden_mode else wp.get('general_recent_weight', 0.25))
+        cw = float(wp.get('young_maiden_race_weight', 0.30) if maiden_mode else wp.get('general_race_weight', 0.35))
+    wsum = aw + rw + cw
+    if wsum <= 0:
+        aw, rw, cw = 0.40, 0.25, 0.35
+        wsum = 1.0
+    aw, rw, cw = aw / wsum, rw / wsum, cw / wsum
+
+    df['WinPatternScore'] = (
+        aw * df['AbilityBaseScore']
+        + rw * df['RecentFormScore']
+        + cw * df['RaceConditionScore']
+    ).astype(float)
+
+    ins_count, ins_rise, ins_train, ins_comment, ins_track = compute_insurance_signals_v1_1(df, params)
+    df['InsuranceSignalCount'] = _num_series(ins_count, 0, index=df.index, dtype=int)
+    df['InsuranceRiseFlag'] = _num_series(ins_rise, 0, index=df.index, dtype=int)
+    df['InsuranceTrainingFlag'] = _num_series(ins_train, 0, index=df.index, dtype=int)
+    df['InsuranceCommentFlag'] = _num_series(ins_comment, 0, index=df.index, dtype=int)
+    df['InsuranceTrackFlag'] = _num_series(ins_track, 0, index=df.index, dtype=int)
+
+    ir = (params.get('insurance_rules', {}) or {})
+    sig_thr = int(ir.get('signal_threshold', wp.get('signal_promote_threshold', 3)) or 3)
+    sig_thr = max(1, sig_thr)
+    promote_win_bonus = float(wp.get('signal_promote_bonus_win', 4.5) or 4.5)
+    promote_place_bonus = float(wp.get('signal_promote_bonus_place', 2.5) or 2.5)
+    df['is_insurance_line'] = ((df['InsuranceSignalCount'] >= sig_thr) | (df['RecoverySignal'] > 0)).astype(int)
+    promote_scale = (_num_series(df, 'InsuranceSignalCount', 0.0).clip(lower=float(sig_thr), upper=4.0) - float(sig_thr) + 1.0).clip(lower=0.0, upper=2.0) / 2.0
+    df['WinPatternBoost'] = (promote_win_bonus * promote_scale).astype(float)
+    df['PlaceAxisBoost'] = (promote_place_bonus * promote_scale).astype(float)
+
+    temp_win_scale = float(wp.get('temperament_penalty_win_scale', 0.85) or 0.85)
+    temp_place_scale = float(wp.get('temperament_penalty_place_scale', 0.35) or 0.35)
+
+    fr = (params.get('favorite_logic_rules', {}) or {})
+    maint_bonus_win = float(fr.get('maintenance_relief_bonus_win', 2.0) or 2.0)
+    maint_bonus_place = float(fr.get('maintenance_relief_bonus_place', 0.8) or 0.8)
+    dev_pen_win = float(fr.get('development_wait_penalty_win', 3.2) or 3.2)
+    dev_pen_place = float(fr.get('development_wait_penalty_place', 1.0) or 1.0)
+
+    return df
+
+
+def _wps_finalize_candidate_scores(
+    df: "pd.DataFrame",
+    meta: "Dict[str, str]",
+    params: dict,
+) -> "pd.DataFrame":
+    """WinCandidateScore・PlaceAxisScore最終統合と馬場距離ボーナスを適用して返す。
+
+    R29 fix: ヘルパー関数分割後にローカル変数が参照できなくなっていた問題を修正。
+    long_maiden_mode / comment_trend / scale 変数を関数内で再計算する。
+    """
+    # R29 fix: 変数を再計算（分割後のスコープ問題を解消）
+    long_maiden_mode = _is_long_maiden_race(meta, df)
+    comment_trend = _num_series(df, 'CommentTrend', 50.0)
+    wp = (params.get('win_pattern_rules', {}) or {})
+    temp_win_scale   = float(wp.get('temperament_penalty_win_scale',  0.85) or 0.85)
+    temp_place_scale = float(wp.get('temperament_penalty_place_scale', 0.35) or 0.35)
+    fr = (params.get('favorite_logic_rules', {}) or {})
+    maint_bonus_win   = float(fr.get('maintenance_relief_bonus_win',    2.0) or 2.0)
+    maint_bonus_place = float(fr.get('maintenance_relief_bonus_place',  0.8) or 0.8)
+    dev_pen_win       = float(fr.get('development_wait_penalty_win',    3.2) or 3.2)
+    dev_pen_place     = float(fr.get('development_wait_penalty_place',  1.0) or 1.0)
+    if long_maiden_mode:
+        df["WinCandidateScore"] = (
+            0.48 * df['WinPatternScore']
+            + 0.20 * df['StabilityComposite']
+            + 0.14 * df["WPS"]
+            + 0.10 * comment_trend
+            + 0.08 * df["Upside"]
+            + df['WinPatternBoost']
+            + df['RecoveryBonusWin']
+            + 0.08 * df['FavoriteScore']
+            + maint_bonus_win * df['MaintenanceRunRelief']
+            - df['FrontCollapseRisk']
+            - df['StartRiskShort']
+            - temp_win_scale * df['TemperamentRisk']
+            - df['LongFrontFadeRisk']
+            - df['DistanceStaminaRisk']
+            - dev_pen_win * (df['DevelopmentWaitRisk'] / 6.0)
+        ).astype(float)
+
+        df["PlaceAxisScore"] = (
+            0.46 * df["SAS"]
+            + 0.14 * df["Consist"]
+            + 0.08 * df['GateFit']
+            + 0.08 * df['ConditionFit']
+            + 0.06 * comment_trend
+            + 0.10 * df['RecentFormScore']
+            + 0.08 * df['DistanceSuitScore']
+            + df['PlaceAxisBoost']
+            + df['RecoveryBonusPlace']
+            + maint_bonus_place * df['MaintenanceRunRelief']
+            - 0.25 * df['FrontCollapseRisk']
+            - 0.15 * df['StartRiskShort']
+            - temp_place_scale * df['TemperamentRisk']
+            - 0.35 * df['LongFrontFadeRisk']
+            - 0.40 * df['DistanceStaminaRisk']
+            - dev_pen_place * (df['DevelopmentWaitRisk'] / 6.0)
+        ).astype(float)
+    else:
+        df["WinCandidateScore"] = (
+            0.58 * df['WinPatternScore']
+            + 0.14 * df["WPS"]
+            + 0.06 * comment_trend
+            + 0.10 * df["Upside"]
+            + 0.12 * df['FavoriteScore']
+            + df['WinPatternBoost']
+            + maint_bonus_win * df['MaintenanceRunRelief']
+            - df['FrontCollapseRisk']
+            - df['StartRiskShort']
+            - temp_win_scale * df['TemperamentRisk']
+            - dev_pen_win * (df['DevelopmentWaitRisk'] / 6.0)
+        ).astype(float)
+
+        df["PlaceAxisScore"] = (
+            0.52 * df["SAS"]
+            + 0.14 * df["Consist"]
+            + 0.08 * df['GateFit']
+            + 0.08 * df['ConditionFit']
+            + 0.06 * comment_trend
+            + 0.10 * df['RecentFormScore']
+            + 0.02 * df['DistanceSuitScore']
+            + df['PlaceAxisBoost']
+            + maint_bonus_place * df['MaintenanceRunRelief']
+            - 0.25 * df['FrontCollapseRisk']
+            - 0.15 * df['StartRiskShort']
+            - temp_place_scale * df['TemperamentRisk']
+            - dev_pen_place * (df['DevelopmentWaitRisk'] / 6.0)
+        ).astype(float)
+
+    df = _wps_surface_dist_bonus(df, meta)
+    return df
+
+
+def _csv_compute_wps_win_scores(
+    df: pd.DataFrame,
+    meta: Dict[str, str],
+    params: dict,
+) -> pd.DataFrame:
+    """WPS・WinPatternScore・InsuranceSignals・WinCandidateScore・PlaceAxisScore を計算して df に書き込む。
+
+    maiden_mode / long_maiden_mode を内部で判定し、馬場距離ボーナス補正まで含む。
+    4ヘルパー（_wps_compute_wps_weights, _wps_compute_risk_signals,
+    _wps_compute_pattern_scores, _wps_finalize_candidate_scores）に委譲する。
+    """
+    df = _wps_compute_wps_weights(df, meta, params)
+    df = _wps_compute_risk_signals(df, meta, params)
+    df = _wps_compute_pattern_scores(df, meta, params)
+    df = _wps_finalize_candidate_scores(df, meta, params)
+    return df
+
+
+
+def _comp_position_accel(
+    df: "pd.DataFrame",
+    meta: "Dict[str, str]",
+    params: dict,
+) -> "pd.DataFrame":
+    """GoodPositionScore・ReAccelScore・PositionReAccelScore・JockeyDistanceEvidenceScoreをdfに書き込む。"""
+    # ── local vars needed for position scores
+    z4 = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    pf3 = _num_series(df, 'pred_first3f', np.nan, index=df.index)
+    pl3 = _num_series(df, 'pred_last3f', np.nan, index=df.index)
+    pf3_rank = pf3.rank(method='min', ascending=True)
+    pl3_rank  = pl3.rank(method='min', ascending=True)
+    pace_mode = str((meta or {}).get('pace_eval_mode', '') or '')
+    wp = (params.get('win_pattern_rules', {}) or {})
+    front_auto_rank  = int(wp.get('pace_front_auto_promote_rank_max', 3) or 3)
+    front_auto_bonus = float(wp.get('pace_front_auto_promote_bonus', 4.5) or 4.5)
+    front_keep_bonus = float(wp.get('pace_front_keep_wide_bonus', 2.0) or 2.0)
+    front_bias = ((z4 == 'FRONT') & (pf3_rank <= float(front_auto_rank))).astype(float) * front_auto_bonus
+    if pace_mode == 'high':
+        front_bias = front_bias * 0.45
+    elif pace_mode == 'high-mid':
+        front_bias = front_bias * 0.75
+    gatefit = _num_series(df, 'GateFit', 50.0)
+    front_bias = front_bias + (((z4 == 'FRONT') & (gatefit >= 58.0)).astype(float) * front_keep_bonus)
+    good_pos_mask = z4.isin(['FRONT', 'MIDDLE'])
+    if pf3.notna().sum() > 1 and float(pf3.max()) != float(pf3.min()):
+        pf3_fast01 = ((float(pf3.max()) - pf3) / (float(pf3.max()) - float(pf3.min()))).clip(lower=0.0, upper=1.0)
+    else:
+        pf3_fast01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
+    if pl3.notna().sum() > 1 and float(pl3.max()) != float(pl3.min()):
+        last3f_fast01 = ((float(pl3.max()) - pl3) / (float(pl3.max()) - float(pl3.min()))).clip(lower=0.0, upper=1.0)
+    else:
+        last3f_fast01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
+    posfit = _num_series(df, 'PosFit', 50.0)
+    condfit = _num_series(df, 'ConditionFit', 50.0)
+    stability = _num_series(df, ['StabilityComposite', 'SAS'], 50.0)
+    pacefit = _num_series(df, 'PaceFit', 50.0)
+    comment_trend_num = _num_series(df, 'CommentTrend', 50.0)
+    training_num = _num_series(df, 'TrainingScore', 50.0)
+    distance_num = _num_series(df, 'DistanceSuitScore', 50.0)
+    recent_num = _num_series(df, 'RecentFormScore', 50.0)
+    df['GoodPositionScore'] = (
+        0.38 * posfit
+        + 0.18 * gatefit
+        + 0.12 * condfit
+        + 0.14 * stability
+        + 0.10 * pacefit
+        + 0.08 * (good_pos_mask.astype(float) * 100.0)
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    reaccel_gate = (good_pos_mask & ((pf3_rank <= max(5, int(np.ceil(len(df) * 0.40)))) | (posfit >= 58.0))).astype(float)
+    df['ReAccelScore'] = (
+        0.34 * df['GoodPositionScore']
+        + 0.28 * (last3f_fast01 * 100.0)
+        + 0.14 * recent_num
+        + 0.10 * comment_trend_num
+        + 0.08 * training_num
+        + 0.06 * distance_num
+        + reaccel_gate * (4.0 if pace_mode in {'mid', 'high-mid'} else 2.0)
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    df['PositionReAccelScore'] = (
+        0.56 * df['GoodPositionScore']
+        + 0.44 * df['ReAccelScore']
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    dist_rank = distance_num.rank(method='min', ascending=False)
+    if float(dist_rank.max()) > 1.0:
+        dist_rank_score = ((float(dist_rank.max()) - dist_rank) / (float(dist_rank.max()) - 1.0) * 100.0).clip(lower=0.0, upper=100.0)
+    else:
+        dist_rank_score = pd.Series([50.0] * len(df), index=df.index, dtype=float)
+
+    jrank_col = None
+    for _jc in ['JockeyRank', 'jockey_rank', 'jockeyRank', '騎手順位', '騎手Rank']:
+        if _jc in df.columns:
+            jrank_col = _jc
+            break
+    if jrank_col is not None:
+        jr = _num_series(df.get(jrank_col, np.nan), index=df.index)
+        maxr = float(jr.dropna().max()) if jr.notna().sum() > 0 else float('nan')
+        if np.isfinite(maxr) and maxr > 1.0:
+            jockey_rank_score = ((maxr - jr.fillna(maxr)) / (maxr - 1.0) * 100.0).clip(lower=0.0, upper=100.0)
+        else:
+            jockey_rank_score = pd.Series([50.0] * len(df), index=df.index, dtype=float)
+    else:
+        jockey_rank_score = pd.Series([50.0] * len(df), index=df.index, dtype=float)
+
+    df['JockeyDistanceEvidenceScore'] = (
+        0.52 * jockey_rank_score
+        + 0.48 * dist_rank_score
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    return df
+
+
+def _comp_pace_lap_scores(
+    df: "pd.DataFrame",
+    meta: "Dict[str, str]",
+    params: dict,
+) -> "pd.DataFrame":
+    """PaceScenarioAdvantage・LapSuitScore・PopularityPositionLapScore等をdfに書き込む。
+
+    R29 fix: _comp_position_accel分割後にローカル変数を再定義。
+    """
+    # ── local vars needed for pace/lap scores (R29 fix: re-define after function split)
+    z4 = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    pf3 = _num_series(df, 'pred_first3f', np.nan, index=df.index)
+    pl3 = _num_series(df, 'pred_last3f', np.nan, index=df.index)
+    pf3_rank = pf3.rank(method='min', ascending=True)
+    pace_mode = str((meta or {}).get('pace_eval_mode', '') or '')
+    wp = (params.get('win_pattern_rules', {}) or {})
+    front_auto_rank  = int(wp.get('pace_front_auto_promote_rank_max', 3) or 3)
+    front_auto_bonus = float(wp.get('pace_front_auto_promote_bonus', 4.5) or 4.5)
+    lap_meta = _lap_shape_meta_features(meta)
+    # shared score series
+    gatefit   = _num_series(df, 'GateFit',          50.0)
+    posfit    = _num_series(df, 'PosFit',            50.0)
+    condfit   = _num_series(df, 'ConditionFit',      50.0)
+    stability = _num_series(df, ['StabilityComposite', 'SAS'], 50.0)
+    pacefit   = _num_series(df, 'PaceFit',           50.0)
+    if pl3.notna().sum() > 1 and float(pl3.max()) != float(pl3.min()):
+        last3f_fast01 = ((float(pl3.max()) - pl3) / (float(pl3.max()) - float(pl3.min()))).clip(lower=0.0, upper=1.0)
+    else:
+        last3f_fast01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
+    # front_bias: re-compute (mirrors _comp_position_accel logic)
+    front_keep_bonus = float(wp.get('pace_front_keep_wide_bonus', 2.0) or 2.0)
+    front_bias = ((z4 == 'FRONT') & (pf3_rank <= float(front_auto_rank))).astype(float) * front_auto_bonus
+    if pace_mode == 'high':
+        front_bias = front_bias * 0.45
+    elif pace_mode == 'high-mid':
+        front_bias = front_bias * 0.75
+    front_bias = front_bias + (((z4 == 'FRONT') & (gatefit >= 58.0)).astype(float) * front_keep_bonus)
+    # R29 fix: additional shared series (previously leaked from _comp_position_accel scope)
+    good_pos_mask    = z4.isin(['FRONT', 'MIDDLE'])
+    distance_num     = _num_series(df, 'DistanceSuitScore',   50.0)
+    recent_num       = _num_series(df, 'RecentFormScore',     50.0)
+    comment_trend_num = _num_series(df, 'CommentTrend',       50.0)
+    training_num     = _num_series(df, 'TrainingScore',       50.0)
+    favorite_num     = _num_series(df, 'FavoriteScore',       50.0)
+    anchor_base_num  = _num_series(df, ['AnchorScore', 'SAS'], 50.0)
+    win_num          = _num_series(df, 'WinCandidateScore',   50.0)
+
+    df['PaceScenarioAdvantage'] = (
+        0.28 * pacefit
+        + 0.18 * posfit
+        + 0.12 * gatefit
+        + 0.10 * condfit
+        + 0.10 * stability
+        + 0.14 * df['PositionReAccelScore']
+        + 0.08 * (last3f_fast01 * 100.0)
+        + front_bias
+        - 0.35 * _num_series(df, 'FrontCollapseRisk', 0.0)
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    pop_proxy = pd.Series(np.nan, index=df.index, dtype=float)
+    for _pc in ['popularity', '人気', 'odds_rank', 'OddsRank']:
+        if _pc in df.columns:
+            pop_proxy = _num_series(df.get(_pc, np.nan), index=df.index)
+            break
+    if pop_proxy.notna().sum() > 0:
+        maxp = float(pop_proxy.dropna().max()) if pop_proxy.notna().sum() else float('nan')
+        if np.isfinite(maxp) and maxp > 1.0:
+            pop_proxy_score = ((maxp - pop_proxy.fillna(maxp)) / (maxp - 1.0) * 100.0).clip(lower=0.0, upper=100.0)
+        else:
+            pop_proxy_score = pd.Series([50.0] * len(df), index=df.index, dtype=float)
+    else:
+        pop_proxy_score = _num_series(df.get('p_win_field', favorite_num), favorite_num, index=df.index, lower=0.0, upper=100.0)
+
+    lap_closing_bias = float(lap_meta.get('closing_bias', 0.0) or 0.0)
+    lap_goodpos_bias = float(lap_meta.get('goodpos_bias', 0.0) or 0.0)
+    df['LapSuitScore'] = (
+        0.34 * df['PaceScenarioAdvantage']
+        + 0.24 * df['PositionReAccelScore']
+        + 0.16 * (last3f_fast01 * 100.0)
+        + 0.12 * distance_num
+        + 0.08 * recent_num
+        + good_pos_mask.astype(float) * max(0.0, lap_goodpos_bias) * 0.80
+        + (~good_pos_mask).astype(float) * max(0.0, lap_closing_bias) * 0.70
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    df['PopularityPositionLapScore'] = (
+        0.24 * pop_proxy_score
+        + 0.40 * df['GoodPositionScore']
+        + 0.36 * df['LapSuitScore']
+        + ((df['PositionReAccelScore'] >= 60.0).astype(float) * 2.4)
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    second_col_signal = (
+        ((training_num >= 58.0) | (comment_trend_num >= 56.0)).astype(float) * 3.2
+        + ((df['JockeyDistanceEvidenceScore'] >= 60.0).astype(float) * 2.0)
+        + ((df['PositionReAccelScore'] >= 60.0).astype(float) * 2.4)
+    )
+    df['GoodPositionSecondColumnScore'] = (
+        0.34 * df['PositionReAccelScore']
+        + 0.24 * df['PopularityPositionLapScore']
+        + 0.20 * df['JockeyDistanceEvidenceScore']
+        + 0.10 * training_num
+        + 0.06 * comment_trend_num
+        + 0.06 * anchor_base_num
+        + second_col_signal
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    df['CloseScenarioScore'] = (
+        0.18 * (last3f_fast01 * 100.0)
+        + 0.20 * df['PaceScenarioAdvantage']
+        + 0.18 * win_num
+        + 0.12 * distance_num
+        + 0.08 * recent_num
+        + 0.24 * _num_series(df, 'PositionReAccelScore', 50.0)
+        + max(0.0, lap_closing_bias) * (~good_pos_mask).astype(float) * 0.70
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    return df
+
+
+def _comp_axis_final(
+    df: "pd.DataFrame",
+    meta: "Dict[str, str]",
+    params: dict,
+) -> "pd.DataFrame":
+    """AxisReadinessScore・WinAxisScore・PlaceAxisCoreScore・FinalMarkScoreをdfに書き込む。
+
+    R29 fix: 分割後にローカル変数を再定義。
+    """
+    # ── local vars needed for axis/final scores (R29 fix: re-define after function split)
+    z4 = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    pf3 = _num_series(df, 'pred_first3f', np.nan, index=df.index)
+    pf3_rank = pf3.rank(method='min', ascending=True)
+    wp = (params.get('win_pattern_rules', {}) or {})
+    front_auto_rank  = int(wp.get('pace_front_auto_promote_rank_max', 3) or 3)
+    training_num     = _num_series(df, 'TrainingScore',      50.0)
+    posfit           = _num_series(df, 'PosFit',             50.0)
+    gatefit          = _num_series(df, 'GateFit',            50.0)
+    stability        = _num_series(df, ['StabilityComposite', 'SAS'], 50.0)
+    distance_num     = _num_series(df, 'DistanceSuitScore',  50.0)
+    favorite_num     = _num_series(df, 'FavoriteScore',      50.0)
+    anchor_base_num  = _num_series(df, ['AnchorScore', 'SAS'], 50.0)
+    win_num          = _num_series(df, 'WinCandidateScore',  50.0)
+    ability_num       = _num_series(df, 'Ability',            50.0)
+    comment_trend_num = _num_series(df, 'CommentTrend',       50.0)
+    recent_num        = _num_series(df, 'RecentFormScore',    50.0)
+    pace_mode         = str((meta or {}).get('pace_eval_mode', '') or '')
+    course_fit_delta = _num_series(df, 'CourseProfileFit', 50.0) - 50.0
+    course_straight_delta = _num_series(df, 'CourseStraightFit', 50.0) - 50.0
+    course_corner_delta = _num_series(df, 'CourseCornerFit', 50.0) - 50.0
+    course_stamina_delta = _num_series(df, 'CourseStaminaFit', 50.0) - 50.0
+    df['AxisReadinessScore'] = (
+        0.26 * _num_series(df, 'PlaceAxisScore', 50.0)
+        + 0.18 * df['PaceScenarioAdvantage']
+        + 0.18 * df['PositionReAccelScore']
+        + 0.12 * posfit
+        + 0.10 * stability
+        + 0.08 * gatefit
+        + 0.08 * df['JockeyDistanceEvidenceScore']
+        + 0.10 * course_fit_delta
+        + 0.05 * course_corner_delta
+        - 0.70 * _num_series(df, 'DevelopmentWaitRisk', 0.0)
+        - 0.45 * _num_series(df, 'StartRiskShort', 0.0)
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    df['WinAxisScore'] = (
+        0.34 * ability_num
+        + 0.18 * _num_series(df, 'RaceConditionScore', 50.0)
+        + 0.20 * df['PositionReAccelScore']
+        + 0.12 * df['PaceScenarioAdvantage']
+        + 0.08 * posfit
+        + 0.08 * df['JockeyDistanceEvidenceScore']
+        + 0.08 * course_fit_delta
+        + 0.06 * course_straight_delta
+        - 0.65 * _num_series(df, 'DevelopmentWaitRisk', 0.0)
+        - 0.35 * _num_series(df, 'FrontCollapseRisk', 0.0)
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    df['PlaceAxisCoreScore'] = (
+        0.26 * _num_series(df, 'SAS', 50.0)
+        + 0.18 * df['PaceScenarioAdvantage']
+        + 0.18 * df['PositionReAccelScore']
+        + 0.12 * stability
+        + 0.10 * posfit
+        + 0.08 * distance_num
+        + 0.08 * df['JockeyDistanceEvidenceScore']
+        + 0.10 * course_fit_delta
+        + 0.06 * course_stamina_delta
+        - 0.45 * _num_series(df, 'DevelopmentWaitRisk', 0.0)
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    df['WinCandidateScore'] = (0.58 * _num_series(df, 'WinCandidateScore', 50.0) + 0.42 * df['WinAxisScore']).clip(lower=0.0, upper=100.0).astype(float)
+    df['PlaceAxisScore'] = (0.62 * _num_series(df, 'PlaceAxisScore', 50.0) + 0.38 * df['PlaceAxisCoreScore']).clip(lower=0.0, upper=100.0).astype(float)
+
+    _mark_base = (
+        0.42 * df['WinCandidateScore']
+        + 0.16 * favorite_num
+        + 0.16 * df['PlaceAxisScore']
+        + 0.12 * df['PositionReAccelScore']
+        + 0.08 * df['PopularityPositionLapScore']
+        + 0.06 * df['PaceScenarioAdvantage']
+        + 0.05 * course_fit_delta
+    ).astype(float)
+    _pace_rank = _num_series(df, 'PaceScenarioAdvantage', 0.0).rank(method='min', ascending=False)
+    _mark_rank = _mark_base.rank(method='min', ascending=False)
+    _promote = ((_pace_rank <= 5.0) & (_mark_rank >= 7.0)).astype(float) * 4.0
+    _promote = _promote + (((df['GoodPositionSecondColumnScore'] >= 62.0) & ((training_num >= 58.0) | (comment_trend_num >= 56.0))).astype(float) * 2.4)
+    _promote = _promote + (((z4 == 'FRONT') & (pf3_rank <= float(front_auto_rank)) & (_pace_rank <= 5.0)).astype(float) * 1.5)
+    if pace_mode == 'high':
+        _promote = _promote * 0.65
+    df['PacePromotionBonus'] = _num_series(_promote, 0.0, index=df.index)
+    df['FinalMarkScore'] = (_mark_base + df['PacePromotionBonus']).clip(lower=0.0, upper=100.0).astype(float)
+
+    try:
+        promoted_second = df.sort_values(['GoodPositionSecondColumnScore', 'PopularityPositionLapScore', 'num'], ascending=[False, False, True])
+        promoted_second = promoted_second.loc[((training_num >= 58.0) | (comment_trend_num >= 56.0) | (df['JockeyDistanceEvidenceScore'] >= 60.0)), 'num'].astype(str).tolist()[:4]
+        meta['trio_race_type_mode'] = 'closing' if pace_mode in {'high', 'high-mid'} else 'good-position'
+        meta['position_second_column_nums'] = ','.join(promoted_second)
+        meta['pace_human_check'] = str((meta or {}).get('pace_human_check', '') or '')
+    except Exception:
+        pass
+    return df
+
+
+def _csv_compute_composite_scores(
+    df: pd.DataFrame,
+    meta: Dict[str, str],
+    params: dict,
+) -> pd.DataFrame:
+    """GoodPositionScore・ReAccelScore・PaceScenarioAdvantage・LapSuitScore・FinalMarkScore等を計算してdfに書き込む。
+
+    3ヘルパー（_comp_position_accel, _comp_pace_lap_scores, _comp_axis_final）に委譲する。
+    """
+    df = _comp_position_accel(df, meta, params)
+    df = _comp_pace_lap_scores(df, meta, params)
+    df = _comp_axis_final(df, meta, params)
+    return df
+
+
+
+def _csp_compute_signal_flags(
+    df: "pd.DataFrame",
+    meta: Dict[str, str],
+    params: dict,
+) -> "pd.DataFrame":
+    """DangerousPopularity / ValueHole / NextRunRecommend の各シグナル列を df に追加して返す。(R21: _csv_compute_signal_probs から分離)"""
+    # R32: フラグメント解消 -- 大量列追加後に呼び出されるためコピーで連続化
+    df = df.copy()  # noqa: PD901
+    df['WinThroughScore'] = _num_series(df, 'WinCandidateScore', 50.0)
+    danger_score, danger_flag, danger_reason = compute_popularity_danger_v1_1(df, params)
+    df['DangerousPopularityScore'] = _num_series(danger_score, 0.0, index=df.index)
+    df['DangerousPopularityFlag'] = _num_series(danger_flag, 0, index=df.index, dtype=int)
+    df['DangerousPopularityReason'] = danger_reason.infer_objects(copy=False).fillna('').astype(str)
+    hole_score, hole_flag, hole_reason = compute_value_hole_flags_v1_1(df, params)
+    df['ValueHoleScore'] = _num_series(hole_score, 0.0, index=df.index)
+    df['ValueHoleFlag'] = _num_series(hole_flag, 0, index=df.index, dtype=int)
+    df['ValueHoleReason'] = hole_reason.infer_objects(copy=False).fillna('').astype(str)
+    nr_score, nr_main, nr_watch, nr_tags, nr_comment = compute_next_run_recommendation_v1_1(df, meta, params)
+    df['NextRunRecommendScore'] = _num_series(nr_score, 0.0, index=df.index, lower=0.0, upper=100.0)
+    df['NextRunMainFlag'] = _num_series(nr_main, 0, index=df.index, dtype=int)
+    df['NextRunWatchFlag'] = _num_series(nr_watch, 0, index=df.index, dtype=int)
+    df['NextRunReasonTags'] = nr_tags.infer_objects(copy=False).fillna('').astype(str)
+    df['NextRunReasonComment'] = nr_comment.infer_objects(copy=False).fillna('').astype(str)
+    return df
+
+
+def _csp_update_meta_nums(
+    df: "pd.DataFrame",
+    meta: Dict[str, str],
+    maiden_mode: bool,
+    long_maiden_mode: bool,
+    wp: dict,
+    aw: float,
+    rw: float,
+    cw: float,
+) -> None:
+    """meta の *_nums 系キーを更新する。(R21: _csv_compute_signal_probs から分離)"""
+    try:
+        meta['young_maiden_mode'] = '1' if maiden_mode else '0'
+        meta['long_maiden_mode'] = '1' if long_maiden_mode else '0'
+        if long_maiden_mode and str((meta or {}).get('pace', '') or '').upper().strip()[:1] == 'M':
+            meta['long_maiden_pace_blend'] = (
+                f"M={float(wp.get('long_maiden_pace_m_weight', 0.65) or 0.65):.2f},"
+                f"S={float(wp.get('long_maiden_pace_s_weight', 0.35) or 0.35):.2f}"
+            )
+        meta['win_pattern_weights'] = f"A={aw:.3f} R={rw:.3f} C={cw:.3f}"
+        meta['insurance_line_nums'] = ','.join(
+            df.sort_values(['InsuranceSignalCount', 'RecoverySignal', 'WinCandidateScore', 'num'],
+                           ascending=[False, False, False, True])
+              .loc[_num_series(df.get('is_insurance_line', 0), 0, index=df.index, dtype=int) > 0, 'num']
+              .astype(str).tolist()[:6]
+        )
+        meta['recovery_line_nums'] = ','.join(
+            df.sort_values(['RecoverySignalCount', 'DistanceSuitScore', 'num'],
+                           ascending=[False, False, True])
+              .loc[_num_series(df.get('RecoverySignal', 0), 0, index=df.index, dtype=int) > 0, 'num']
+              .astype(str).tolist()[:6]
+        )
+        meta['next_run_nums'] = ','.join(
+            df.sort_values(['NextRunMainFlag', 'NextRunWatchFlag', 'NextRunRecommendScore', 'num'],
+                           ascending=[False, False, False, True])
+              .loc[_num_series(df.get('NextRunWatchFlag', 0), 0, index=df.index, dtype=int) > 0, 'num']
+              .astype(str).tolist()[:6]
+        )
+        meta['favorite_nums'] = ','.join(
+            df.sort_values(['FavoriteScore', 'WinThroughScore', 'num'],
+                           ascending=[False, False, True])['num'].astype(str).tolist()[:6]
+        )
+        meta['danger_popularity_nums'] = ','.join(
+            df.sort_values(['DangerousPopularityFlag', 'DangerousPopularityScore', 'num'],
+                           ascending=[False, False, True])
+              .loc[_num_series(df.get('DangerousPopularityFlag', 0), 0, index=df.index, dtype=int) > 0, 'num']
+              .astype(str).tolist()[:6]
+        )
+        meta['value_hole_nums'] = ','.join(
+            df.sort_values(['ValueHoleFlag', 'ValueHoleScore', 'num'],
+                           ascending=[False, False, True])
+              .loc[_num_series(df.get('ValueHoleFlag', 0), 0, index=df.index, dtype=int) > 0, 'num']
+              .astype(str).tolist()[:6]
+        )
+    except Exception:
+        pass
+
+
+def _csp_apply_pace_h_front_penalty(
+    df: "pd.DataFrame",
+    meta: dict,
+    params: dict,
+) -> "pd.DataFrame":
+    """R27改良: ペースH予測時に先行スタイル馬の AnchorScore を減算する。
+
+    R27改良: RunningStyleLabel (classify_running_style 出力) が利用可能な場合は
+    zone_4c 単独判定より優先し、可信度が HIGH なら追加ペナルティを適用する。
+
+    ペナルティ構造:
+        zone_4c==FRONT または RunningStyleLabel==FRONT                : base_pen
+        前走も先行 (zone_3c==FRONT または 履歴 FRONT 確定)           : + style_pen
+        RunningStyleConf==HIGH かつ RunningStyleLabel==FRONT            : + extra_pen
+    """
+    try:
+        wr = params.get('wide_rules', {})
+        if not bool(wr.get('anchor_pace_h_penalty_apply', True)):
+            df['AnchorScorePaceHPenalty'] = 0.0
+            return df
+        pace = str((meta or {}).get('pace', '')).upper().strip()[:1]
+        if pace != 'H':
+            df['AnchorScorePaceHPenalty'] = 0.0
+            return df
+
+        base_pen  = float(wr.get('anchor_pace_h_front_penalty', 5.0))
+        style_pen = float(wr.get('anchor_pace_h_front_style_penalty', 3.0))
+        rsc_cfg   = (params.get('running_style_classify', {}) or {})
+        extra_pen = float(rsc_cfg.get('pace_h_confirmed_extra_penalty', 2.0))
+
+        # R27: RunningStyleLabel を優先利用；なければ zone_4c フォールバック
+        if 'RunningStyleLabel' in df.columns:
+            rsl = df['RunningStyleLabel'].astype(str).str.upper()
+            is_front = (rsl == 'FRONT')
+        else:
+            z4_str = df['zone_4c'].astype(str).str.upper() if 'zone_4c' in df.columns \
+                     else pd.Series(['MIDDLE'] * len(df), index=df.index)
+            is_front = (z4_str == 'FRONT')
+
+        # 履歴先行判定: zone_3c かつ RunningStyleConf==HIGHの存在確認
+        z3_str = df['zone_3c'].astype(str).str.upper() if 'zone_3c' in df.columns \
+                 else pd.Series(['MIDDLE'] * len(df), index=df.index)
+        prev_front = (z3_str == 'FRONT')
+
+        rsc_high = pd.Series([False] * len(df), index=df.index)
+        if 'RunningStyleConf' in df.columns:
+            rsc_high = (df['RunningStyleConf'].astype(str).str.upper() == 'HIGH') & is_front
+
+        penalty = pd.Series(0.0, index=df.index)
+        penalty[is_front] += base_pen
+        penalty[is_front & prev_front] += style_pen
+        penalty[rsc_high] += extra_pen   # R27: HIGH確定の先行馬に追加減点
+        df['AnchorScorePaceHPenalty'] = penalty
+        df['AnchorScore'] = (df['AnchorScore'] - penalty).clip(lower=0.0, upper=100.0)
+    except Exception:
+        df['AnchorScorePaceHPenalty'] = 0.0
+    return df
+
+
+def _csp_apply_pace_h_rear_bonus(
+    df: "pd.DataFrame",
+    meta: Dict[str, str],
+    params: dict,
+) -> "pd.DataFrame":
+    """R31 案B改良 + R33 汎用化: Hペース時の REAR/MIDDLE+GRB 馬への AnchorScore ボーナス。
+
+    REAR ボーナス (R31 引き継ぎ):
+      層1 (基本): REAR + HIGH → h_pace_rear_high_anchor_bonus  (デフォルト 1.5)
+      層2 (GRB):  REAR + HIGH + GateRecoveryBonus > grb_threshold
+                  → +h_pace_rear_high_grb_extra              (デフォルト 1.5)
+      効果: ムーヴ型（GRB>0）= +3.0、普通 REAR+HIGH = +1.5
+
+    MIDDLE ボーナス (R33 新規):
+      MIDDLE + HIGH + GateRecoveryBonus > grb_threshold
+                  → +h_pace_middle_high_grb_bonus             (デフォルト 1.0)
+      論拠: GRB付き差し馬はゲート不利挽回力 → Hペースでも評価、ただし REAR より控えめ
+    """
+    try:
+        if not bool(params.get('h_pace_rear_high_anchor_enabled', True)):
+            df['AnchorScoreRearBonus'] = 0.0
+            df['AnchorScoreMiddleGRBBonus'] = 0.0
+            return df
+        pace = str((meta or {}).get('pace', '')).upper().strip()[:1]
+        if pace != 'H':
+            df['AnchorScoreRearBonus'] = 0.0
+            df['AnchorScoreMiddleGRBBonus'] = 0.0
+            return df
+        if 'RunningStyleLabel' not in df.columns or 'RunningStyleConf' not in df.columns:
+            df['AnchorScoreRearBonus'] = 0.0
+            df['AnchorScoreMiddleGRBBonus'] = 0.0
+            return df
+
+        base_bonus  = float(params.get('h_pace_rear_high_anchor_bonus', 1.5))
+        grb_extra   = float(params.get('h_pace_rear_high_grb_extra',   1.5))
+        grb_thr     = float(params.get('h_pace_rear_high_grb_threshold', 0.0))
+
+        rsl  = df['RunningStyleLabel'].astype(str).str.upper()
+        rsc  = df['RunningStyleConf'].astype(str).str.upper()
+        rear_high_mask = (rsl == 'REAR') & (rsc == 'HIGH')
+
+        # --- REAR ボーナス (R31 引き継ぎ) ---
+        rear_bonus = pd.Series(0.0, index=df.index)
+        rear_bonus[rear_high_mask] = base_bonus
+
+        grb = pd.Series(0.0, index=df.index)
+        if 'GateRecoveryBonus' in df.columns:
+            grb = pd.to_numeric(df['GateRecoveryBonus'], errors='coerce').fillna(0.0)
+            grb_mask = rear_high_mask & (grb > grb_thr)
+            rear_bonus[grb_mask] = rear_bonus[grb_mask] + grb_extra
+
+        df['AnchorScoreRearBonus'] = rear_bonus
+
+        # --- MIDDLE+HIGH+GRB ボーナス (R33 新規) ---
+        mid_bonus = pd.Series(0.0, index=df.index)
+        if bool(params.get('h_pace_middle_high_grb_enabled', True)):
+            mid_grb_bonus = float(params.get('h_pace_middle_high_grb_bonus', 1.0))
+            mid_grb_thr   = float(params.get('h_pace_middle_high_grb_threshold', 2.0))  # R35: default 0.0→2.0
+            middle_high_mask = (rsl == 'MIDDLE') & (rsc == 'HIGH')
+            mid_grb_mask = middle_high_mask & (grb > mid_grb_thr)
+            mid_bonus[mid_grb_mask] = mid_grb_bonus
+
+        df['AnchorScoreMiddleGRBBonus'] = mid_bonus
+
+        # AnchorScore に REAR + MIDDLE ボーナスを加算
+        total_bonus = rear_bonus + mid_bonus
+        df['AnchorScore'] = (df['AnchorScore'] + total_bonus).clip(lower=0.0, upper=100.0).astype(float)
+    except Exception:
+        df['AnchorScoreRearBonus'] = 0.0
+        df['AnchorScoreMiddleGRBBonus'] = 0.0
+    return df
+
+
+def _csp_compute_win_place_probs(
+    df: "pd.DataFrame",
+    meta: Dict[str, str],
+    params: dict,
+) -> "pd.DataFrame":
+    """AnchorScore・複勝/勝ち確率・タイトレース判定を df に書き込んで返す。(R21: _csv_compute_signal_probs から分離)"""
+    # R32: フラグメント解消 -- 内部で複数列を追加するためコピーで連続化
+    df = df.copy()  # noqa: PD901
+    df['WinCandidateScore'] = _num_series(df, 'WinCandidateScore', 50.0).clip(lower=0.0, upper=100.0).astype(float)
+    df['PlaceAxisScore'] = _num_series(df, 'PlaceAxisScore', 50.0).clip(lower=0.0, upper=100.0).astype(float)
+    course_fit_delta = _num_series(df.get('CourseProfileFit', 50.0), 50.0, index=df.index) - 50.0
+    course_stamina_delta = _num_series(df.get('CourseStaminaFit', 50.0), 50.0, index=df.index) - 50.0
+    df['AnchorScore'] = (
+        0.62 * df['PlaceAxisScore']
+        + 0.20 * _num_series(df.get('AxisReadinessScore', df['PlaceAxisScore']), df['PlaceAxisScore'], index=df.index)
+        + 0.10 * _num_series(df.get('PaceScenarioAdvantage', 50.0), 50.0, index=df.index)
+        + 0.08 * _num_series(df.get('StabilityComposite', df.get('SAS', 50.0)), 50.0, index=df.index)
+        + 0.10 * course_fit_delta
+        + 0.04 * course_stamina_delta
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    # R26: ペースH時の先行馬 AnchorScore ペナルティ
+    df = _csp_apply_pace_h_front_penalty(df, meta, params)
+    # R30 案B: ペースH時の REAR+HIGH確信馬 AnchorScore ボーナス
+    df = _csp_apply_pace_h_rear_bonus(df, meta, params)
+
+    # --- Place probability (model) ---
+    score_col_for_place = str(params.get('place_model_score_col', 'PlaceAxisScore'))
+    if score_col_for_place not in df.columns:
+        score_col_for_place = ('PlaceAxisScore' if 'PlaceAxisScore' in df.columns
+                               else ('AnchorScore' if 'AnchorScore' in df.columns else 'SAS'))
+    _pc = (params.get('place_calibration', {}) or {})
+    _sc_mean = float(_num_series(df[score_col_for_place], 50.0, index=df.index).mean())
+    df["p_place_model"] = df[score_col_for_place].apply(
+        lambda x: _place_prob_from_score(float(x), _pc, _sc_mean)).astype(float)
+
+    # --- Place probability (PURE_DATA) ---
+    df["p_place_mkt"] = np.nan
+    for _col in ['p_win_mkt', 'p_place_mkt', 'MarketWinFit', 'MarketPlaceFit']:
+        if _col in df.columns:
+            try:
+                df[_col] = np.nan if _col.startswith('p_') else 0.0
+            except Exception:
+                pass
+    df["p_place_est"] = _num_series(df["p_place_model"], index=df.index).clip(lower=0.0, upper=1.0)
+    df["p_place_est_pct"] = (df["p_place_est"] * 100.0).astype(float)
+
+    # --- Win probability field ---
+    score_col_for_win = str(params.get('win_model_score_col', 'WinCandidateScore'))
+    if score_col_for_win not in df.columns:
+        score_col_for_win = ('WinCandidateScore' if 'WinCandidateScore' in df.columns
+                             else ('WPS' if 'WPS' in df.columns else 'SAS'))
+    try:
+        win_tau = float(params.get('win_calibration_tau', 12.0) or 12.0)
+    except Exception:
+        win_tau = 12.0
+    _win_score = _num_series(df[score_col_for_win], 50.0, index=df.index)
+    win_raw = np.exp((_win_score - _win_score.mean()) / max(1.0, win_tau))
+    win_raw = pd.Series(win_raw).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    win_denom = float(win_raw.sum())
+    df["p_win_field"] = (win_raw / win_denom * 100.0).astype(float) if win_denom > 0 else 0.0
+
+    # --- Tight race detection ---
+    try:
+        _tight_mode, _tight_spread = detect_tight_race_v1_1(df)
+        thr_time = float(params.get('tight_race_time_gap_sec', 0.50) or 0.50)
+        if np.isfinite(_tight_spread) and _tight_spread <= thr_time:
+            _tight_mode = True
+        win_gap = float(params.get('tight_race_win_gap_pts', 2.5) or 2.5)
+        place_gap = float(params.get('tight_race_place_gap_pts', 3.5) or 3.5)
+        win_top = float(_num_series(df.get('WinCandidateScore', np.nan), -999.0, index=df.index).max())
+        place_top = float(_num_series(df.get('PlaceAxisScore', np.nan), -999.0, index=df.index).max())
+        df['is_win_group'] = (
+            _num_series(df.get('WinCandidateScore', np.nan), -999.0, index=df.index) >= (win_top - win_gap)
+        ).astype(int)
+        df['is_place_group'] = (
+            _num_series(df.get('PlaceAxisScore', np.nan), -999.0, index=df.index) >= (place_top - place_gap)
+        ).astype(int)
+        meta['tight_race_mode'] = '1' if _tight_mode else '0'
+        meta['tight_race_spread'] = '' if not np.isfinite(_tight_spread) else f"{_tight_spread:.3f}"
+        try:
+            ws = df.sort_values(['WinCandidateScore', 'num'], ascending=[False, True]).copy()
+            ps = df.sort_values(['PlaceAxisScore', 'num'], ascending=[False, True]).copy()
+            meta['win_group_nums'] = ','.join(ws.loc[ws['is_win_group'] > 0, 'num'].astype(str).tolist()[:6])
+            meta['place_group_nums'] = ','.join(ps.loc[ps['is_place_group'] > 0, 'num'].astype(str).tolist()[:6])
+            meta['main_num_candidate'] = str(ws.iloc[0].get('num', '')) if len(ws) else ''
+            meta['anchor_num_candidate'] = str(ps.iloc[0].get('num', '')) if len(ps) else ''
+            fs = df.sort_values(['FavoriteScore', 'WinThroughScore', 'num'], ascending=[False, False, True]).copy()
+            meta['favorite_num_candidate'] = str(fs.iloc[0].get('num', '')) if len(fs) else ''
+        except Exception:
+            pass
+    except Exception:
+        df['is_win_group'] = 0
+        df['is_place_group'] = 0
+    return df
+
+
+def _csv_compute_signal_probs(
+    df: pd.DataFrame,
+    meta: Dict[str, str],
+    params: dict,
+    rating_min: float,
+    rating_max: float,
+    speed_min: float,
+    speed_max: float,
+) -> Tuple[pd.DataFrame, Dict, "AuditFlags"]:
+    """DangerousPopularity・ValueHole・NextRunRecommendScore と複勝/勝ち確率・タイトレース判定を計算して返す。(R21: 3サブ関数に委譲)
+
+    Returns:
+        (df, logs, AuditFlags)
+    """
+    df = _csp_compute_signal_flags(df, meta, params)
+    # R29 fix: 変数を再計算（分割後のスコープ問題を解消）
+    maiden_mode      = _is_young_maiden_race(meta, df)
+    long_maiden_mode = _is_long_maiden_race(meta, df)
+    wp = (params.get('win_pattern_rules', {}) or {})
+    if long_maiden_mode:
+        aw = float(wp.get('long_maiden_ability_weight',  0.34) or 0.34)
+        rw = float(wp.get('long_maiden_recent_weight',   0.28) or 0.28)
+        cw = float(wp.get('long_maiden_race_weight',     0.38) or 0.38)
+    else:
+        aw = float(wp.get('young_maiden_ability_weight', 0.35) if maiden_mode else wp.get('general_ability_weight', 0.40))
+        rw = float(wp.get('young_maiden_recent_weight',  0.35) if maiden_mode else wp.get('general_recent_weight',  0.25))
+        cw = float(wp.get('young_maiden_race_weight',    0.30) if maiden_mode else wp.get('general_race_weight',    0.35))
+    _csp_update_meta_nums(df, meta,
+                          maiden_mode, long_maiden_mode, wp, aw, rw, cw)
+    df = _csp_compute_win_place_probs(df, meta, params)
+    logs = {
+        "rating_min": rating_min,
+        "rating_max": rating_max,
+        "speed_min": speed_min,
+        "speed_max": speed_max,
+    }
+    return df, logs, AuditFlags(audit_flag="CONFIRMED(derived_p_place_est)", reason="ok")
+
+
+
+def compute_scores_v1_1(entries: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> Tuple[pd.DataFrame, Dict, AuditFlags]:
+    """全スコアを統合計算して DataFrame・メタ・監査フラグを返す最上位関数。
+
+    すべての compute_*_v1_1 を呼び出し、各列をスコア DataFrame に書き込む。
+    内部実装は 6 つのサブ関数に分割されている:
+      _csv_neutral_return          : データ欠損時の早期リターン
+      _csv_compute_base_features   : 基本特徴量
+      _csv_compute_sas             : SAS / AnchorScore
+      _csv_compute_wps_win_scores  : WPS / 勝ち馬・複勝軸候補
+      _csv_compute_composite_scores: 複合スコア群
+      _csv_compute_signal_probs    : シグナル・確率・タイトレース
+
+    Returns:
+        (df_scored: pd.DataFrame, meta: Dict, audit: AuditFlags)
+    """
+    df = entries.copy()
+
+    params = params or DEFAULT_PARAMS
+
+    # MARKET_FEATURES_OFF_SCORE_V2: 市場市場由来特徴は予想に使わない（表示のみ可）
+    try:
+        market_enabled = bool(params.get('market_features_enabled', False))
+    except Exception:
+        market_enabled = False
+
+    # R24: class_up_point 列が存在する場合は数値に正規化（entries.copy() 後の df に適用）
+    # R29 fix: fillna(0.0) を削除。NaN は NaN のまま保持し valid_mask 方式で後段処理する。
+    if 'class_up_point' in df.columns:
+        df['class_up_point'] = pd.to_numeric(
+            df['class_up_point'], errors='coerce'
+        )  # NaN はそのまま保持（fillna しない）
+
+    for c in ["num", "name", "rating", "speed_max", "zone_3c", "zone_4c", "speed_hist"]:
+        if c not in df.columns:
+            df[c] = ""
+
+    df["zone_3c"] = df["zone_3c"].apply(normalize_zone_token)
+    df["zone_4c"] = df["zone_4c"].apply(normalize_zone_token)
+
+    rating_num = _num_series(df, 'rating', np.nan, index=df.index)
+    speed_num  = _num_series(df, 'speed_max', np.nan, index=df.index)
+
+    # ── 早期リターン（データ欠損） ──────────────────────────────
+    early = _csv_neutral_return(df, meta, params, rating_num, speed_num)
+    if early is not None:
+        return early
+
+    # ── 基本特徴量 ──────────────────────────────────────────────
+    # R29: entries に comment_text / prev_interview 列があれば build_comment_features を自動実行
+    # (CLI 経由せず compute_scores_v1_1 を直接呼び出す場合もコメント特徴量を有効化する)
+    # R34修正: 判定条件を変更
+    #   修正前: 'GateRecoveryBonus' 列の存在のみで判定
+    #            → GateRecoveryBonus=0.0 で初期化済みの場合もビルドをスキップするバグ
+    #   修正後: 'CommentFit' 列（build_comment_features 固有の出力列）の存在で判定
+    #            → CommentFit があればビルド済み、なければ未実行として呼び出す
+    _has_comment_cols      = any(c in df.columns for c in ['comment_text', 'prev_interview'])
+    _comment_already_built = 'CommentFit' in df.columns  # R34: build固有の出力列で判定
+    if _has_comment_cols and not _comment_already_built:
+        try:
+            _cmt_cols = ['num'] + [c for c in ['name', 'comment_text', 'prev_interview'] if c in df.columns]
+            df = build_comment_features(df, df[_cmt_cols].copy(), params=params)
+        except Exception:
+            pass  # 失敗時はコメントなしで継続
+
+    df, rating_min, rating_max, speed_min, speed_max = _csv_compute_base_features(df, meta, params)
+
+    # ── SAS / AnchorScore ───────────────────────────────────────
+    df = _csv_compute_sas(df, meta, params)
+
+    # ── WPS / 勝ち馬・複勝軸候補スコア ─────────────────────────
+    df = _csv_compute_wps_win_scores(df, meta, params)
+
+    # ── 複合スコア群 ────────────────────────────────────────────
+    df = _csv_compute_composite_scores(df, meta, params)
+
+    # ── シグナル・確率・タイトレース ─────────────────────────────
+    return _csv_compute_signal_probs(df, meta, params, rating_min, rating_max, speed_min, speed_max)
+
+
+
+
+# =========================
+# 3) Decision + Report (PLACE + WIDE with ODDS)
+# =========================
+
+# NOTE
+# - 「複勝 1点」+「ワイド ◎−3頭流し（3点）」を出力します。
+# - 市場は任意入力（CSV）で取り込み、EV（期待値）と簡易ステーク配分を計算します。
+# - 市場が無い場合は従来通り「確率推定（p）」優先で相手選定します。
+
+
+# [REMOVED] parse_market_range: market/market helpers removed (not used)
+
+
+# [REMOVED] ev_from_p_and_market: market/market helpers removed (not used)
+
+
+
+
+def _sanitize_num_token(v) -> str:
+    """Normalize horse number token to '1'..'18' string; return '' if invalid."""
+    try:
+        s = str(v).strip()
+    except Exception:
+        return ''
+    if s in ('', 'nan', 'None'):
+        return ''
+
+    # full-width digits -> half-width
+    try:
+        s = s.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
+    except Exception:
+        pass
+
+    # common OCR noise
+    s = s.replace(' ', '').replace('\t', '')
+    s = s.replace('O', '0').replace('o', '0')
+    s = s.replace('I', '1').replace('l', '1').replace('|', '1')
+
+    # keep digits only
+    s2 = re.sub(r'[^0-9]', '', s)
+    if s2 == '':
+        return ''
+
+    # strip leading zeros (but keep single '0')
+    s2 = s2.lstrip('0') or '0'
+
+    try:
+        n = int(s2)
+    except Exception:
+        return ''
+    if 1 <= n <= 18:
+        return str(n)
+    return ''
+
+
+def validate_and_sanitize_entries(entries: pd.DataFrame, expected_min: int = 16) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """Deduplicate/clean entries and return (entries, meta_add).
+
+    - Drop rows with invalid num
+    - Deduplicate by num (keep most informative row)
+    - Add validation summaries into meta
+
+    Never raises; always returns a DataFrame.
+    """
+    meta_add: Dict[str, str] = {}
+    try:
+        df = entries.copy() if entries is not None else pd.DataFrame()
+    except Exception:
+        df = pd.DataFrame()
+
+    if len(df) == 0:
+        meta_add['validation_fatal'] = '1'
+        meta_add['validation_reason'] = 'entries_empty'
+        meta_add['validation_entries_rows'] = '0'
+        meta_add['validation_unique_nums'] = '0'
+        return pd.DataFrame(columns=['num','name']), meta_add
+
+    # Ensure columns
+    if 'num' not in df.columns:
+        df['num'] = ''
+    if 'name' not in df.columns:
+        df['name'] = ''
+
+    # Sanitize nums
+    df['num_raw'] = df['num']
+    df['num'] = df['num'].apply(_sanitize_num_token)
+
+    before_rows = int(len(df))
+    df = df[df['num'].astype(str).str.strip() != ''].copy()
+    after_drop = int(len(df))
+
+    # quality score for dedupe (prefer rows with more filled key fields)
+    key_fields = [c for c in ['name','rating','speed_max','pred_first3f','pred_last3f','zone_3c','zone_4c'] if c in df.columns]
+    def _q(r) -> float:
+        """候補行 r について key_fields のスコアを集計する内部ヘルパ。"""
+        sc = 0
+        for c in key_fields:
+            try:
+                v = r.get(c, '')
+                if pd.isna(v):
+                    continue
+                s = str(v).strip()
+                if s not in ('', 'nan', 'None'):
+                    sc += 1
+            except Exception:
+                pass
+        return sc
+
+    try:
+        df['_q'] = df.apply(_q, axis=1)
+    except Exception:
+        df['_q'] = 0
+
+    # Deduplicate
+    dup_cnt = int(df.duplicated(subset=['num']).sum())
+    if dup_cnt > 0:
+        # keep best-quality row per num
+        try:
+            df = df.sort_values(['_q'], ascending=False).drop_duplicates(subset=['num'], keep='first')
+        except Exception:
+            df = df.drop_duplicates(subset=['num'], keep='first')
+
+    # Sort by num
+    try:
+        df['_num_i'] = _num_series(df['num'], 999, index=df.index, dtype=int)
+        df = df.sort_values(['_num_i']).drop(columns=['_num_i'])
+    except Exception:
+        pass
+
+    # Drop helper cols
+    try:
+        df = df.drop(columns=[c for c in ['_q'] if c in df.columns])
+    except Exception:
+        pass
+
+    # Summary stats
+    uniq = int(df['num'].nunique()) if 'num' in df.columns else int(len(df))
+    meta_add['validation_entries_rows'] = str(before_rows)
+    meta_add['validation_rows_after_drop_invalid_num'] = str(after_drop)
+    meta_add['validation_unique_nums'] = str(uniq)
+    meta_add['validation_duplicates_removed'] = str(dup_cnt)
+
+    # missing rates for critical fields
+    try:
+        rating_ok = int(_num_series(df, 'rating', np.nan, index=df.index).notna().sum())
+        speed_ok  = int(_num_series(df, 'speed_max', np.nan, index=df.index).notna().sum())
+        meta_add['validation_rating_nonmissing'] = str(rating_ok)
+        meta_add['validation_speed_nonmissing'] = str(speed_ok)
+    except Exception:
+        pass
+
+    # fatal criteria: completely missing core numeric
+    fatal = False
+    reason = []
+    try:
+        if uniq <= 0:
+            fatal = True; reason.append('no_valid_num')
+        # If either rating or speed is completely missing, scoring becomes unreliable.
+        rating_ok = int(_num_series(df, 'rating', np.nan, index=df.index).notna().sum())
+        speed_ok  = int(_num_series(df, 'speed_max', np.nan, index=df.index).notna().sum())
+        if rating_ok == 0 or speed_ok == 0:
+            fatal = True; reason.append('rating_or_speed_all_missing')
+    except Exception:
+        fatal = True; reason.append('validation_exception')
+
+    # expected_min check is warning (not fatal): still output template.
+    warn = []
+    if uniq < int(expected_min):
+        warn.append(f'entries_less_than_{expected_min}({uniq})')
+
+    meta_add['validation_fatal'] = '1' if fatal else '0'
+    meta_add['validation_reason'] = ';'.join(reason) if reason else 'ok'
+    meta_add['validation_warnings'] = ';'.join(warn) if warn else ''
+
+    # R24-fix: class_up_point 列が存在する場合は float64 に正規化（文字列入力対応・int64 回避）
+    if 'class_up_point' in df.columns:
+        df['class_up_point'] = pd.to_numeric(df['class_up_point'], errors='coerce').astype(float)
+
+    return df.reset_index(drop=True), meta_add
+
+
+def _anchor_prepare_df(df, params: dict) -> tuple:
+    """アンカー選択用に DataFrame を準備し、ソート済みの (d, best) を返す。
+
+    p_place_est_pct の数値化・SAS 量子化・ソートを行う。
+    Returns:
+        tuple[pd.DataFrame, dict]: (sorted_df, best_row_dict)
+    """
+    import numpy as np
+    d = df.copy()
+    if 'p_place_est_pct' in d.columns:
+        d['p_place_est_pct'] = _num_series(d['p_place_est_pct'], 0.0, index=d.index)
+    if 'AnchorScore' in d.columns:
+        d['AnchorScore'] = _num_series(d['AnchorScore'], 0.0, index=d.index)
+    if 'p_place_low_pct' in d.columns:
+        d['p_place_low_pct'] = _num_series(d['p_place_low_pct'], 0.0, index=d.index)
+
+    # SAS_STABLE: quantize SAS to reduce jitter
+    try:
+        d['_sas_q'] = (_num_series(d.get('SAS', np.nan), 0.0, index=d.index) * 2).round() / 2
+    except Exception:
+        d['_sas_q'] = 0.0
+
+    # Sort primary by p_place_low if available, else p_place_est
+    sort_cols = []
+    if 'p_place_low_pct' in d.columns:
+        sort_cols = ['p_place_low_pct', 'p_place_est_pct', 'AnchorScore', '_sas_q', 'num']
+        asc       = [False, False, False, False, True]
+    else:
+        sort_cols = ['p_place_est_pct', 'AnchorScore', '_sas_q', 'num']
+        asc       = [False, False, False, True]
+
+    try:
+        d = d.sort_values(sort_cols, ascending=asc)
+    except Exception:
+        d = d.sort_values(['p_place_est_pct', 'num'], ascending=[False, True])
+
+    if len(d) == 0:
+        return d, {}
+    best = d.iloc[0].to_dict()
+    return d, best
+
+
+def _anchor_apply_risk_guard(d, best: dict, params: dict) -> dict:
+    """コメントリスクペナルティを適用し、必要であれば best を更新して返す。"""
+    import numpy as np
+    wr = (params.get('wide_rules') or {})
+    risk_penalty_enabled = bool(wr.get('anchor_comment_risk_penalty_enabled', True))
+    if not risk_penalty_enabled:
+        return best
+    try:
+        risk_col = 'CommentRisk' if 'CommentRisk' in d.columns else None
+        if risk_col:
+            d = d.copy()
+            d['_risk'] = _num_series(d[risk_col], 0.0, index=d.index)
+            penalty_scale = float(wr.get('anchor_comment_risk_penalty_scale', 0.005) or 0.005)
+            penalty_max   = float(wr.get('anchor_comment_risk_penalty_max_pct', 3.0) or 3.0)
+            d['_p_low_adj'] = (
+                _num_series(d.get('p_place_low_pct', np.nan), 0.0, index=d.index)
+                - (d['_risk'] * penalty_scale * 100).clip(upper=penalty_max)
+            ).clip(lower=0.0)
+            d = d.sort_values(['_p_low_adj', 'p_place_est_pct', 'AnchorScore', 'num'],
+                              ascending=[False, False, False, True])
+            if len(d):
+                best = d.iloc[0].to_dict()
+    except Exception:
+        pass
+    return best
+
+
+def _anchor_front_risk_guard(d, best: dict, params: dict) -> dict:
+    """スプリント戦・先行過密時のフロント型軸リスク回避ガードを適用して best を返す。"""
+    import numpy as np
+    wr = (params.get('wide_rules') or {})
+    fg_enabled = bool(wr.get('anchor_front_risk_guard_enabled', True))
+    if not fg_enabled:
+        return best
+    try:
+        meta_inj = params.get('_meta_injection') or {}
+        dist_raw = meta_inj.get('distance', meta_inj.get('dist', ''))
+        try:
+            dist = float(str(dist_raw).replace('m','').strip())
+        except Exception:
+            dist = float('nan')
+        is_sprint = np.isfinite(dist) and dist <= 1400
+
+        if not is_sprint:
+            return best
+
+        front_count = 0
+        try:
+            z4 = d.get('zone_4c', d.get('zone4c', None))
+            if z4 is not None:
+                front_count = int((d['zone_4c'].astype(str).str.upper() == 'FRONT').sum())
+        except Exception:
+            pass
+
+        front_dense_thr = int(wr.get('anchor_front_risk_front_dense_threshold', 4) or 4)
+        if front_count < front_dense_thr:
+            return best
+
+        best_num  = str(best.get('num', ''))
+        best_zone = ''
+        try:
+            br = d.loc[d['num'].astype(str) == best_num]
+            if len(br):
+                best_zone = str(br.iloc[0].get('zone_4c', '')).upper()
+        except Exception:
+            pass
+
+        if best_zone != 'FRONT':
+            return best
+
+        p_low_best = float(_num_series(best.get('p_place_low_pct', np.nan)))
+        switch_gap_max = float(wr.get('anchor_front_risk_switch_max_gap_pct', 2.0) or 2.0)
+
+        non_front = d.loc[d.get('zone_4c', '').astype(str).str.upper() != 'FRONT'].copy() if 'zone_4c' in d.columns else d.iloc[1:]
+        if len(non_front) == 0:
+            return best
+
+        alt = non_front.iloc[0]
+        p_low_alt = float(_num_series(alt.get('p_place_low_pct', np.nan)))
+        if np.isfinite(p_low_alt) and np.isfinite(p_low_best) and (p_low_best - p_low_alt) <= switch_gap_max:
+            best = alt.to_dict()
+    except Exception:
+        pass
+    return best
+
+
+def _anchor_market_guard(d, best: dict, params: dict) -> dict:
+    """市場ガード（v10.12）: モデル上位が市場上位から大きく乖離した時に市場側にスイッチして best を返す。"""
+    import numpy as np
+    wr = (params.get('wide_rules') or {})
+    mg_enabled = bool(wr.get('anchor_market_guard_enabled', True))
+    if not mg_enabled:
+        return best
+    try:
+        if 'p_place_mkt' not in d.columns:
+            return best
+        d2 = d.copy()
+        d2['_pmkt'] = _num_series(d2['p_place_mkt'], np.nan, index=d2.index)
+        valid_mkt = d2.dropna(subset=['_pmkt'])
+        if len(valid_mkt) < 2:
+            return best
+
+        min_gap    = float(wr.get('anchor_market_guard_min_gap_pct', 5.0) or 5.0)
+        band_top_n = int(wr.get('anchor_market_guard_top_band_n', 3) or 3)
+
+        mkt_sorted = valid_mkt.sort_values('_pmkt', ascending=False)
+        mkt_best   = mkt_sorted.iloc[0].to_dict()
+        mkt_best_n = str(mkt_best.get('num', ''))
+        model_best_n = str(best.get('num', ''))
+
+        if mkt_best_n == model_best_n:
+            return best
+
+        mkt_band_nums = set(mkt_sorted.head(band_top_n)['num'].astype(str).tolist())
+        if model_best_n in mkt_band_nums:
+            return best
+
+        mb = float(_num_series(best.get('p_place_low_pct', np.nan)))
+        bb = float(_num_series(mkt_best.get('p_place_low_pct', np.nan)))
+        if np.isfinite(mb) and np.isfinite(bb) and (mb - bb) >= min_gap:
+            mkt_best.pop('_p_place_mkt', None)
+            return mkt_best
+    except Exception:
+        pass
+    return best
+
+def _anchor_resolve_box_candidates(
+    d: "pd.DataFrame",
+    best: dict,
+    params: dict,
+) -> "list[dict]":
+    """R26: AnchorScore 上位馬が gap 以内なら BOX 候補リストを返す。
+
+    Returns:
+        候補馬の dict リスト。単一軸の場合は [best] のみ。
+        'anchor_mode' キーを 'BOX' または 'SINGLE' で記録する。
+    """
+    wr = params.get('wide_rules', {})
+    if not bool(wr.get('anchor_box_enabled', True)):
+        best['anchor_mode'] = 'SINGLE'
+        return [best]
+    gap_thr   = float(wr.get('anchor_box_gap_threshold', 5.0))
+    max_count = int(wr.get('anchor_box_max_count', 3))
+    best_score = float(best.get('AnchorScore', 0.0))
+    try:
+        cands = d[_num_series(d['AnchorScore'], 0.0, index=d.index) >= best_score - gap_thr]
+        cands = cands.sort_values('AnchorScore', ascending=False).head(max_count)
+        result = [row.to_dict() for _, row in cands.iterrows()]
+    except Exception:
+        result = [best]
+    # ===== IMPROVE-②C: 調教◎馬の強制BOX昇格 (v1.33) =====
+    try:
+        if bool(params.get('anchor_training_ex_enabled', True)):
+            _rank_max = int(params.get('anchor_training_ex_rank_max', 5))
+            # AnchorScore上位N位のDataFrame
+            _top_df = d.sort_values('AnchorScore', ascending=False).head(_rank_max)
+            _ex_nums = set(str(r.get('num','')) for r in result)
+            for _, _tr in _top_df.iterrows():
+                _tr_dict = _tr.to_dict()
+                _num_str = str(_tr_dict.get('num',''))
+                # 調教ファクターが◎の馬（factor_training列が存在する場合）
+                _train_factor = str(_tr_dict.get('factor_training', '') or '').strip()
+                if _train_factor == '◎' and _num_str not in _ex_nums:
+                    _tr_dict['anchor_mode'] = 'BOX'
+                    result.append(_tr_dict)
+                    _ex_nums.add(_num_str)
+            if len(result) > max_count:
+                result = sorted(result, key=lambda x: float(x.get('AnchorScore', 0)), reverse=True)[:max_count+1]
+    except Exception:
+        pass
+
+    mode = 'BOX' if len(result) >= 2 else 'SINGLE'
+    for r in result:
+        r['anchor_mode'] = mode
+    return result
+
+
+def select_anchor(df: pd.DataFrame, params: Optional[dict] = None) -> Dict[str, str]:
+    """◎（アンカー）を選ぶ（絶対厳守・ただし市場ガード付き）。
+
+    基本:
+      - ◎は複勝的中率（p_place_est_pct）最高の馬を採用。
+      - 同率: AnchorScore → 馬番 タイブレーク。
+
+    改善(v10.12): 市場ガード / v10.13: フロントリスクガード
+    R26: 軸馬 BOX 自動切り替え（anchor_box_enabled=Trueの時に anchor_mode='BOX'を記録）。
+
+    サブ関数 (_anchor_*) に各ガードロジックを委譲するオーケストレータ。
+    """
+    params = params or {}
+    if df is None or len(df) == 0:
+        return {}
+
+    # Step 1: ソート & 初期 best
+    d, best = _anchor_prepare_df(df, params)
+    if not best:
+        return {}
+
+    # Step 2: コメントリスクペナルティ
+    best = _anchor_apply_risk_guard(d, best, params)
+
+    # Step 3: フロント型リスクガード（スプリント戦）
+    best = _anchor_front_risk_guard(d, best, params)
+
+    # Step 4: 市場ガード
+    best = _anchor_market_guard(d, best, params)
+
+    # Step 5: R26 BOX 候補解決（best に anchor_mode + box_candidates を付与）
+    box_cands = _anchor_resolve_box_candidates(d, best, params)
+    best['anchor_mode']       = box_cands[0].get('anchor_mode', 'SINGLE')
+    best['anchor_box_nums']   = ','.join(str(c.get('num','')) for c in box_cands)
+    best['anchor_box_count']  = len(box_cands)
+
+    return best
+
+
+def select_place_anchor_bestp(df: pd.DataFrame, place_rule: Optional[dict] = None) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """複勝◎（place）を「ルールにのっとり複勝率が最も高い馬」で選ぶ（絶対厳守）。
+    ルール: min_p_place_est / min_place_market_min（市場が取れている場合のみ適用）
+    戻り: (horse_dict, info_dict) info.status=PASS/FAIL, reason付き"""
+    place_rule = place_rule or {}
+    min_p_place = float(place_rule.get('min_p_place_est', 0.26) or 0.26)
+    min_place_market = 0.0  # PURE_DATA: market gate removed
+    if df is None or len(df) == 0 or ('p_place_est_pct' not in df.columns):
+        return {}, {'status':'FAIL','reason':'no_p_place_est_pct'}
+    d = df.copy()
+    d['p_place_est_pct'] = _num_series(d.get('p_place_est_pct', np.nan), index=d.index)
+    try:
+        d['p_place_est_pct'] = d['p_place_est_pct'].clip(lower=0.0, upper=100.0)
+    except Exception:
+        pass
+    m = d['p_place_est_pct'].notna() & np.isfinite(d['p_place_est_pct']) & (d['p_place_est_pct'] >= (min_p_place * 100.0))
+    if 'place_market_min' in d.columns:
+        pom = _num_series(d.get('place_market_min', np.nan), index=d.index)
+        # market が取れている馬だけ下限を適用（欠損は許容）
+        m = m & (pom.isna() | (pom >= min_place_market))
+    eligible = d.loc[m].copy()
+    if len(eligible) == 0:
+        return {}, {'status':'FAIL','reason':'no_place_candidate_meets_rules'}
+    eligible = eligible.sort_values(['p_place_est_pct'], ascending=False).reset_index(drop=True)
+    best = eligible.iloc[0].to_dict()
+    return best, {'status':'PASS','reason':'best_p_place_est_pct_among_eligible'}
+
+def _pl_strength_from_score(df: pd.DataFrame, score_col: str = 'SAS', tau: float = 12.0, w_model: float = 0.70, gamma_mkt: float = 0.60) -> np.ndarray:
+    """PL用の強さ(strength)を作る。
+
+    - model側: score_col（SAS/AnchorScore 等）を中心に指数化
+    - market側: (任意) p_win_mkt があればそれも弱く混ぜる
+
+    ブレンドは log ドメイン（幾何平均）にして安定化。
+    """
+    if score_col not in df.columns:
+        score_col = 'SAS' if 'SAS' in df.columns else score_col
+
+    sc = _num_series(df.get(score_col), np.nan, index=df.index)
+    sc = _num_series(sc, float(sc.mean()) if sc.notna().sum() else 50.0, index=df.index)
+    x = (sc.astype(float) - float(sc.mean())) / float(tau)
+    s_model = np.exp(x.values)
+    s_model = np.where(np.isfinite(s_model) & (s_model > 0), s_model, 1e-9)
+
+    # market signal
+    if 'p_win_mkt' in df.columns:
+        pm = _num_series(df['p_win_mkt'], 0.0, index=df.index).values
+        pm = np.clip(pm, 1e-9, 1.0)
+        # emphasize a bit (gamma)
+        s_mkt = pm ** float(gamma_mkt)
+    else:
+        s_mkt = np.ones_like(s_model)
+
+    w = clamp(float(w_model), 0.0, 1.0)
+    s = (s_model ** w) * (s_mkt ** (1.0 - w))
+    s = np.where(np.isfinite(s) & (s > 0), s, 1e-9)
+    return s.astype(float)
+
+
+def _pl_strength_from_sas(df: pd.DataFrame, tau: float = 12.0, w_model: float = 0.70, gamma_mkt: float = 0.60) -> np.ndarray:
+    """Backward compatibility wrapper (legacy)."""
+    return _pl_strength_from_score(df, score_col='SAS', tau=tau, w_model=w_model, gamma_mkt=gamma_mkt)
+
+
+def _pl_sample_top3_indices(strength: np.ndarray, n_samples: int = 15000, seed: int = 0, chunk_size: int = 4000) -> np.ndarray:
+    """PL(Plackett-Luce)で上位3頭をサンプル（省メモリ版）。
+
+    旧実装は gumbel 行列 (n_samples, n_horses) を一括生成していたため、
+    スクショ運用でサンプル数を上げるとメモリが跳ねる。
+    ここでは chunk に分けて生成し、ピークメモリを抑える。
+
+    手法: Gumbel-top-k trick: key = log(w) + Gumbel(0,1)
+    """
+    rng = np.random.default_rng(seed)
+    w = np.asarray(strength, dtype=float)
+    w = np.where(np.isfinite(w) & (w > 0), w, 1e-12)
+    logw = np.log(w)
+
+    n = int(n_samples)
+    cs = int(chunk_size) if int(chunk_size) > 0 else n
+    out = []
+    done = 0
+    while done < n:
+        m = min(cs, n - done)
+        g = rng.gumbel(loc=0.0, scale=1.0, size=(int(m), int(len(w))))
+        keys = logw[None, :] + g
+        top3 = np.argpartition(keys, -3, axis=1)[:, -3:]
+        out.append(top3)
+        done += m
+    return np.vstack(out) if out else np.zeros((0,3), dtype=int)
+
+
+# ===============================
+# Shared PL sampling (SPEED_OPT_V1)
+# - Sample top3 once and reuse for wide/trio calculations.
+# - PURE_DATA: no market signal required.
+# ===============================
+
+def _sample_top3_shared_for_wide_and_trio(
+    df: pd.DataFrame,
+    n_total: int,
+    seed: int,
+    params: Optional[dict] = None,
+    chunk_size: int = 4000,
+) -> np.ndarray:
+    """Sample top3 (Plackett-Luce) once for the whole race.
+
+    Returns: (n_total, 3) int array of indices.
+    """
+    params = params or DEFAULT_PARAMS
+    score_col = str(params.get('pl_strength_score_col', params.get('anchor_score_col', 'SAS')))
+    strength = _pl_strength_from_score(
+        df,
+        score_col=score_col,
+        w_model=float(params.get('w_pl_strength_model', 0.70)),
+        gamma_mkt=float(params.get('gamma_pl_mkt', 0.60)),
+    )
+    return _pl_sample_top3_indices(
+        strength,
+        n_samples=int(max(0, n_total)),
+        seed=int(seed),
+        chunk_size=int(chunk_size),
+    )
+
+
+def compute_p_wide_vs_anchor(df: pd.DataFrame, anchor_num: str, n_samples: int = 15000, seed: int = 0, params: Optional[dict] = None) -> pd.Series:
+    """アンカー馬に対するワイド同時入着確率（PLモンテカルロ由来・近似）。
+
+    - _pl_sample_top3_indices() で「上位3頭（=複勝圏）」を n_samples 回サンプル
+    - anchor が上位3に入った回において、同時に入った馬をカウント → ワイド同時入着確率(%)
+
+    注意: 既存実装はグローバル params を参照していたため、v1.1+ では
+          params を明示引数化して安全にした。
+    """
+    params = params or DEFAULT_PARAMS
+    score_col = str(params.get('pl_strength_score_col', params.get('anchor_score_col', 'SAS')))
+    strength = _pl_strength_from_score(
+        df,
+        score_col=score_col,
+        w_model=float(params.get('w_pl_strength_model',0.70)),
+        gamma_mkt=float(params.get('gamma_pl_mkt',0.60)),
+    )
+    top3 = _pl_sample_top3_indices(strength, n_samples=n_samples, seed=seed)
+
+    nums = df['num'].astype(str).tolist()
+    if str(anchor_num) not in nums:
+        raise ValueError('anchor_num not found')
+    a = nums.index(str(anchor_num))
+
+    anchor_in = (top3 == a).any(axis=1)
+    sel = top3[anchor_in]
+    if sel.size == 0:
+        p = np.full((len(nums),), 0.0, dtype=float)
+    else:
+        cnt = np.bincount(sel.reshape(-1).astype(int), minlength=len(nums)).astype(float)
+        p = cnt / float(n_samples) * 100.0
+    p[a] = np.nan
+    return pd.Series(p.astype(float), index=df.index, name='p_wide_est_pct')
+
+
+
+def compute_p_wide_vs_anchor_runs(
+    df: pd.DataFrame,
+    anchor_num: str,
+    n_runs: int = 7,
+    n_samples: int = 15000,
+    seed0: int = 101,
+    q_low: float = 0.05,
+    params: Optional[dict] = None,
+) -> tuple[pd.Series, pd.Series]:
+    """ワイド同時入着確率(%)を複数runで推定し、平均と下側分位(=下限)を返す。
+
+    SPEED_OPT_V1:
+      - strength計算を1回、top3サンプル生成も1回（n_runs*n_samples）にまとめる
+      - 総サンプル数は維持できるため、精度は落とさない（むしろ安定化）
+    """
+    params = params or DEFAULT_PARAMS
+    n_runs = int(max(1, n_runs))
+    n_samples = int(max(1, n_samples))
+
+    n_total = int(n_runs * n_samples)
+    top3_all = _sample_top3_shared_for_wide_and_trio(df, n_total=n_total, seed=int(seed0), params=params)
+
+    mats = []
+    for i in range(n_runs):
+        blk = top3_all[i*n_samples:(i+1)*n_samples]
+        p_i = compute_p_wide_from_top3(df, anchor_num=str(anchor_num), top3=blk)
+        mats.append(_num_series(p_i, index=getattr(p_i, 'index', None)).astype(float).values)
+
+    M = np.vstack(mats).T if mats else np.zeros((len(df), 0), dtype=float)
+    p_mean = np.nanmean(M, axis=1) if M.shape[1] else np.zeros((len(df),), dtype=float)
+
+    try:
+        q = float(q_low)
+        q = 0.0 if q < 0 else (1.0 if q > 1 else q)
+    except Exception:
+        q = 0.05
+    p_low = np.nanquantile(M, q, axis=1) if M.shape[1] else np.zeros((len(df),), dtype=float)
+
+    p_mean_s = pd.Series(p_mean, index=df.index, name='p_wide_est_pct')
+    p_low_s = pd.Series(p_low, index=df.index, name='p_wide_low_pct')
+    return p_mean_s.astype(float), p_low_s.astype(float)
+
+
+# ------------------------------
+# 三連複（推定市場ZONE）サポート
+
+
+
+
+# ===============================
+# TRAPFILTER_EXTRAS_V1
+# - Apply a light 'trap score' filter ONLY to trio-formation extras.
+# - Does NOT change ◎ selection or wide opponent selection.
+# - Soft filter: if it over-filters, fallback keeps formation feasible.
+# ===============================
+
+def _to_float(x, default=float('nan')) -> float:
+    """任意の値を float に変換する。変換失敗時は default（デフォルト nan）を返す。"""
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _compute_trap_score_row(row: dict) -> float:
+    # Returns: (trap_score: float, trap_reasons: str)
+    """    1 頭分の行データ row から罠スコア（float）と理由タグ文字列を計算する。
+
+    Returns:
+        tuple[float, str]: (trap_score, trap_reasons)
+
+    """
+    score = 0.0
+    reasons = []
+
+    # (A) outer draw + FRONT
+    waku = row.get('枠', row.get('frame', row.get('waku', None)))
+    z4 = str(row.get('zone_4c', '') or '').upper().strip()
+    fw = _to_float(waku)
+    if fw == fw and fw >= 14 and (z4.startswith('FRONT') or z4 == 'FRONT'):
+        score += 30.0
+        reasons.append('外枠+前(+30)')
+
+    # (B) weight delta <= -10kg
+    dw = row.get('delta', row.get('delta_weight', row.get('weight_delta', None)))
+    fd = _to_float(dw)
+    if fd == fd and fd <= -10.0:
+        score += 25.0
+        reasons.append('馬体重急減<=-10(+25)')
+
+    return float(score), ' / '.join(reasons)
+
+
+def _add_trap_score_columns(dfin: pd.DataFrame) -> pd.DataFrame:
+    """trap_score (float) と trap_reasons (str) 列を追加して返す。"""
+    try:
+        d = dfin.copy()
+        sc = []
+        rs = []
+        for _, r in d.iterrows():
+            s0, r0 = _compute_trap_score_row(r.to_dict())
+            sc.append(s0)
+            rs.append(r0)
+        d['trap_score'] = sc
+        d['trap_reasons'] = rs
+        return d
+    except Exception:
+        d = dfin.copy()
+        if 'trap_score' not in d.columns:
+            d['trap_score'] = 0.0
+        if 'trap_reasons' not in d.columns:
+            d['trap_reasons'] = ''
+        return d
+def _trio_dedup(nums: list, anchor: str) -> list:
+    """重複・アンカー馬を除いた馬番リストを返す。"""
+    out: list = []
+    for x in nums or []:
+        xs = str(x)
+        if xs and xs != anchor and xs not in out:
+            out.append(xs)
+    return out
+
+
+def _trio_points(b_list: list, c_list: list) -> int:
+    """三連複フォーメーションの点数を計算する。"""
+    k = len(b_list)
+    n = len(c_list)
+    return int(k * (n - 1) - (k * (k - 1) // 2)) if (k > 0 and n > 0) else 0
+
+
+def _trio_cap_points(b_list: list, c_list: list, max_points: int) -> tuple[list, int]:
+    """c_list を max_points 以内に縮めて返す。"""
+    c = list(c_list)
+    pts = _trio_points(b_list, c)
+    while pts > max_points and len(c) > len(b_list):
+        c.pop()
+        pts = _trio_points(b_list, c)
+    return c, int(pts)
+
+
+def _trio_build_mode(
+    style: str,
+    d: 'pd.DataFrame',
+    anchor: str,
+    max_points: int,
+    extra_max: int,
+    target_c: int,
+    preferred_b: 'list | None' = None,
+) -> dict:
+    """指定スタイル（position / closing）でフォーメーションを組む。"""
+    score_col = '_closing_main' if style == 'closing' else '_position_main'
+    b = _trio_dedup(preferred_b, anchor)[:4] if preferred_b else []
+    order = (
+        d.sort_values([score_col, 'p_place_est_pct', 'trap_score', 'num'], ascending=[False, False, True, True])
+        ['num'].astype(str).tolist()
+    )
+    for x in order:
+        if len(b) >= 4:
+            break
+        if x not in b:
+            b.append(x)
+    b = _trio_dedup(b, anchor)[:4]
+    rest = d[~d['num'].isin(set(b))].copy()
+    rest = rest.sort_values(
+        [score_col, 'p_place_est_pct', 'PopularityPositionLapScore', 'trap_score', 'num'],
+        ascending=[False, False, False, True, True],
+    )
+    extras = [str(x) for x in rest['num'].astype(str).tolist() if str(x)]
+    extras = extras[:max(0, int(extra_max))]
+    c = list(b)
+    for x in extras:
+        if len(c) >= target_c:
+            break
+        if x not in c and x != anchor:
+            c.append(x)
+    c, pts = _trio_cap_points(b, c, max_points)
+    return {'b': b, 'c': c, 'points': int(pts)}
+
+
+def build_trio_formation_from_wide(anchor_num: str, wide_opp_nums: list[str], df: pd.DataFrame, params: Optional[dict] = None) -> dict:
+    """三連複フォーメーションを作る。
+
+    改良点:
+      - H判定を盲信せず、pace_eval_modeに応じて「差し型 / 好位再加速型」を併記
+      - 好位×再加速×調教/コメント/距離裏付けが強い馬を2列目へ昇格可能
+      - 人気 proxy × 位置 × ラップ適性を2列目/3列目の優先度に反映
+    """
+    params = params or DEFAULT_PARAMS
+    wr = (params.get('wide_rules', {}) or {})
+    meta = (params.get('_meta', {}) or {})
+    max_points = int(wr.get('trio_formation_max_points', 30) or 30)
+    extra_max = int(wr.get('trio_formation_extra_max', 18) or 18)
+    target_c = 10
+    a = str(anchor_num)
+
+    if df is None or len(df) == 0:
+        return {'a': a, 'b': [], 'c': [], 'points': 0, 'mode': 'position'}
+
+    d = df.copy()
+    d['num'] = d['num'].astype(str)
+    d = _add_trap_score_columns(d)
+    d = d[d['num'] != a].copy()
+    if len(d) == 0:
+        return {'a': a, 'b': [], 'c': [], 'points': 0, 'mode': 'position'}
+
+    # numeric safety
+    for col, default in [
+        ('p_place_est_pct', 0.0),
+        ('PositionReAccelScore', 50.0),
+        ('GoodPositionSecondColumnScore', 50.0),
+        ('PopularityPositionLapScore', 50.0),
+        ('CloseScenarioScore', 50.0),
+        ('JockeyDistanceEvidenceScore', 50.0),
+        ('TrainingScore', 50.0),
+        ('CommentTrend', 50.0),
+        ('AnchorScore', 50.0),
+        ('CourseProfileFit', 50.0),
+        ('CourseStraightFit', 50.0),
+        ('CourseCornerFit', 50.0),
+        ('CourseStaminaFit', 50.0),
+    ]:
+        base_col = d[col] if col in d.columns else pd.Series([default] * len(d), index=d.index)
+        d[col] = _num_series(base_col, default, index=d.index)
+
+    if 'trap_score' not in d.columns:
+        d['trap_score'] = 0.0
+    d['trap_score'] = _num_series(d.get('trap_score', 0.0), 0.0, index=d.index)
+    d['_support_signal'] = (
+        (d['TrainingScore'] >= 58.0) | (d['CommentTrend'] >= 56.0) | (d['JockeyDistanceEvidenceScore'] >= 60.0) | (d['CourseProfileFit'] >= 60.0)
+    ).astype(float)
+    d['_position_main'] = (
+        0.40 * d['GoodPositionSecondColumnScore']
+        + 0.24 * d['PositionReAccelScore']
+        + 0.16 * d['PopularityPositionLapScore']
+        + 0.10 * d['AnchorScore']
+        + 0.06 * d['CourseProfileFit']
+        + 0.04 * d['CourseCornerFit']
+        + d['_support_signal'] * 2.4
+        - 0.05 * d['trap_score']
+    ).astype(float)
+    d['_closing_main'] = (
+        0.42 * d['CloseScenarioScore']
+        + 0.20 * d['PopularityPositionLapScore']
+        + 0.16 * d['AnchorScore']
+        + 0.10 * d['p_place_est_pct']
+        + 0.08 * d['CourseProfileFit']
+        + 0.04 * d['CourseStraightFit']
+        + 0.04 * d['CourseStaminaFit']
+        - 0.05 * d['trap_score']
+    ).astype(float)
+
+    pace_mode = str((meta or {}).get('pace_eval_mode', '') or '').strip().lower()
+    mode = 'closing' if pace_mode in {'high', 'high-mid'} else 'position'
+
+    base_b = _trio_dedup(wide_opp_nums, a)[:4]
+    if len(base_b) < 4:
+        fill_order = (
+            d.sort_values(['_position_main', 'p_place_est_pct', 'num'], ascending=[False, False, True])
+            ['num'].astype(str).tolist()
+        )
+        for x in fill_order:
+            if len(base_b) >= 4:
+                break
+            if x not in base_b:
+                base_b.append(x)
+
+    promoted = []
+    if len(base_b) >= 1:
+        work_b = list(base_b)
+        for _ in range(2):
+            bdf = d[d['num'].isin(work_b)].copy()
+            cand = d[(~d['num'].isin(work_b)) & (d['_support_signal'] > 0)].copy()
+            if len(bdf) == 0 or len(cand) == 0:
+                break
+            weak = bdf.sort_values(['_position_main', 'PopularityPositionLapScore', 'num'], ascending=[True, True, False]).head(1)
+            strong = cand.sort_values(['_position_main', 'GoodPositionSecondColumnScore', 'PopularityPositionLapScore', 'JockeyDistanceEvidenceScore', 'num'], ascending=[False, False, False, False, True]).head(1)
+            if len(weak) == 0 or len(strong) == 0:
+                break
+            weak_num = str(weak.iloc[0]['num'])
+            strong_num = str(strong.iloc[0]['num'])
+            weak_sc = float(weak.iloc[0]['_position_main'])
+            strong_sc = float(strong.iloc[0]['_position_main'])
+            if strong_sc >= weak_sc + (0.4 if float(strong.iloc[0].get('_support_signal', 0.0) or 0.0) > 0 else 0.8):
+                work_b = [x for x in work_b if x != weak_num]
+                work_b.append(strong_num)
+                work_b = _trio_dedup(work_b, a)[:4]
+                promoted.append(strong_num)
+        base_b = work_b
+
+    _bm = dict(max_points=max_points, extra_max=extra_max, target_c=target_c)
+    default_form  = _trio_build_mode(mode,      d, a, **_bm, preferred_b=base_b)
+    closing_form  = _trio_build_mode('closing',  d, a, **_bm)
+    position_form = _trio_build_mode('position', d, a, **_bm, preferred_b=base_b if mode == 'position' else None)
+
+    return {
+        'a': a,
+        'b': list(default_form.get('b', []) or []),
+        'c': list(default_form.get('c', []) or []),
+        'points': int(default_form.get('points', 0) or 0),
+        'mode': mode,
+        'closing_form': closing_form,
+        'position_form': position_form,
+        'promoted_second_column_nums': promoted[:4],
+    }
+
+def _wilson_interval(k: int, n: int, z: float = 1.281551565545) -> tuple[float, float]:
+    """Wilson score interval for binomial proportion.
+
+    z default ≈ 1.2816 => ~80% CI (ZONE用途の幅として扱いやすい)
+    """
+    if n <= 0:
+        return (0.0, 1.0)
+    phat = k / float(n)
+    denom = 1.0 + (z * z) / float(n)
+    center = (phat + (z * z) / (2.0 * n)) / denom
+    half = (z / denom) * ((phat * (1.0 - phat) / n + (z * z) / (4.0 * n * n)) ** 0.5)
+    lo = max(0.0, center - half)
+    hi = min(1.0, center + half)
+    return (lo, hi)
+
+
+def _sample_top3(df: pd.DataFrame, n_samples: int = 15000, seed: int = 0, params: Optional[dict] = None) -> np.ndarray:
+    """PLモンテカルロ: 上位3頭インデックスを n_samples 回サンプルして返す。"""
+    params = params or DEFAULT_PARAMS
+    score_col = str(params.get('pl_strength_score_col', params.get('anchor_score_col', 'SAS')))
+    strength = _pl_strength_from_score(
+        df,
+        score_col=score_col,
+        w_model=float(params.get('w_pl_strength_model', 0.70)),
+        gamma_mkt=(0.0 if not bool(params.get('market_features_enabled', False)) else float(params.get('gamma_pl_mkt', 0.60))),  # PL_STRENGTH_MARKET_OFF_V2
+    )
+    return _pl_sample_top3_indices(strength, n_samples=n_samples, seed=seed)
+
+
+def compute_p_wide_from_top3(df: pd.DataFrame, anchor_num: str, top3: np.ndarray) -> pd.Series:
+    """top3サンプルからワイド同時入着確率(%)を計算（compute_p_wide_vs_anchor と同等）。"""
+    nums = df['num'].astype(str).tolist()
+    if str(anchor_num) not in nums:
+        raise ValueError('anchor_num not found')
+    a = nums.index(str(anchor_num))
+
+    n_samples = int(top3.shape[0])
+    anchor_in = (top3 == a).any(axis=1)
+    sel = top3[anchor_in]
+    if sel.size == 0:
+        p = np.full((len(nums),), 0.0, dtype=float)
+    else:
+        cnt = np.bincount(sel.reshape(-1).astype(int), minlength=len(nums)).astype(float)
+        p = cnt / float(n_samples) * 100.0
+    p[a] = np.nan
+    return pd.Series(p.astype(float), index=df.index, name='p_wide_est_pct')
+
+
+def _calibrate_k_from_wide(
+    df: pd.DataFrame,
+    anchor_num: str,
+    p_wide_uncond_pct: pd.Series,
+    wide_market_df: Optional[pd.DataFrame],
+    default_k: float = 1.0,
+) -> float:
+    """ワイド実市場(mid) × 予測確率 から market≈K/p の K を推定（アンカー絡み）。
+
+    - p_wide_uncond = P(anchor & opp が複勝圏) の近似（%）
+    - wide_market_mid は wide_market_df から取得
+
+    K は相場感のキャリブレーション用（median）。
+    """
+    if wide_market_df is None or len(wide_market_df) == 0:
+        return float(default_k)
+
+    # opponent -> market_mid
+    det = _wide_market_detail_map_for_anchor(wide_market_df, anchor_num=str(anchor_num))
+    if not det:
+        return float(default_k)
+
+    vals = []
+    for idx, r in df.iterrows():
+        opp = str(r.get('num'))
+        if opp == str(anchor_num):
+            continue
+        if opp not in det:
+            continue
+        market_mid = det[opp].get('wide_market_mid', np.nan)
+        if market_mid is None or (not np.isfinite(float(market_mid))) or float(market_mid) <= 0:
+            continue
+        pw = p_wide_uncond_pct.loc[idx]
+        if pw is None or (not np.isfinite(float(pw))) or float(pw) <= 0:
+            continue
+        p = float(pw) / 100.0
+        vals.append(float(market_mid) * p)
+
+    if not vals:
+        return float(default_k)
+
+    k = float(np.median(vals))
+    if not np.isfinite(k) or k <= 0:
+        return float(default_k)
+    return k
+
+
+# ---------------------------------------------------------------------------
+# R24: compute_trio_topmass_for_anchor を4サブ関数に分割 (131行 → 各 20〜30行)
+# ---------------------------------------------------------------------------
+
+_EMPTY_TRIO_DF = pd.DataFrame(
+    columns=['trio', 'p_cond_pct', 'p_uncond_pct', 'market_est', 'market_zone']
+)
+
+
+def _trio_filter_anchor_rows(
+    top3: np.ndarray,
+    anchor_idx: int,
+) -> "tuple[np.ndarray, int]":
+    """R24: top3 配列から anchor が含まれる行を抽出し、others ペアを返す。
+
+    Returns:
+        (others, anchor_hits): others は shape (anchor_hits, 2) で i<j に整列済み。
+        anchor_hits == 0 の場合は others が空配列。
+    """
+    anchor_mask = (top3 == int(anchor_idx)).any(axis=1)
+    sel = top3[anchor_mask]
+    anchor_hits = int(sel.shape[0])
+    if anchor_hits <= 0:
+        return np.empty((0, 2), dtype=int), 0
+    others = sel[sel != int(anchor_idx)].reshape(-1, 2)
+    others = np.sort(others, axis=1)
+    return others, anchor_hits
+
+
+def _trio_count_and_sort(
+    others: np.ndarray,
+    anchor_hits: int,
+    n_samples: int,
+    top_mass: float,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]":
+    """R24: others ペアを集計・確率計算・降順ソート・cumsum カットして返す。
+
+    Returns:
+        (uniq, cnt, p_cond, p_uncond): カット済み配列。
+        uniq が空なら全て空配列。
+    """
+    uniq, cnt = np.unique(others, axis=0, return_counts=True)
+    if uniq.size == 0:
+        empty = np.array([], dtype=float)
+        return np.empty((0, 2), dtype=int), empty, empty, empty
+    p_cond   = cnt.astype(float) / float(anchor_hits)
+    p_uncond = cnt.astype(float) / float(n_samples)
+    order    = np.argsort(-p_cond)
+    uniq, cnt, p_cond, p_uncond = (
+        uniq[order], cnt[order], p_cond[order], p_uncond[order]
+    )
+    cum = np.cumsum(p_cond)
+    cut = int(np.searchsorted(cum, float(top_mass), side='left') + 1)
+    cut = max(1, min(cut, len(uniq)))
+    return uniq[:cut], cnt[:cut], p_cond[:cut], p_uncond[:cut]
+
+
+def _trio_market_estimate(
+    p_uncond: np.ndarray,
+    cnt: np.ndarray,
+    n_samples: int,
+    k_scale: float,
+    z_ci: float,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
+    """R24: 無条件確率から市場倍率中央値・Wilson 区間 (lo, hi) を計算して返す。
+
+    Returns:
+        (market_mid, market_lo, market_hi): 各 shape == p_uncond.shape
+    """
+    market_mid = np.full_like(p_uncond, np.nan, dtype=float)
+    market_lo  = np.full_like(p_uncond, np.nan, dtype=float)
+    market_hi  = np.full_like(p_uncond, np.nan, dtype=float)
+    pos = p_uncond > 0
+    if not np.any(pos):
+        return market_mid, market_lo, market_hi
+    market_mid[pos] = float(k_scale) / p_uncond[pos]
+    k     = cnt.astype(float)
+    n     = float(n_samples)
+    z     = float(z_ci)
+    phat  = k / n
+    denom = 1.0 + (z * z) / n
+    center = (phat + (z * z) / (2.0 * n)) / denom
+    half   = (z / denom) * np.sqrt(phat * (1.0 - phat) / n + (z * z) / (4.0 * n * n))
+    lo_p   = np.clip(center - half, 0.0, 1.0)
+    hi_p   = np.clip(center + half, 0.0, 1.0)
+    market_lo[hi_p > 0] = float(k_scale) / hi_p[hi_p > 0]
+    market_hi[lo_p > 0] = float(k_scale) / lo_p[lo_p > 0]
+    return market_mid, market_lo, market_hi
+
+
+def _trio_format_rows(
+    uniq: np.ndarray,
+    cnt: np.ndarray,
+    p_cond: np.ndarray,
+    p_uncond: np.ndarray,
+    market_mid: np.ndarray,
+    market_lo: np.ndarray,
+    market_hi: np.ndarray,
+    nums: list,
+    names: list,
+    anchor_num: str,
+) -> list:
+    """R25: 集計配列を行辞書のリストに変換する。_trio_build_output から分離。"""
+    rows = []
+    for (i, j), c, pc, pu, om, olo, ohi in zip(
+        uniq.tolist(), cnt.tolist(),
+        p_cond.tolist(), p_uncond.tolist(),
+        market_mid.tolist(), market_lo.tolist(), market_hi.tolist(),
+    ):
+        n1    = nums[int(i)]
+        n2    = nums[int(j)]
+        name1 = names[int(i)] if 0 <= int(i) < len(names) else ''
+        name2 = names[int(j)] if 0 <= int(j) < len(names) else ''
+        rows.append({
+            'trio':         f"{anchor_num}-{n1}-{n2}",
+            'p_cond':       float(pc),
+            'p_uncond':     float(pu),
+            'p_cond_pct':   float(pc) * 100.0,
+            'p_uncond_pct': float(pu) * 100.0,
+            'market_est':   float(om),
+            'market_lo':    float(olo),
+            'market_hi':    float(ohi),
+            'market_zone':  (f"{olo:.1f}\u2013{ohi:.1f}"
+                             if np.isfinite(olo) and np.isfinite(ohi) else ''),
+            'horse1':  f"{n1}.{name1}",
+            'horse2':  f"{n2}.{name2}",
+            'count':   int(c),
+        })
+    return rows
+
+
+def _trio_build_output(
+    rows: list,
+    k_scale: float,
+    anchor_hits: int,
+    n_samples: int,
+    top_mass: float,
+) -> pd.DataFrame:
+    """R25: 行リストを DataFrame 化し attrs を付与して返す。"""
+    out = pd.DataFrame(rows)
+    if len(out):
+        out['cum_cond_pct'] = out['p_cond'].cumsum() * 100.0
+    out.attrs.update({
+        'k_scale':     float(k_scale),
+        'anchor_hits': int(anchor_hits),
+        'n_samples':   int(n_samples),
+        'top_mass':    float(top_mass),
+    })
+    return out
+
+
+def _trio_validate_inputs(
+    df: pd.DataFrame,
+    anchor_num: str,
+    top3: np.ndarray,
+) -> "tuple | None":
+    """R25: 入力検証・前処理。
+
+    Returns:
+        (nums, anchor_idx, n_samples, top3_arr) 正常時。
+        None の場合は _EMPTY_TRIO_DF を返すべき。
+    Raises:
+        ValueError: anchor_num が df に存在しない場合。
+    """
+    nums = df['num'].astype(str).tolist()
+    if str(anchor_num) not in nums:
+        raise ValueError('anchor_num not found')
+    a = nums.index(str(anchor_num))
+    n_samples = int(getattr(top3, 'shape', [0])[0])
+    if n_samples <= 0:
+        return None
+    return nums, a, n_samples, np.asarray(top3, dtype=int)
+
+
+def _trio_calibrate_and_estimate(
+    df: pd.DataFrame,
+    anchor_num: str,
+    p_uncond: np.ndarray,
+    cnt: np.ndarray,
+    n_samples: int,
+    p_wide_uncond_pct: "Optional[pd.Series]",
+    wide_market_df: "Optional[pd.DataFrame]",
+    z_ci: float,
+) -> "tuple[float, np.ndarray, np.ndarray, np.ndarray]":
+    """R25: Kキャリブレーションと市場倍率推定をまとめて実行する。
+
+    Returns:
+        (k_scale, market_mid, market_lo, market_hi)
+    """
+    k_scale = 1.0
+    if p_wide_uncond_pct is not None:
+        k_scale = _calibrate_k_from_wide(
+            df, anchor_num=str(anchor_num),
+            p_wide_uncond_pct=p_wide_uncond_pct,
+            wide_market_df=wide_market_df, default_k=1.0,
+        )
+    market_mid, market_lo, market_hi = _trio_market_estimate(
+        p_uncond, cnt, n_samples, k_scale, z_ci
+    )
+    return k_scale, market_mid, market_lo, market_hi
+
+
+def compute_trio_topmass_for_anchor(
+    df: pd.DataFrame,
+    anchor_num: str,
+    top3: np.ndarray,
+    top_mass: float = 0.22,
+    wide_market_df: Optional[pd.DataFrame] = None,
+    p_wide_uncond_pct: Optional[pd.Series] = None,
+    z_ci: float = 1.281551565545,
+) -> pd.DataFrame:
+    """三連複（◎固定）推定。 R25: 7サブ関数に分割完了。"""
+    # Step 1: 入力検証
+    validated = _trio_validate_inputs(df, anchor_num, top3)
+    if validated is None:
+        return _EMPTY_TRIO_DF.copy()
+    nums, a, n_samples, top3 = validated
+    # Step 2: anchor 行抽出
+    others, anchor_hits = _trio_filter_anchor_rows(top3, a)
+    if anchor_hits <= 0:
+        return _EMPTY_TRIO_DF.copy()
+    # Step 3: 集計・確率計算・ソート・カット
+    uniq, cnt, p_cond, p_uncond = _trio_count_and_sort(others, anchor_hits, n_samples, top_mass)
+    if uniq.size == 0:
+        return _EMPTY_TRIO_DF.copy()
+    # Step 4: K校正 + 市場推定
+    k_scale, market_mid, market_lo, market_hi = _trio_calibrate_and_estimate(
+        df, anchor_num, p_uncond, cnt, n_samples,
+        p_wide_uncond_pct, wide_market_df, z_ci,
+    )
+    # Step 5-6: 行変換 → DataFrame
+    names = df.get('name', pd.Series([''] * len(df))).astype(str).tolist()
+    rows = _trio_format_rows(
+        uniq, cnt, p_cond, p_uncond,
+        market_mid, market_lo, market_hi, nums, names, anchor_num,
+    )
+    return _trio_build_output(rows, k_scale, anchor_hits, n_samples, top_mass)
+
+
+def compute_trio_topmass_global_then_filter_anchor(
+    df: pd.DataFrame,
+    anchor_num: str,
+    top3: np.ndarray,
+    top_mass: float = 0.22,
+    wide_market_df: Optional[pd.DataFrame] = None,
+    p_wide_uncond_pct: Optional[pd.Series] = None,
+    z_ci: float = 1.281551565545,
+) -> pd.DataFrame:
+    """三連複（推定）: まず全体 top_mass を作り、その中から◎絡みだけ抽出。
+
+    要望仕様:
+      - 全組み合わせの無条件確率 P(trio) を出し、累積上位 top_mass（例: 0.22）を先に確定
+      - その集合の中から「◎を含む三連複」だけを抽出して表示
+
+    注意:
+      - 推定市場は無条件確率 P(trio) を使って market≈K/p で算出（Kはワイドからキャリブレーション可能）
+      - p_cond は参考として P(trio | ◎が複勝圏) = P(trio)/P(◎が複勝圏) で付与
+    """
+    nums = df['num'].astype(str).tolist()
+    if str(anchor_num) not in nums:
+        raise ValueError('anchor_num not found')
+    a = nums.index(str(anchor_num))
+
+    n_samples = int(top3.shape[0])
+    if n_samples <= 0:
+        return pd.DataFrame(columns=['trio','p_uncond_pct','market_est','market_zone'])
+
+    anchor_in = (top3 == a).any(axis=1)
+    p_anchor = float(anchor_in.mean())
+
+    # unordered triple counts (global)
+    s = np.sort(top3.astype(int), axis=1)  # i<j<k
+    uniq, cnt = np.unique(s, axis=0, return_counts=True)
+
+    p_uncond = cnt / float(n_samples)
+
+    order = np.argsort(-p_uncond)
+    uniq = uniq[order]
+    cnt = cnt[order]
+    p_uncond = p_uncond[order]
+
+    cum = np.cumsum(p_uncond)
+    cut = int(np.searchsorted(cum, float(top_mass), side='left') + 1)
+    cut = max(1, min(cut, len(uniq)))
+
+    uniq_top = uniq[:cut]
+    cnt_top = cnt[:cut]
+    p_uncond_top = p_uncond[:cut]
+    cum_top = cum[:cut]
+
+    # filter to anchor-included
+    mask = (uniq_top == int(a)).any(axis=1)
+    uniq_top = uniq_top[mask]
+    cnt_top = cnt_top[mask]
+    p_uncond_top = p_uncond_top[mask]
+    cum_top = cum_top[mask]
+
+    if len(uniq_top) == 0:
+        out = pd.DataFrame(columns=['trio','p_uncond_pct','market_est','market_zone'])
+        out.attrs['k_scale'] = float('nan')
+        out.attrs['p_anchor'] = float(p_anchor)
+        out.attrs['n_samples'] = int(n_samples)
+        out.attrs['top_mass'] = float(top_mass)
+        out.attrs['top_set_size'] = int(cut)
+        out.attrs['anchor_in_top_count'] = 0
+        return out
+
+    # K calibration (optional)
+    k_scale = 1.0
+    if p_wide_uncond_pct is not None:
+        k_scale = _calibrate_k_from_wide(df, anchor_num=str(anchor_num), p_wide_uncond_pct=p_wide_uncond_pct, wide_market_df=wide_market_df, default_k=1.0)
+
+    rows = []
+    for tri, c, pu, cu in zip(uniq_top, cnt_top, p_uncond_top, cum_top):
+        tri = [int(x) for x in tri.tolist()]
+        tri_nums = [nums[i] for i in tri]
+        others = [x for x in tri_nums if x != str(anchor_num)]
+        if len(others) != 2:
+            continue
+        n1, n2 = others
+
+        # conditional probability (reference)
+        pcond = (float(pu) / float(p_anchor)) if p_anchor > 0 else float('nan')
+
+        market_mid = float('nan')
+        market_lo = float('nan')
+        market_hi = float('nan')
+        if pu > 0:
+            market_mid = k_scale / float(pu)
+            lo_p, hi_p = _wilson_interval(int(c), int(n_samples), z=float(z_ci))
+            if hi_p > 0:
+                market_lo = k_scale / hi_p
+            if lo_p > 0:
+                market_hi = k_scale / lo_p
+
+        name1 = str(df.loc[df['num'].astype(str) == str(n1), 'name'].iloc[0]) if (df['num'].astype(str) == str(n1)).any() else ''
+        name2 = str(df.loc[df['num'].astype(str) == str(n2), 'name'].iloc[0]) if (df['num'].astype(str) == str(n2)).any() else ''
+
+        rows.append({
+            'trio': f"{anchor_num}-{n1}-{n2}",
+            'horse1': f"{n1}.{name1}",
+            'horse2': f"{n2}.{name2}",
+            'p_uncond': float(pu),
+            'p_uncond_pct': float(pu * 100.0),
+            'p_cond': float(pcond),
+            'p_cond_pct': float(pcond * 100.0) if np.isfinite(pcond) else float('nan'),
+            'cum_global_pct': float(cu * 100.0),
+            'market_est': float(market_mid),
+            'market_lo': float(market_lo),
+            'market_hi': float(market_hi),
+            'market_zone': (f"{market_lo:.1f}–{market_hi:.1f}" if np.isfinite(market_lo) and np.isfinite(market_hi) else ''),
+            'count': int(c),
+        })
+
+    out = pd.DataFrame(rows)
+    out = out.sort_values(['p_uncond'], ascending=False).reset_index(drop=True)
+
+    out.attrs['k_scale'] = float(k_scale)
+    out.attrs['p_anchor'] = float(p_anchor)
+    out.attrs['n_samples'] = int(n_samples)
+    out.attrs['top_mass'] = float(top_mass)
+    out.attrs['top_set_size'] = int(cut)
+    out.attrs['anchor_in_top_count'] = int(len(out))
+    return out
+
+
+# [REMOVED] _wide_market_map_for_anchor: market/market helpers removed (not used)
+
+
+# [REMOVED] _wide_market_detail_map_for_anchor: market/market helpers removed (not used)
+
+
+def _wide_pair_key(anchor_num: str, opp_num: str) -> Tuple[str, str]:
+    """ワイドのキーは (min,max) 正規化で持つ。"""
+    try:
+        a = int(str(anchor_num))
+        b = int(str(opp_num))
+        return (str(min(a, b)), str(max(a, b)))
+    except Exception:
+        aa = str(anchor_num)
+        bb = str(opp_num)
+        return (aa, bb) if aa <= bb else (bb, aa)
+
+
+
+
+
+# =========================
+# v10.3) Pair model (p_pair) training/inference for WIDE
+# - LightGBM + Isotonic calibration (GroupKFold by race_id)
+# - produces p_pair and p_pair_low (quantile across calibrated fold models)
+# =========================
+
+@dataclass
+class PlaceModelBundle:
+    """複勝(1-3着)確率 p_show を推定するモデル一式。
+
+    - base_model: LightGBM classifier
+    - iso: IsotonicRegression calibrator fitted on OOF predictions
+    - feature_cols: 使用特徴量
+
+    重要: GroupKFold を使って OOF 予測を作り、その OOF で isotonic を学習することで
+    学習データ自己予測のリークを回避する。
+    """
+
+    def __init__(self, base_model, iso, feature_cols, meta=None):
+        """IsotonicPlaceWrapper のインスタンスを初期化する。"""
+        self.base_model = base_model
+        self.iso = iso
+        self.feature_cols = list(feature_cols)
+        self.meta = meta or {}
+
+
+def _safe_prob01(a) -> object:
+    """配列を nan/inf 処理後に [1e-6, 1-1e-6] の確率範囲にクリップして返す。"""
+    a = np.asarray(a, dtype=float)
+    a = np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=0.0)
+    return np.clip(a, 1e-6, 1.0-1e-6)
+
+
+def _beta_low_heuristic(p, q=0.05, a0=1.0, b0=1.0, n=100) -> float:
+    """Beta下限の簡易ヒューリスティック。
+
+    p を「n回中 p*n 回成功した」とみなして信用区間の下限を出す。
+    SciPy が無い場合は Wilson 下限にフォールバック。
+    """
+    p = _safe_prob01(p)
+    if _beta_dist is not None:
+        aa = a0 + p * float(n)
+        bb = b0 + (1.0 - p) * float(n)
+        try:
+            return np.asarray(_beta_dist.ppf(q, aa, bb), dtype=float)
+        except Exception:
+            pass
+    # Wilson score lower bound (fallback)
+    z = 1.6448536269514722  # ~ 95% one-sided
+    n = max(float(n), 1.0)
+    phat = p
+    denom = 1.0 + z*z/n
+    center = (phat + z*z/(2.0*n)) / denom
+    rad = z * np.sqrt((phat*(1.0-phat) + z*z/(4.0*n))/n) / denom
+    return np.clip(center - rad, 0.0, 1.0)
+
+
+# =========================
+# Threshold optimization (Youden / Fβ)
+# - Use ONLY on validation/OOF predictions.
+# =========================
+
+def _confusion_counts01(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float, float]:
+    """二値分類の混同行列を (TP, TN, FP, FN) の float タプルで返す。"""
+    y_true = np.asarray(y_true, dtype=int)
+    y_pred = np.asarray(y_pred, dtype=int)
+    tp = float(np.sum((y_true == 1) & (y_pred == 1)))
+    tn = float(np.sum((y_true == 0) & (y_pred == 0)))
+    fp = float(np.sum((y_true == 0) & (y_pred == 1)))
+    fn = float(np.sum((y_true == 1) & (y_pred == 0)))
+    return tp, tn, fp, fn
+
+
+def _youden_j(y_true: np.ndarray, y_prob: np.ndarray, t: float) -> float:
+    """閾値 t における Youden-J 統計量 (感度 + 特異度 - 1) を返す。"""
+    y_prob = _safe_prob01(y_prob)
+    y_pred = (y_prob >= float(t)).astype(int)
+    tp, tn, fp, fn = _confusion_counts01(y_true, y_pred)
+    tpr = tp / (tp + fn + 1e-12)  # sensitivity
+    tnr = tn / (tn + fp + 1e-12)  # specificity
+    return float(tpr + tnr - 1.0)
+
+
+def _fbeta_score(y_true: np.ndarray, y_prob: np.ndarray, t: float, beta: float = 2.0) -> float:
+    """閾値 t における F-β スコアを返す（デフォルト β=2.0、再現率重視）。"""
+    y_prob = _safe_prob01(y_prob)
+    y_pred = (y_prob >= float(t)).astype(int)
+    tp, tn, fp, fn = _confusion_counts01(y_true, y_pred)
+    prec = tp / (tp + fp + 1e-12)
+    rec = tp / (tp + fn + 1e-12)
+    b2 = float(beta) * float(beta)
+    return float((1.0 + b2) * prec * rec / (b2 * prec + rec + 1e-12))
+
+
+def optimize_thresholds_youden_fbeta2(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    beta: float = 2.0,
+    grid: int = 1001,
+) -> Dict[str, Dict[str, float]]:
+    """Return both optimal thresholds on the same y_prob:
+
+    - youden: maximize TPR+TNR-1
+    - fbeta2: maximize Fβ (β defaults to 2)
+
+    Note: Use ONLY with OOF/val predictions.
+    """
+    y_true = np.asarray(y_true, dtype=int)
+    y_prob = _safe_prob01(y_prob)
+
+    best = {
+        'youden': {'t': 0.5, 'score': -1e18},
+        'fbeta2': {'t': 0.5, 'score': -1e18},
+    }
+
+    g = int(max(101, grid))
+    for i in range(g):
+        t = i / float(g - 1)
+        s1 = _youden_j(y_true, y_prob, t)
+        if s1 > best['youden']['score']:
+            best['youden'] = {'t': float(t), 'score': float(s1)}
+        s2 = _fbeta_score(y_true, y_prob, t, beta=float(beta))
+        if s2 > best['fbeta2']['score']:
+            best['fbeta2'] = {'t': float(t), 'score': float(s2)}
+
+    return best
+
+
+def choose_threshold_from_metrics(best: Dict[str, Dict[str, float]], strategy: str = 'conservative_max') -> float:
+    """Select a single threshold from both metrics.
+
+    strategy:
+      - conservative_max: max(t_youden, t_fbeta2)
+      - aggressive_min:   min(t_youden, t_fbeta2)
+      - use_youden
+      - use_fbeta2
+    """
+    ty = float((best.get('youden', {}) or {}).get('t', 0.5))
+    tf = float((best.get('fbeta2', {}) or {}).get('t', 0.5))
+    s = str(strategy or '').lower().strip()
+    if s == 'aggressive_min':
+        return float(min(ty, tf))
+    if s == 'use_youden':
+        return float(ty)
+    if s == 'use_fbeta2':
+        return float(tf)
+    # default conservative
+    return float(max(ty, tf))
+
+
+def auto_select_place_feature_cols(df: pd.DataFrame, y_col: str = 'show_flag', group_col: str = 'race_id') -> List[str]:
+    """ユーザが特徴量を指定しない場合の自動選定（安全寄り）。
+
+    方針:
+    1) STELLA 内で安定して生成されやすい主要指標（SAS/AnchorScore等）を優先
+    2) それでも足りない場合は、学習CSVに存在する数値列から y/group/文字列列を除いて採用
+
+    注意:
+    - ここは「壊れないこと」「列ミスマッチを起こさないこと」を優先。
+    - 最適化は後で可能（必要になった時点で feature_cols を固定推奨）。
+    """
+    if df is None or len(df) == 0:
+        return []
+
+    preferred = [
+        # STELLA core
+        'AnchorScore','SAS','rating','speed_max',
+        'Ability','PosFit','Consist','MapFit','TimeFit','FactorFit',
+        'MarketWinFit','MarketPlaceFit',
+        'WinShape','Upside','WPS',
+        # optional context
+        'AI_REAR_CONFIRMED','zone_3c','zone_4c',
+        # R27: 走法分類
+        'RunningStyleLabel','RunningStyleConf','RunningStyleScore',
+    ]
+
+    cols = []
+    for c in preferred:
+        if c in df.columns:
+            cols.append(c)
+
+    # if still too few, add numeric columns safely
+    if len(cols) < 6:
+        drop = {y_col, group_col}
+        for c in df.columns:
+            if c in drop or c in cols:
+                continue
+            if str(c).lower().endswith('id') or 'id_' in str(c).lower() or '_id' in str(c).lower():
+                continue
+            # exclude obvious text
+            if df[c].dtype == object:
+                continue
+            # keep only finite numeric-ish
+            try:
+                _ = _num_series(df[c], index=df.index)
+            except Exception:
+                continue
+            cols.append(c)
+
+    # final uniq
+    out=[]
+    seen=set()
+    for c in cols:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+
+def train_place_model_bundle(
+    df: pd.DataFrame,
+    feature_cols: list,
+    y_col: str,
+    group_col: str,
+    n_splits: int = 5,
+    lgb_params: Optional[dict] = None,
+    seed: int = 42,
+    threshold_grid: int = 1001,
+    threshold_strategy: str = 'conservative_max',
+    threshold_beta: float = 2.0,
+) -> PlaceModelBundle:
+    """複勝(show_flag)モデル学習 + OOF isotonic 校正 + 全量fitモデル生成。
+
+    追加:
+      - OOF(=val相当) で Youden / Fβ(β=2) の最適閾値を探索し meta に保存。
+    """
+    assert y_col in df.columns, f'missing y_col={y_col}'
+    assert group_col in df.columns, f'missing group_col={group_col}'
+
+    X = df[feature_cols].copy()
+    y = _num_series(df[y_col], 0, index=df.index, dtype=int).values
+    groups = df[group_col].values
+
+    # fill missing / non-numeric
+    for c in feature_cols:
+        X[c] = _num_series(X[c], index=X.index)
+    X = X.fillna(0.0)
+
+    params = dict(
+        n_estimators=400,
+        learning_rate=0.05,
+        max_depth=-1,
+        objective='binary',
+        class_weight='balanced',
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=seed,
+        n_jobs=-1,
+    )
+    if lgb_params:
+        params.update({k:v for k,v in lgb_params.items() if v is not None})
+
+    # OOF preds for isotonic
+    cv = GroupKFold(n_splits=int(n_splits))
+    oof = np.zeros(len(X), dtype=float)
+    for tr_idx, va_idx in cv.split(X, y, groups=groups):
+        m = lgb.LGBMClassifier(**params)
+        m.fit(X.iloc[tr_idx], y[tr_idx])
+        oof[va_idx] = m.predict_proba(X.iloc[va_idx])[:,1]
+
+    oof = _safe_prob01(oof)
+    iso = IsotonicRegression(out_of_bounds='clip')
+    iso.fit(oof, y)
+
+    # --- threshold optimization on calibrated OOF (val-equivalent) ---
+    try:
+        oof_cal = _safe_prob01(iso.transform(oof))
+        best = optimize_thresholds_youden_fbeta2(y_true=y, y_prob=oof_cal, beta=float(threshold_beta), grid=int(threshold_grid))
+        t_sel = choose_threshold_from_metrics(best, strategy=str(threshold_strategy))
+    except Exception:
+        best = {}
+        t_sel = 0.26  # fallback: default min_p_place_est
+
+    # final model trained on full data
+    final_model = lgb.LGBMClassifier(**params)
+    final_model.fit(X, y)
+
+    meta = {
+        'n_splits': int(n_splits),
+        'y_col': str(y_col),
+        'group_col': str(group_col),
+        'lgb_params': params,
+        'thresholds': best,
+        'threshold_strategy': str(threshold_strategy),
+        'threshold_selected': float(t_sel),
+        'threshold_beta': float(threshold_beta),
+        'threshold_grid': int(threshold_grid),
+    }
+    return PlaceModelBundle(base_model=final_model, iso=iso, feature_cols=feature_cols, meta=meta)
+
+
+def predict_place_probs(bundle: PlaceModelBundle, X: pd.DataFrame) -> np.ndarray:
+    """PlaceModelBundle を使って入着確率を予測し ndarray を返す。"""
+    X = X.copy()
+    for c in bundle.feature_cols:
+        if c not in X.columns:
+            X[c] = 0.0
+        X[c] = _num_series(X[c], index=X.index)
+    X = X[bundle.feature_cols].fillna(0.0)
+    raw = bundle.base_model.predict_proba(X)[:,1]
+    raw = _safe_prob01(raw)
+    try:
+        cal = bundle.iso.transform(raw)
+    except Exception:
+        cal = raw
+    return _safe_prob01(cal)
+
+
+def save_place_model_bundle(bundle: PlaceModelBundle, out_path: str) -> None:
+    """PlaceModelBundle を joblib でファイルに保存する。"""
+    joblib.dump(bundle, out_path)
+
+
+def load_place_model_bundle(in_path: str) -> PlaceModelBundle:
+    """joblib ファイルから PlaceModelBundle を読み込んで返す。"""
+    obj = joblib.load(in_path)
+    return obj
+
+
+@dataclass
+class PairModelBundle:
+    feature_cols: List[str]
+    pair_feature_cols: List[str]
+    model: object
+    low_q: float = 0.05
+    meta: Dict = None
+
+    def __post_init__(self):
+        """dataclassの後処理: meta が None の場合に空dictを設定する。"""
+        if self.meta is None:
+            self.meta = {}
+
+
+def _require_pair_ml_deps() -> None:
+    """    ペアモデルに必要な依存ライブラリ (lightgbm, scikit-learn 等) の有無を確認する。
+    不足している場合は RuntimeError を送出する。
+    """
+    if lgb is None or CalibratedClassifierCV is None or GroupKFold is None or IsotonicRegression is None:
+        raise RuntimeError('pair model requires lightgbm + scikit-learn (+ IsotonicRegression)')
+
+
+def _safe_numeric(v) -> float:
+    """値を float に変換し、有限でなければ np.nan を返す。"""
+    try:
+        x = float(v)
+        return x if np.isfinite(x) else np.nan
+    except Exception:
+        return np.nan
+
+
+def make_pair_feature_names(feature_cols: List[str]) -> List[str]:
+    """ペアモデル用の特徴量列名リスト（差分・比率列を含む）を生成して返す。"""
+    cols: List[str] = []
+    for c in feature_cols:
+        cols += [f'{c}_a', f'{c}_b', f'{c}_min', f'{c}_max', f'{c}_sum', f'{c}_absdiff']
+    return cols
+
+
+def build_pair_feature_row(a: pd.Series, b: pd.Series, feature_cols: List[str]) -> Dict[str, float]:
+    """2頭の Series からペアモデル用特徴量 dict を構築する。"""
+    # order-invariant engineered features
+    out: Dict[str, float] = {}
+    for c in feature_cols:
+        va = _safe_numeric(a.get(c, np.nan))
+        vb = _safe_numeric(b.get(c, np.nan))
+        out[f'{c}_a'] = va
+        out[f'{c}_b'] = vb
+        _both_nan = not np.isfinite(va) and not np.isfinite(vb)
+        out[f'{c}_min'] = np.nan if _both_nan else np.nanmin([va, vb])
+        out[f'{c}_max'] = np.nan if _both_nan else np.nanmax([va, vb])
+        out[f'{c}_sum'] = (va + vb) if (np.isfinite(va) and np.isfinite(vb)) else np.nan
+        out[f'{c}_absdiff'] = abs(va - vb) if (np.isfinite(va) and np.isfinite(vb)) else np.nan
+    return out
+
+
+def build_pair_training_table_from_horse_table(
+    horse_df: pd.DataFrame,
+    feature_cols: List[str],
+    race_id_col: str = 'race_id',
+    horse_id_col: str = 'horse_id',
+    show_flag_col: str = 'show_flag',
+) -> pd.DataFrame:
+    """ホーステーブルからペアモデル学習用 DataFrame を構築して返す。"""
+    # horse-level -> pair-level; y_pair = both show_flag==1
+    if race_id_col not in horse_df.columns:
+        raise ValueError(f'missing column: {race_id_col}')
+    if show_flag_col not in horse_df.columns:
+        raise ValueError(f'missing column: {show_flag_col}')
+    if horse_id_col not in horse_df.columns:
+        horse_id_col = 'num' if 'num' in horse_df.columns else horse_id_col
+
+    rows: List[Dict] = []
+    for rid, g in horse_df.groupby(race_id_col):
+        g = g.reset_index(drop=True)
+        n = len(g)
+        if n < 2:
+            continue
+        for i in range(n):
+            for j in range(i + 1, n):
+                a = g.iloc[i]
+                b = g.iloc[j]
+                y = int(int(a.get(show_flag_col, 0) or 0) == 1 and int(b.get(show_flag_col, 0) or 0) == 1)
+                feat = build_pair_feature_row(a, b, feature_cols)
+                rows.append({
+                    race_id_col: rid,
+                    'horse_id_a': a.get(horse_id_col, i),
+                    'horse_id_b': b.get(horse_id_col, j),
+                    'y_pair': y,
+                    **feat,
+                })
+    return pd.DataFrame(rows)
+
+
+def train_pair_model_bundle(
+    horse_df: pd.DataFrame,
+    feature_cols: List[str],
+    race_id_col: str = 'race_id',
+    horse_id_col: str = 'horse_id',
+    show_flag_col: str = 'show_flag',
+    n_splits: int = 5,
+    low_q: float = 0.05,
+    lgbm_params: Optional[dict] = None,
+    threshold_grid: int = 1001,
+    threshold_strategy: str = 'conservative_max',
+    threshold_beta: float = 2.0,
+) -> PairModelBundle:
+    """ペアモデルを学習し PairModelBundle を返す。
+
+    CSV または DataFrame から特徴量を構築し、交差検証付きで LightGBM を学習する。
+    """
+    _require_pair_ml_deps()
+
+    pair_df = build_pair_training_table_from_horse_table(
+        horse_df,
+        feature_cols=feature_cols,
+        race_id_col=race_id_col,
+        horse_id_col=horse_id_col,
+        show_flag_col=show_flag_col,
+    )
+    if len(pair_df) == 0:
+        raise ValueError('pair training table empty')
+
+    pair_feature_cols = make_pair_feature_names(feature_cols)
+    X = pair_df[pair_feature_cols].copy()
+    y = pair_df['y_pair'].astype(int)
+    groups = pair_df[race_id_col]
+
+    cv = GroupKFold(n_splits=int(n_splits))
+    splits = list(cv.split(X, y, groups=groups))
+
+    params = dict(
+        n_estimators=600,
+        learning_rate=0.03,
+        num_leaves=63,
+        max_depth=-1,
+        objective='binary',
+        class_weight='balanced',
+        subsample=0.8,
+        colsample_bytree=0.8,
+        n_jobs=-1,
+    )
+    if lgbm_params:
+        params.update(lgbm_params)
+
+    # --- OOF calibrated predictions for threshold optimization (val-equivalent) ---
+    gbm = lgb.LGBMClassifier(**params)
+    oof_cal = np.zeros(len(X), dtype=float)
+    for tr_idx, va_idx in splits:
+        m = lgb.LGBMClassifier(**params)
+        m.fit(X.iloc[tr_idx], y.iloc[tr_idx])
+        raw_va = _safe_prob01(m.predict_proba(X.iloc[va_idx])[:, 1])
+        # isotonic calibration on the fold's validation
+        iso = IsotonicRegression(out_of_bounds='clip')
+        iso.fit(raw_va, y.iloc[va_idx].values)
+        try:
+            oof_cal[va_idx] = _safe_prob01(iso.transform(raw_va))
+        except Exception:
+            oof_cal[va_idx] = raw_va
+
+    try:
+        best = optimize_thresholds_youden_fbeta2(y_true=y.values, y_prob=oof_cal, beta=float(threshold_beta), grid=int(threshold_grid))
+        t_sel = choose_threshold_from_metrics(best, strategy=str(threshold_strategy))
+    except Exception:
+        best = {}
+        t_sel = 0.08  # fallback: 8% default gate as probability
+
+    # --- final calibrated model for inference ---
+    clf = CalibratedClassifierCV(gbm, method='isotonic', cv=splits)
+    clf.fit(X, y)
+
+    meta = {
+        'n_splits': int(n_splits),
+        'race_id_col': str(race_id_col),
+        'show_flag_col': str(show_flag_col),
+        'horse_id_col': str(horse_id_col),
+        'lgb_params': params,
+        'thresholds': best,
+        'threshold_strategy': str(threshold_strategy),
+        'threshold_selected': float(t_sel),
+        'threshold_beta': float(threshold_beta),
+        'threshold_grid': int(threshold_grid),
+    }
+
+    return PairModelBundle(
+        feature_cols=list(feature_cols),
+        pair_feature_cols=list(pair_feature_cols),
+        model=clf,
+        low_q=float(low_q),
+        meta=meta,
+    )
+
+
+def predict_pair_with_low(bundle: PairModelBundle, X_pair: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """ペアモデルで確率を予測し (proba_high, proba_low) の tuple を返す。"""
+    # mean
+    clf = bundle.model
+    p_mean = clf.predict_proba(X_pair)[:, 1]
+
+    # fold-wise quantile as lower bound
+    p_folds: List[np.ndarray] = []
+    if hasattr(clf, 'calibrated_classifiers_'):
+        for cc in getattr(clf, 'calibrated_classifiers_', []):
+            try:
+                p_folds.append(cc.predict_proba(X_pair)[:, 1])
+            except Exception:
+                pass
+
+    if len(p_folds) >= 2:
+        P = np.vstack(p_folds)
+        q = float(bundle.low_q)
+        q = 0.0 if q < 0.0 else (1.0 if q > 1.0 else q)
+        p_low = np.quantile(P, q, axis=0)
+    else:
+        p_low = np.full_like(p_mean, np.nan)
+
+    return p_mean.astype(float), p_low.astype(float)
+
+
+def save_pair_model_bundle(bundle: PairModelBundle, out_path: str) -> None:
+    """PairModelBundle を joblib でファイルに保存する。"""
+    joblib.dump(bundle, out_path)
+
+
+def load_pair_model_bundle(in_path: str) -> PairModelBundle:
+    """joblib ファイルから PairModelBundle を読み込んで返す。"""
+    obj = joblib.load(in_path)
+    if not hasattr(obj, 'feature_cols') or not hasattr(obj, 'pair_feature_cols'):
+        raise ValueError('invalid pair model bundle')
+    return obj
+
+
+def build_pair_X_for_anchor(
+    scored_df: pd.DataFrame,
+    anchor_num: str,
+    opp_nums: List[str],
+    feature_cols: List[str],
+) -> pd.DataFrame:
+    """アンカー馬と対戦相手馬のペア特徴量 DataFrame を構築する。"""
+    d = scored_df.copy()
+    d['num'] = d['num'].astype(str)
+    arow = d[d['num'] == str(anchor_num)].head(1)
+    if len(arow) == 0:
+        raise ValueError('anchor not found')
+    a = arow.iloc[0]
+
+    rows: List[Dict] = []
+    for on in opp_nums:
+        brow = d[d['num'] == str(on)].head(1)
+        b = brow.iloc[0] if len(brow) else pd.Series({})
+        feat = build_pair_feature_row(a, b, feature_cols)
+        feat['opp_num'] = str(on)
+        rows.append(feat)
+
+    X = pd.DataFrame(rows)
+    for c in make_pair_feature_names(feature_cols):
+        if c not in X.columns:
+            X[c] = np.nan
+    X = X[make_pair_feature_names(feature_cols) + ['opp_num']]
+    return X
+
+
+
+def _sworm_init_pool(
+    df: 'pd.DataFrame',
+    anchor_num: str,
+    p_wide_est_pct: 'pd.Series',
+    p_wide_low_pct,
+    params: 'Optional[dict]',
+    rules: 'Optional[dict]',
+    meta: 'Optional[Dict[str, str]]',
+) -> tuple:
+    """パラメータ初期化・重み正規化・候補プール構築。
+
+    [BUG-FIX v13] pace_key を meta['pace'] から取得する。
+    元の select_wide_opponents_rulemode では pace_key が未定義のまま使用されており、
+    実行時 NameError が発生していた潜在バグを修正。
+
+    Returns:
+        (pool, d, n_points, min_all, max_all, w_p, w_s, w_o, pace_key)
+    """
+    params = params or DEFAULT_PARAMS
+    rules = rules or {}
+
+    n_points = int(rules.get('n_points', 4))
+    n_points = 4 if n_points <= 0 else n_points
+
+    # NOTE(v10.12): 下限ゲート廃止。min_all<=0 ならフィルタしない。
+    min_all = 0.0  # PURE_DATA
+
+    max_all = 0.0  # PURE_DATA
+    # min_p_wide_model_pct: (PLACE-only safety) wide does NOT gate by it
+
+    w = dict(rules.get('pick_weights', {}) or {})
+    w_p = float(w.get('p_wide', 0.55))
+    w_s = float(w.get('opp_strength', 0.25))
+    w_o = 0.0  # PURE_DATA: market_safety disabled
+    # normalize weights (avoid zero division)
+    w_sum = float(max(1e-9, w_p + w_s + w_o))
+    w_p, w_s, w_o = w_p / w_sum, w_s / w_sum, w_o / w_sum
+
+    # build candidate base
+    d = df.copy()
+    d['num'] = d['num'].astype(str)
+    d['AI_REAR_CONFIRMED'] = d['AI_REAR_CONFIRMED'].astype(bool)
+    d['p_wide_model_pct'] = p_wide_est_pct
+    d['p_wide_low_pct'] = p_wide_low_pct if p_wide_low_pct is not None else np.nan
+
+    pool = d[~d['AI_REAR_CONFIRMED']].copy()
+    pool = pool[pool['num'] != str(anchor_num)].copy()
+
+    # need market detail
+    # WIDE_PURE_DATA_V1: 市場は表示のみ。無くてもワイド相手は選ぶ
+    # PURE_DATA: wide_market_df を使用しない（表示・ロジック共に削除）
+    pool['wide_market_text'] = ''
+    pool['wide_market_min'] = np.nan
+    pool['wide_market_max'] = np.nan
+    pool['wide_market_mid'] = np.nan
+    pool['wide_market'] = np.nan
+
+    # [BUG-FIX v13] pace_key was never defined in original function
+    pace_key: str = str((meta or {}).get('pace', '') or '').upper().strip()[:1]
+    return pool, d, n_points, min_all, max_all, w_p, w_s, w_o, pace_key
+
+
+def _sworm_pair_override(
+    pool: 'pd.DataFrame',
+    d: 'pd.DataFrame',
+    anchor_num: str,
+    pair_model_bundle,
+) -> 'pd.DataFrame':
+    """Pair ML モデルが提供されている場合に p_wide_model_pct / p_wide_low_pct を上書きする。"""
+    # --- v10.3: Pair ML model override (if provided) ---
+    if pair_model_bundle is not None:
+        try:
+            opp_nums = pool['num'].astype(str).tolist()
+            Xp = build_pair_X_for_anchor(d, anchor_num=str(anchor_num), opp_nums=opp_nums, feature_cols=pair_model_bundle.feature_cols)
+            opp_order = Xp['opp_num'].astype(str).tolist()
+            Xmat = Xp[pair_model_bundle.pair_feature_cols].copy()
+            p_mean, p_low = predict_pair_with_low(pair_model_bundle, Xmat)
+            p_map = {opp_order[i]: float(p_mean[i]) for i in range(len(opp_order))}
+            pl_map = {opp_order[i]: float(p_low[i]) for i in range(len(opp_order))}
+            pool['p_wide_model_pct'] = pool['num'].map(lambda n: p_map.get(str(n), np.nan) * 100.0)
+            pool['p_wide_low_pct'] = pool['num'].map(lambda n: pl_map.get(str(n), np.nan) * 100.0)
+        except Exception:
+            pass
+
+    for c in ['wide_market_min','wide_market_max','wide_market_mid','wide_market']:
+        pool[c] = _num_series(pool[c], index=pool.index)
+    return pool
+
+
+def _sworm_apply_gates(
+    pool: 'pd.DataFrame',
+    rules: dict,
+    n_points: int,
+    max_all: float,
+) -> tuple:
+    """市場上限・EV・p_wide_model 閾値ゲートを適用する。
+
+    Returns:
+        (pool, n_points, skip) – skip=None で正常通過；
+        skip=(empty_df, reason_dict) の場合は呼び出し元で即 return する。
+    """
+    # market upper bound (optional)
+    # PURE_DATA: market filter disabled (min_all=0)
+    if float(max_all) > 0.0:
+        pool = pool[
+            (pool['wide_market_mid'].isna())
+            | (pool['wide_market_mid'] <= float(max_all))
+        ].copy()
+
+    # EV gate
+    try:
+        ev_gate_enabled = False  # PURE_DATA
+    except Exception:
+        ev_gate_enabled = True
+
+    pool['p_pair'] = _num_series(pool.get('p_wide_model_pct', np.nan), index=pool.index) / 100.0
+    pool['p_pair_low'] = _num_series(pool.get('p_wide_low_pct', np.nan), index=pool.index) / 100.0
+    # vectorized EV (faster than DataFrame.apply)
+    pool['ev'] = 0.0  # PURE_DATA
+
+    if ev_gate_enabled:
+        # strict: buy only if EV>0 and P_low>0
+        pool = pool[
+            (pool['ev'].notna()) & (pool['ev'] > 0.0)
+            & (pool['p_pair_low'].notna()) & (pool['p_pair_low'] > 0.0)
+        ].copy()
+
+    # p_wide_model gate: apply only if it keeps >= n_points candidates
+    pool['p_wide_model_pct'] = _num_series(pool.get('p_wide_model_pct', np.nan), index=pool.index)
+    try:
+        thr = float(rules.get('min_p_wide_model_pct', 0.0) or 0.0)
+    except Exception:
+        thr = 0.0
+    if thr > 0 and pool['p_wide_model_pct'].notna().sum() > 0:
+        pool2 = pool[pool['p_wide_model_pct'] >= thr].copy()
+        if len(pool2) >= n_points:
+            pool = pool2
+
+    # min_points check (Nakayama5R: allow 2-3 points when pool is small)
+    try:
+        min_points = int(rules.get('min_points', 2) or 2)
+    except Exception:
+        min_points = 2
+    if min_points <= 0:
+        min_points = 2
+
+    if len(pool) < n_points:
+        if len(pool) >= min_points:
+            n_points = int(len(pool))
+        else:
+            _empty = pd.DataFrame(
+                columns=[
+                    'num', 'name', 'wide_market_text', 'wide_market_min',
+                    'wide_market_max', 'wide_market_mid', 'wide_market',
+                    'p_wide_model_pct', 'p_wide_low_pct', 'pick_score',
+                ]
+            )
+            _skip = (
+                _empty,
+                {
+                    'status': 'SKIP',
+                    'reason': (
+                        f'not_enough_pairs_after_rules: {len(pool)}/{n_points}'
+                        f' (min_points={min_points})'
+                    ),
+                },
+            )
+            return pool, n_points, _skip
+
+    return pool, n_points, None
+
+
+def _sworm_normalise_features(
+    pool: 'pd.DataFrame',
+    params: dict,
+    rules: dict,
+    w_p: float,
+    w_s: float,
+    w_o: float,
+) -> 'pd.DataFrame':
+    """特徴量を 0–1 正規化し pick_score_base を計算して pool を返す。
+
+    含む: p_wide_model / opponent_strength / EV 正規化、base01 + core bonus。
+    """
+    # (1) p_wide_model
+    p = _num_series(pool.get('p_wide_model_pct', np.nan), index=pool.index)
+    p01 = (
+        (p - p.min()) / (p.max() - p.min())
+        if (np.isfinite(p.min()) and np.isfinite(p.max()) and p.max() != p.min())
+        else pd.Series([0.5] * len(pool), index=pool.index)
+    )
+
+    # (2) opponent strength: AnchorScore (preferred) else SAS
+    score_col = str(params.get('anchor_score_col', 'AnchorScore'))
+    if score_col not in pool.columns:
+        score_col = 'SAS'
+    st = _num_series(pool.get(score_col, np.nan), index=pool.index)
+    st01 = (
+        (st - st.min()) / (st.max() - st.min())
+        if (np.isfinite(st.min()) and np.isfinite(st.max()) and st.max() != st.min())
+        else pd.Series([0.5] * len(pool), index=pool.index)
+    )
+    pool['pick_p01'] = p01.astype(float)
+    pool['pick_s01'] = st01.astype(float)
+
+    # (3) PURE_DATA: market_safety disabled
+    od01 = pd.Series([0.5] * len(pool), index=pool.index)
+    pool['pick_o01'] = od01.astype(float)
+
+    # EV awareness (non-negative only; small weight)
+    evv = _num_series(pool.get('ev', np.nan), index=pool.index)
+    if evv.notna().sum() > 0 and float(evv.max()) != float(evv.min()):
+        ev01 = (evv - float(evv.min())) / (float(evv.max()) - float(evv.min()))
+    else:
+        ev01 = pd.Series([0.5] * len(pool), index=pool.index)
+    pool['pick_ev01'] = ev01.astype(float)
+
+    # base score
+    try:
+        core_top_n = int(rules.get('core_top_n', 6) or 6)
+    except Exception:
+        core_top_n = 6
+    try:
+        core_bonus = float(rules.get('core_bonus', 0.04) or 0.04)
+    except Exception:
+        core_bonus = 0.04
+
+    base01 = (w_p * pool['pick_p01'] + w_s * pool['pick_s01'] + w_o * pool['pick_o01']).astype(float)
+
+    # core bonus by strength rank (top-N)
+    try:
+        top_idx = set(
+            pool['pick_s01'].sort_values(ascending=False).head(max(0, core_top_n)).index.tolist()
+        )
+        base01 = base01 + pool.index.map(lambda idx: core_bonus if idx in top_idx else 0.0).astype(float)
+    except Exception:
+        pass
+
+    # PURE_DATA: EV awareness disabled
+    ev_pos01 = pd.Series([0.5] * len(pool), index=pool.index)
+    pool['pick_score_base'] = (0.85 * base01 + 0.15 * ev_pos01).astype(float)
+    return pool
+
+def _sworm_precision_tune(
+    pool: 'pd.DataFrame',
+    rules: dict,
+) -> 'pd.DataFrame':
+    """PRECISION_TUNE_V1: pred_last3f / CommentFit / CommentRisk を pick_score_base に反映する。"""
+    # last3f fast bonus
+    try:
+        _l3_enabled = bool(rules.get('pred_last3f_support_enabled', True))
+    except Exception:
+        _l3_enabled = True
+    try:
+        _l3_bonus = float(rules.get('pred_last3f_support_bonus', 0.05) or 0.05)
+    except Exception:
+        _l3_bonus = 0.05
+    if _l3_enabled and ('pred_last3f' in pool.columns):
+        try:
+            l3 = _num_series(pool.get('pred_last3f', np.nan), index=pool.index)
+            if l3.notna().sum() > 1 and float(l3.max()) != float(l3.min()):
+                l3_fast01 = (
+                    (float(l3.max()) - l3) / (float(l3.max()) - float(l3.min()))
+                ).clip(lower=0.0, upper=1.0)
+            else:
+                l3_fast01 = pd.Series([0.0] * len(pool), index=pool.index)
+            pool['pick_last3f01'] = _num_series(l3_fast01, 0.0, index=pool.index)
+            pool['pick_score_base'] = (
+                pool['pick_score_base'] + _l3_bonus * pool['pick_last3f01']
+            ).astype(float)
+        except Exception:
+            pool['pick_last3f01'] = 0.0
+    else:
+        pool['pick_last3f01'] = 0.0
+
+    # comment adjustment
+    try:
+        _comment_adj_enabled = bool(rules.get('comment_support_in_wide_enabled', True))
+    except Exception:
+        _comment_adj_enabled = True
+    try:
+        _comment_bonus    = float(rules.get('comment_support_bonus', 0.02) or 0.02)
+        _comment_risk_pen = float(rules.get('comment_risk_penalty',  0.03) or 0.03)
+    except Exception:
+        _comment_bonus, _comment_risk_pen = 0.02, 0.03
+    if _comment_adj_enabled:
+        try:
+            cfv = _num_series(pool.get('CommentFit',  np.nan), index=pool.index)
+            crv = _num_series(pool.get('CommentRisk', np.nan), index=pool.index)
+            cf01 = (
+                ((cfv - float(cfv.min())) / (float(cfv.max()) - float(cfv.min()))).clip(0.0, 1.0)
+                if (cfv.notna().sum() > 1 and float(cfv.max()) != float(cfv.min()))
+                else pd.Series([0.0] * len(pool), index=pool.index)
+            )
+            cr01 = (
+                ((crv - float(crv.min())) / (float(crv.max()) - float(crv.min()))).clip(0.0, 1.0)
+                if (crv.notna().sum() > 1 and float(crv.max()) != float(crv.min()))
+                else pd.Series([0.0] * len(pool), index=pool.index)
+            )
+            pool['pick_comment01']      = _num_series(cf01, 0.0, index=pool.index)
+            pool['pick_comment_risk01'] = _num_series(cr01, 0.0, index=pool.index)
+            pool['pick_score_base'] = (
+                pool['pick_score_base']
+                + _comment_bonus    * pool['pick_comment01']
+                - _comment_risk_pen * pool['pick_comment_risk01']
+            ).astype(float)
+        except Exception:
+            pool['pick_comment01']      = 0.0
+            pool['pick_comment_risk01'] = 0.0
+    else:
+        pool['pick_comment01']      = 0.0
+        pool['pick_comment_risk01'] = 0.0
+    return pool
+
+def _sworm_dual_score_support(
+    pool: 'pd.DataFrame',
+    rules: dict,
+    meta,
+) -> 'pd.DataFrame':
+    """win_support / tight-race bonus / dual-score (WinCandidateScore 等) を pick_score_base に反映する。"""
+    # win-support bonus
+    try:
+        _win_support_bonus       = float(rules.get('win_support_bonus', 0.03) or 0.03)
+        _tight_win_support_bonus = float(rules.get('tight_race_win_support_bonus', 0.07) or 0.07)
+    except Exception:
+        _win_support_bonus, _tight_win_support_bonus = 0.03, 0.07
+    try:
+        _tight_mode = str((meta or {}).get('tight_race_mode', '0')).strip() in ['1', 'true', 'True']
+    except Exception:
+        _tight_mode = False
+    try:
+        pwin = _num_series(pool.get('p_win_field', np.nan), index=pool.index)
+        pwin01 = (
+            ((pwin - float(pwin.min())) / (float(pwin.max()) - float(pwin.min()))).clip(0.0, 1.0)
+            if (pwin.notna().sum() > 1 and float(pwin.max()) != float(pwin.min()))
+            else pd.Series([0.0] * len(pool), index=pool.index)
+        )
+        pool['pick_pwin01'] = _num_series(pwin01, 0.0, index=pool.index)
+        pool['pick_score_base'] = (
+            pool['pick_score_base']
+            + (_tight_win_support_bonus if _tight_mode else _win_support_bonus)
+            * pool['pick_pwin01']
+        ).astype(float)
+    except Exception:
+        pool['pick_pwin01'] = 0.0
+
+    # dual-score support
+    try:
+        _win_sc_bonus        = float(rules.get('win_candidate_support_bonus',           0.06) or 0.06)
+        _cond_sc_bonus       = float(rules.get('condition_support_bonus',                0.04) or 0.04)
+        _gate_sc_bonus       = float(rules.get('gate_support_bonus',                     0.03) or 0.03)
+        _course_sc_bonus     = float(rules.get('course_support_bonus',                   0.05) or 0.05)
+        _win_group_bonus     = (
+            float(rules.get('tight_race_win_group_support_bonus',  0.05) or 0.05)
+            if _tight_mode else
+            float(rules.get('win_group_support_bonus',             0.03) or 0.03)
+        )
+        _insurance_bonus     = (
+            float(rules.get('tight_race_insurance_support_bonus',  0.07) or 0.07)
+            if _tight_mode else
+            float(rules.get('insurance_support_bonus',             0.05) or 0.05)
+        )
+        _insurance_signal_bonus = float(rules.get('insurance_signal_support_bonus', 0.03) or 0.03)
+        _temp_wide_pen          = float(rules.get('temperament_wide_penalty',        0.02) or 0.02)
+
+        wc     = _num_series(pool.get('WinCandidateScore',    np.nan), index=pool.index)
+        cond   = _num_series(pool.get('ConditionFit',         np.nan), index=pool.index)
+        gate   = _num_series(pool.get('GateFit',              np.nan), index=pool.index)
+        course = _num_series(pool.get('CourseProfileFit',     np.nan), index=pool.index)
+        ins    = _num_series(pool.get('InsuranceSignalCount', np.nan), 0.0, index=pool.index)
+        temp   = _num_series(pool.get('TemperamentRisk',      np.nan), 0.0, index=pool.index)
+
+        wc01     = _series_norm01(wc,     lower_is_better=False, neutral=0.0)
+        cond01   = _series_norm01(cond,   lower_is_better=False, neutral=0.0)
+        gate01   = _series_norm01(gate,   lower_is_better=False, neutral=0.0)
+        course01 = _series_norm01(course, lower_is_better=False, neutral=0.0)
+        ins01    = _series_norm01(ins,    lower_is_better=False, neutral=0.0)
+        temp01   = _series_norm01(temp,   lower_is_better=False, neutral=0.0)
+
+        wg = _num_series(pool.get('is_win_group',        0), 0.0, index=pool.index, lower=0.0, upper=1.0)
+        ig = _num_series(pool.get('is_insurance_line',   0), 0.0, index=pool.index, lower=0.0, upper=1.0)
+
+        pool['pick_win_cand01']         = wc01.astype(float)
+        pool['pick_condition01']        = cond01.astype(float)
+        pool['pick_gate01']             = gate01.astype(float)
+        pool['pick_course01']           = course01.astype(float)
+        pool['pick_win_group01']        = wg.astype(float)
+        pool['pick_insurance01']        = ins01.astype(float)
+        pool['pick_insurance_group01']  = ig.astype(float)
+        pool['pick_temperament_risk01'] = temp01.astype(float)
+        pool['pick_score_base'] = (
+            pool['pick_score_base']
+            + _win_sc_bonus            * pool['pick_win_cand01']
+            + _cond_sc_bonus           * pool['pick_condition01']
+            + _gate_sc_bonus           * pool['pick_gate01']
+            + _course_sc_bonus         * pool['pick_course01']
+            + _win_group_bonus         * pool['pick_win_group01']
+            + _insurance_bonus         * pool['pick_insurance_group01']
+            + _insurance_signal_bonus  * pool['pick_insurance01']
+            - _temp_wide_pen           * pool['pick_temperament_risk01']
+        ).astype(float)
+    except Exception:
+        pool['pick_win_cand01']         = 0.0
+        pool['pick_condition01']        = 0.0
+        pool['pick_gate01']             = 0.0
+        pool['pick_course01']           = 0.0
+        pool['pick_win_group01']        = 0.0
+        pool['pick_insurance01']        = 0.0
+        pool['pick_insurance_group01']  = 0.0
+        pool['pick_temperament_risk01'] = 0.0
+    return pool
+
+def _sworm_compute_scores(
+    pool: 'pd.DataFrame',
+    params: dict,
+    rules: dict,
+    meta,
+    w_p: float,
+    w_s: float,
+    w_o: float,
+) -> 'pd.DataFrame':
+    """特徴量正規化・PRECISION_TUNE・dual-score をサブ関数に委譲して pick_score_base を計算する。
+
+    サブ関数:
+        _sworm_normalise_features  — 0–1 正規化 + base score
+        _sworm_precision_tune      — last3f / comment 調整
+        _sworm_dual_score_support  — win_support / dual-score bonus
+    """
+    pool = _sworm_normalise_features(pool, params, rules, w_p, w_s, w_o)
+    pool = _sworm_precision_tune(pool, rules)
+    pool = _sworm_dual_score_support(pool, rules, meta)
+    return pool
+
+
+
+def _sworm_pace_adjust(
+    pool: 'pd.DataFrame',
+    rules: dict,
+    pace_key: str,
+) -> 'pd.DataFrame':
+    """ペース別のゾーンボーナス / ペナルティを pick_score_base に加算する。
+
+    H ペース: 逃げにペナルティ, 差し〜追い込みにボーナス。
+    S ペース: REAR/MIDDLE の末脚系に slow_pace_rear_speed_bonus を加算。
+    """
+    # high-pace shape penalty/bonus: front fade risk > stalking persistence > deep rear
+    if pace_key == 'H':
+        try:
+            _front_pen = float(rules.get('high_pace_front_penalty', 0.04) or 0.04)
+            _front_fast_pen = float(rules.get('high_pace_front_fast_penalty', 0.03) or 0.03)
+            _middle_bonus = float(rules.get('high_pace_middle_bonus', 0.04) or 0.04)
+            _rear_bonus = float(rules.get('high_pace_rear_bonus', 0.02) or 0.02)
+            zn = pool.get('zone_4c', 'MIDDLE').apply(normalize_zone_token)
+            adj = pd.Series([0.0]*len(pool), index=pool.index, dtype=float)
+            adj.loc[zn == 'FRONT'] -= _front_pen
+            adj.loc[zn == 'MIDDLE'] += _middle_bonus
+            adj.loc[zn == 'REAR'] += _rear_bonus
+            pf = _num_series(pool.get('pred_first3f', np.nan), index=pool.index)
+            if pf.notna().sum() > 1 and float(pf.max()) != float(pf.min()):
+                pf01 = ((float(pf.max()) - pf) / (float(pf.max()) - float(pf.min()))).clip(lower=0.0, upper=1.0)
+                adj.loc[zn == 'FRONT'] -= (_front_fast_pen * pf01.loc[zn == 'FRONT']).astype(float)
+            pool['pick_score_base'] = (pool['pick_score_base'] + adj).astype(float)
+        except Exception:
+            pass
+
+    # pace->zone bonus (score add only; does NOT loosen market gates)
+    try:
+        pb = dict((rules.get('pace_zone_bonus', {}) or {}))
+        pb = dict(pb.get(pace_key, {}) or {}) if pace_key else {}
+    except Exception:
+        pb = {}
+    if pb:
+        def _zone_bonus(z: str) -> float:
+            """ゾーントークン z を正規化し、ペースボーナステーブル pb から値を取り出す。"""
+            zz = normalize_zone_token(z)
+            try:
+                return float(pb.get(zz, 0.0) or 0.0)
+            except Exception:
+                return 0.0
+        pool['pick_pace_bonus'] = pool.get('zone_4c','MIDDLE').apply(_zone_bonus).astype(float)
+        pool['pick_score_base'] = (pool['pick_score_base'] + pool['pick_pace_bonus']).astype(float)
+    else:
+        pool['pick_pace_bonus'] = 0.0
+
+    # === P_PLACE_EST_PRIORITY_WIDE_V1: slow-pace end-performance rear boost (lightweight) ===
+    # Goal: when pace is slow (S), keep at least some late-runner potential in the main line
+    # using only in-file columns (speed_max / speed_hist) without changing any market/EV gates.
+    try:
+        _sp_rear_enabled = bool(rules.get('slow_pace_rear_boost_enabled', True))
+    except Exception:
+        _sp_rear_enabled = True
+    try:
+        _sp_bonus = float(rules.get('slow_pace_rear_speed_bonus', 0.03) or 0.03)
+    except Exception:
+        _sp_bonus = 0.03
+
+    if _sp_rear_enabled and pace_key == 'S':
+        try:
+            zn = pool.get('zone_4c', 'MIDDLE').apply(normalize_zone_token)
+            rear_mask = zn.isin(['REAR', 'MIDDLE'])
+
+            # speed_max: numeric preferred
+            sm = _num_series(pool.get('speed_max', np.nan), index=pool.index)
+            if sm.notna().sum() > 1 and float(sm.max()) != float(sm.min()):
+                sm01 = (sm - float(sm.min())) / (float(sm.max()) - float(sm.min()))
+            else:
+                sm01 = pd.Series([0.0]*len(pool), index=pool.index)
+
+            # speed_hist: extract last numeric token if present (robust to strings)
+            sh_raw = pool.get('speed_hist', pd.Series([None]*len(pool), index=pool.index))
+            def _hist_last_num(x) -> Optional[str]:
+                """歴史データ x の文字列表現から末尾に現れる数値を float として返す。"""
+                try:
+                    s = str(x)
+                except Exception:
+                    return np.nan
+                nums = re.findall(r"[-+]?\d+\.?\d*", s)
+                if not nums:
+                    return np.nan
+                try:
+                    return float(nums[-1])
+                except Exception:
+                    return np.nan
+            sh = sh_raw.map(_hist_last_num)
+            sh = _num_series(sh, index=getattr(sh, 'index', None))
+            if sh.notna().sum() > 1 and float(sh.max()) != float(sh.min()):
+                sh01 = (sh - float(sh.min())) / (float(sh.max()) - float(sh.min()))
+            else:
+                sh01 = pd.Series([0.0]*len(pool), index=pool.index)
+
+            # Combine (clamped), then apply only to REAR/MIDDLE
+            perf01 = (0.7*sm01.fillna(0.0) + 0.3*sh01.fillna(0.0)).clip(lower=0.0, upper=1.0)
+            pool.loc[rear_mask, 'pick_score_base'] = (pool.loc[rear_mask, 'pick_score_base'] + _sp_bonus*perf01.loc[rear_mask]).astype(float)
+        except Exception:
+            pass
+
+    # R28: ワイド対抗スコア ペース別重み行列 (M/S)
+    try:
+        _wsm_enabled = bool(rules.get('wide_scoring_matrix_enabled', True))
+        _wsm = rules.get('wide_scoring_matrix', {})
+        if _wsm_enabled and pace_key in _wsm:
+            _pace_weights = dict(_wsm[pace_key] or {})
+            zn2 = pool.get('zone_4c', pd.Series(['MIDDLE'] * len(pool), index=pool.index)).apply(normalize_zone_token)
+            adj2 = zn2.map(lambda z: float(_pace_weights.get(z, 0.0))).fillna(0.0)
+            pool['pick_score_base'] = (pool['pick_score_base'] + adj2).astype(float)
+            pool['pick_pace_matrix_bonus'] = adj2
+        else:
+            pool['pick_pace_matrix_bonus'] = 0.0
+    except Exception:
+        pool['pick_pace_matrix_bonus'] = 0.0
+
+    # R28: 走法別上り評価 (差し馬補正)
+    try:
+        _rfb_enabled = bool(rules.get('rear_finish_bonus_enabled', True))
+        if _rfb_enabled and 'RunningStyleLabel' in pool.columns:
+            _rfb_top_n    = int(rules.get('rear_finish_top_n', 3))
+            _rfb_amount   = float(rules.get('rear_finish_bonus_amount', 0.04))
+            _mfb_top_n    = int(rules.get('middle_finish_top_n', 3))
+            _mfb_amount   = float(rules.get('middle_finish_bonus_amount', 0.02))
+            _rfb_hc_extra = float(rules.get('rear_finish_high_conf_extra', 0.02))
+            rsl = pool['RunningStyleLabel'].astype(str).str.upper()
+            # pred_last3f 順位 (ascending: 小さいほど速い = 上位)
+            pl = _num_series(pool.get('pred_last3f', pd.Series([np.nan]*len(pool), index=pool.index)), np.nan, index=pool.index)
+            pl_rank = pl.rank(method='min', ascending=True) if pl.notna().sum() > 1 else pd.Series([999]*len(pool), index=pool.index)
+            # REAR ボーナス
+            rear_top_mask = (rsl == 'REAR') & (pl_rank <= _rfb_top_n)
+            pool.loc[rear_top_mask, 'pick_score_base'] = (pool.loc[rear_top_mask, 'pick_score_base'] + _rfb_amount).astype(float)
+            # MIDDLE ボーナス
+            mid_top_mask  = (rsl == 'MIDDLE') & (pl_rank <= _mfb_top_n)
+            pool.loc[mid_top_mask, 'pick_score_base'] = (pool.loc[mid_top_mask, 'pick_score_base'] + _mfb_amount).astype(float)
+            # HIGH 確信度追加
+            if 'RunningStyleConf' in pool.columns:
+                rsc_high_mask = (pool['RunningStyleConf'].astype(str).str.upper() == 'HIGH') & rear_top_mask
+                pool.loc[rsc_high_mask, 'pick_score_base'] = (pool.loc[rsc_high_mask, 'pick_score_base'] + _rfb_hc_extra).astype(float)
+            pool['pick_rear_finish_bonus'] = 0.0
+            pool.loc[rear_top_mask, 'pick_rear_finish_bonus'] = _rfb_amount
+            pool.loc[mid_top_mask,  'pick_rear_finish_bonus'] = _mfb_amount
+        else:
+            pool['pick_rear_finish_bonus'] = 0.0
+    except Exception:
+        pool['pick_rear_finish_bonus'] = 0.0
+
+    return pool
+
+
+def _sworm_greedy_pick(
+    pool: 'pd.DataFrame',
+    rules: dict,
+    n_points: int,
+    pace_key: str,
+) -> list:
+    """ゾーン多様性ペナルティ付き greedy pick を実行し選択インデックスリストを返す。
+
+    scenario_split_enabled が True のとき pace_key に応じて REAR/FRONT を先行確保する。
+    """
+    # greedy pick with zone diversity penalty
+    picked_idx = []
+    zones = []
+    penalty = float(rules.get('zone_dup_penalty', 0.01))  # safety default
+
+    # pre-sort for speed
+    pool_sorted = pool.sort_values(['pick_score_base','pick_p01','pick_s01'], ascending=False).copy()
+
+    # --- dual-axis scenario split (Nakayama10R learning) ---
+    # When pace is uncertain, reserve a few main-line points for REAR/MIDDLE (差し受け)
+    # so that a late-runner winner does not get dropped from the main line.
+    try:
+        ss_enabled = bool(rules.get('scenario_split_enabled', False))
+    except Exception:
+        ss_enabled = False
+
+    try:
+        ss_when = rules.get('scenario_split_when_pace_in', ['H','M'])
+        if isinstance(ss_when, str):
+            ss_when = [ss_when]
+        ss_when = [str(x or '').upper().strip()[:1] for x in (ss_when or [])]
+    except Exception:
+        ss_when = ['H','M']
+
+    try:
+        ss_rear_min = int(rules.get('scenario_split_rear_min_points', 0) or 0)
+    except Exception:
+        ss_rear_min = 0
+    try:
+        ss_front_min = int(rules.get('scenario_split_front_min_points', 0) or 0)
+    except Exception:
+        ss_front_min = 0
+
+    ss_rear_min = max(0, min(int(ss_rear_min), int(n_points)))
+    ss_front_min = max(0, min(int(ss_front_min), int(n_points)))
+    if ss_rear_min + ss_front_min > int(n_points):
+        ss_front_min = max(0, int(n_points) - int(ss_rear_min))
+
+    def _z_norm(z: str) -> str:
+        """ゾーン文字列を normalize_zone_token で正規化トークンに変換する。"""
+        return normalize_zone_token(str(z or 'MIDDLE'))
+
+    if ss_enabled and (pace_key in (ss_when or [])) and (ss_rear_min + ss_front_min > 0):
+        # pre-pick by axis: rear first, then front
+        # NOTE: these are still filtered by market gates already applied above.
+        for idx, r in pool_sorted.iterrows():
+            if len(picked_idx) >= ss_rear_min:
+                break
+            zn = _z_norm(r.get('zone_4c', 'MIDDLE'))
+            if zn in ['REAR', 'MIDDLE']:
+                picked_idx.append(idx)
+                zones.append(zn)
+
+        for idx, r in pool_sorted.iterrows():
+            if len(picked_idx) >= ss_rear_min + ss_front_min:
+                break
+            if idx in picked_idx:
+                continue
+            zn = _z_norm(r.get('zone_4c', 'MIDDLE'))
+            if zn == 'FRONT':
+                picked_idx.append(idx)
+                zones.append(zn)
+
+        # remove pre-picked rows from further greedy filling
+        try:
+            pool_sorted = pool_sorted.drop(index=picked_idx)
+        except Exception:
+            pass
+
+
+    for _ in range(max(0, int(n_points) - len(picked_idx))):
+        best_i = None
+        best_sc = -1e18
+        for idx, r in pool_sorted.head(24).iterrows():
+            zc = str(r.get('zone_4c','MIDDLE')).upper().strip()
+            dup = sum(1 for zz in zones if zz == zc)
+            sc = float(r.get('pick_score_base', 0.0)) - penalty*dup
+            if sc > best_sc:
+                best_sc = sc
+                best_i = idx
+        if best_i is None:
+            break
+        picked_idx.append(best_i)
+        zones.append(str(pool_sorted.loc[best_i].get('zone_4c','MIDDLE')).upper().strip())
+        pool_sorted = pool_sorted.drop(index=best_i)
+
+    return picked_idx
+
+
+def _sworm_post_pick(
+    pool: 'pd.DataFrame',
+    picked_idx: list,
+    rules: dict,
+    n_points: int,
+    anchor_num: str,
+    df: 'pd.DataFrame',
+    params: dict,
+) -> tuple:
+    """選択後の後処理（place 枠・trio-plus 枠の差し替え）を行い最終タプルを返す。
+
+    Returns:
+        (out_df, reason_dict) – reason_dict['status'] は 'PASS' または 'SKIP'。
+    """
+    out = pool.loc[picked_idx].copy()
+    out = out.reset_index(drop=True)
+    out['pick_score'] = _num_series(out['pick_score_base'], index=out.index)
+
+    # === P_PLACE_EST_PRIORITY_WIDE_V1: force include a 2-place candidate (p_place_est priority) ===
+    # Policy: among the selected wide points, ensure at least one opponent is high on p_place_est_pct.
+    # This does NOT change market/EV gates; it only swaps within the already-eligible pool.
+    _swapped_for_place = False
+    try:
+        _ensure_place = bool(rules.get('ensure_place_candidate_in_wide', True))
+    except Exception:
+        _ensure_place = True
+
+    if _ensure_place and ('p_place_est_pct' in pool.columns) and (len(out) > 0):
+        try:
+            pool2 = pool.copy()
+            pool2['p_place_est_pct'] = _num_series(pool2.get('p_place_est_pct', np.nan), index=pool2.index)
+            pool2 = pool2[pool2['p_place_est_pct'].notna() & np.isfinite(pool2['p_place_est_pct'])].copy()
+            if len(pool2) > 0:
+                best_idx = pool2.sort_values(['p_place_est_pct', 'pick_score_base'], ascending=[False, False]).index[0]
+                best_num = str(pool2.loc[best_idx, 'num'])
+                out_nums = set(out['num'].astype(str).tolist())
+                if best_num not in out_nums:
+                    # replace the weakest pick_score with the best place candidate
+                    ps = _num_series(out.get('pick_score', np.nan), -1e9, index=out.index)
+                    worst_pos = int(ps.idxmin())
+                    best_row = pool.loc[best_idx]
+                    for c in out.columns:
+                        if c == 'pick_score':
+                            continue
+                        if c in best_row.index:
+                            out.loc[worst_pos, c] = best_row[c]
+                    out.loc[worst_pos, 'pick_score'] = float(best_row.get('pick_score_base', out.loc[worst_pos, 'pick_score']))
+                    _swapped_for_place = True
+        except Exception:
+            pass
+
+    # === ENSURE_TRIO_PLUS_IN_WIDE_V1: force include 'trio-plus' candidate in wide ===
+    # Policy: ワイド4点のうち1点は「連軸プラス推奨」枠（=三連複フォメ3頭目候補の最上位）から必ず採る。
+    # - trio-plus は build_trio_formation_from_wide の extras 最上位（B=ワイド相手、C=B+extras）で定義する。
+    # - ただし、候補はすでに pool（市場/EV等のゲート後）に存在する馬に限る。
+    # - ゲートは緩めない（pool内での入替のみ）。
+    _swapped_for_trio_plus = False
+    _trio_plus_num = ''
+    try:
+        _ensure_trio_plus = bool(rules.get('ensure_trio_plus_candidate_in_wide', True))
+    except Exception:
+        _ensure_trio_plus = True
+
+    if _ensure_trio_plus and (len(out) > 0):
+        try:
+            _b_now = [str(x) for x in out['num'].astype(str).tolist() if str(x)]
+            _form_tmp = build_trio_formation_from_wide(anchor_num=str(anchor_num), wide_opp_nums=_b_now, df=df, params=params)
+            _a = str(_form_tmp.get('a', '') or '')
+            _b = [str(x) for x in (_form_tmp.get('b', []) or []) if str(x)]
+            _c = [str(x) for x in (_form_tmp.get('c', []) or []) if str(x)]
+            _bset = set(_b)
+            _extras = [x for x in _c if x and (x != _a) and (x not in _bset)]
+            if _extras:
+                _trio_plus_num = str(_extras[0])
+        except Exception:
+            _trio_plus_num = ''
+
+        try:
+            if _trio_plus_num:
+                out_nums = set(out['num'].astype(str).tolist())
+                if _trio_plus_num not in out_nums:
+                    cand = pool[pool['num'].astype(str) == str(_trio_plus_num)].copy()
+                    if len(cand) > 0:
+                        # replace weakest pick_score
+                        ps = _num_series(out.get('pick_score', np.nan), -1e9, index=out.index)
+                        worst_pos = int(ps.idxmin())
+                        # choose best candidate row (should be single)
+                        cand = cand.sort_values(['pick_score_base','p_wide_model_pct','p_place_est_pct'], ascending=[False, False, False])
+                        best_row = cand.iloc[0]
+                        for c in out.columns:
+                            if c == 'pick_score':
+                                continue
+                            if c in best_row.index:
+                                out.loc[worst_pos, c] = best_row[c]
+                        out.loc[worst_pos, 'pick_score'] = float(best_row.get('pick_score_base', out.loc[worst_pos, 'pick_score']))
+                        _swapped_for_trio_plus = True
+        except Exception:
+            pass
+
+
+    if len(out) < n_points:
+        return (
+            out,
+            {'status': 'SKIP', 'reason': f'cannot_build_{n_points}_points_after_greedy: {len(out)}/{n_points}'},
+        )
+
+    reason = 'rule_ok_flow4'
+    try:
+        if 'P_PLACE_EST_PRIORITY_WIDE_V1' and _swapped_for_place:
+            reason = reason + '+place_est_slot'
+        if _swapped_for_trio_plus:
+            reason = reason + '+trio_plus_slot'
+    except Exception:
+        pass
+    return out, {'status': 'PASS', 'reason': reason, 'trio_plus_num': str(_trio_plus_num or '')}
+
+
+def select_wide_opponents_rulemode(
+    df: pd.DataFrame,
+    anchor_num: str,
+    p_wide_est_pct: pd.Series,
+    p_wide_low_pct: Optional[pd.Series],
+    wide_market_df: Optional[pd.DataFrame],
+    params: Optional[dict],
+    rules: Optional[dict] = None,
+    meta: Optional[Dict[str, str]] = None,
+    pair_model_bundle: Optional[PairModelBundle] = None,
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """ワイド相手選定オーケストレータ。
+
+    元の 606 行関数を 7 つのサブ関数に委譲する薄いオーケストレータ。
+    サブ関数: _sworm_init_pool, _sworm_pair_override, _sworm_apply_gates,
+              _sworm_compute_scores, _sworm_pace_adjust, _sworm_greedy_pick,
+              _sworm_post_pick。
+
+    [BUG-FIX v13] pace_key が元関数で未定義だった問題を _sworm_init_pool 内で修正済み。
+    """
+    params = params or DEFAULT_PARAMS
+    rules = rules or {}
+
+    # 1. 候補プール初期化（pace_key の抽出も含む）
+    pool, d, n_points, min_all, max_all, w_p, w_s, w_o, pace_key = _sworm_init_pool(
+        df, anchor_num, p_wide_est_pct, p_wide_low_pct, params, rules, meta
+    )
+
+    # 2. Pair ML モデルによる確率上書き
+    pool = _sworm_pair_override(pool, d, anchor_num, pair_model_bundle)
+
+    # 3. ゲート適用（SKIP 早期リターンの可能性あり）
+    pool, n_points, _skip = _sworm_apply_gates(pool, rules, n_points, max_all)
+    if _skip is not None:
+        return _skip
+
+    # 4. スコア計算
+    pool = _sworm_compute_scores(pool, params, rules, meta, w_p, w_s, w_o)
+
+    # 5. ペース調整
+    pool = _sworm_pace_adjust(pool, rules, pace_key)
+
+    # 5b. R40: スタイル互換性ボーナス（zone_4c ベースの軸×相手互換性）
+    try:
+        _style_enabled = bool(rules.get('style_compat_bonus_enabled', True))
+        if _style_enabled and 'zone_4c' in pool.columns:
+            anchor_rows = df[df['num'].astype(str) == str(anchor_num)]
+            if len(anchor_rows):
+                anchor_dict_for_compat = anchor_rows.iloc[0].to_dict()
+                pool['pick_style_compat_bonus'] = pool.apply(
+                    lambda r: _r40_style_compat_bonus(anchor_dict_for_compat, r.to_dict(), params),
+                    axis=1
+                ).astype(float)
+                pool['pick_score_base'] = (pool['pick_score_base'] + pool['pick_style_compat_bonus']).astype(float)
+            else:
+                pool['pick_style_compat_bonus'] = 0.0
+        else:
+            pool['pick_style_compat_bonus'] = 0.0
+    except Exception:
+        pool['pick_style_compat_bonus'] = 0.0
+
+    # 6. Greedy pick
+    picked_idx = _sworm_greedy_pick(pool, rules, n_points, pace_key)
+
+    # 7. 後処理（place 枠 / trio-plus 枠 swap + 最終 return）
+    return _sworm_post_pick(pool, picked_idx, rules, n_points, anchor_num, df, params)
+
+
+
+
+
+
+
+
+
+
+
+def md_table(df: pd.DataFrame, cols: List[str], float_cols: Optional[List[str]] = None) -> str:
+    """指定列を Markdown テーブル文字列に変換して返す。"""
+    d = df.copy()
+    float_cols = float_cols or []
+    for c in float_cols:
+        if c in d.columns:
+            d[c] = _num_series(d[c], index=d.index).map(lambda x: '' if pd.isna(x) else f'{x:.2f}')
+    return d[cols].to_markdown(index=False)
+
+
+
+# =========================
+# 4) I/O
+# =========================
+
+def load_entries_from_csv(path: str) -> pd.DataFrame:
+    """出走馬 CSV を DataFrame として読み込む。"""
+    return pd.read_csv(path)
+
+
+def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """列名の空白をトリムし、標準化した DataFrame を返す。"""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    rename = {
+        "馬番": "num",
+        "番号": "num",
+        "#": "num",
+        "馬名": "name",
+        "名前": "name",
+        "3C": "zone_3c",
+        "3c": "zone_3c",
+        "4C": "zone_4c",
+        "4c": "zone_4c",
+        "レーティング": "rating",
+        "最高速": "speed_max",
+        "指数履歴": "speed_hist",
+        # ファクター印（媒体によって列名がブレる）
+        "道悪": "michiaku",
+        "馬場": "michiaku",
+        "ダート": "dirt",
+        "コース": "course",
+        "距離": "distance",
+        "前走": "last",
+        "調教": "training",
+        "実績": "record",
+        # market (optional)
+        # R24: 昇級点列（IMP-5 ClassUpBonus 用）
+        '昇級点':    'class_up_point',
+        'class_up': 'class_up_point',
+        'ClassUp':  'class_up_point',
+        '昇級指数': 'class_up_point',
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    if "zone_3c" in df.columns:
+        df["zone_3c"] = df["zone_3c"].apply(normalize_zone_token)
+    if "zone_4c" in df.columns:
+        df["zone_4c"] = df["zone_4c"].apply(normalize_zone_token)
+
+    return df
+
+
+
+
+
+
+
+
+def _bam_init_params(params, place_model_bundle, pair_model_bundle, meta) -> dict:
+    """params を validate・wide/place モードを rules に強制して返す。"""
+    try:
+        params = _apply_auto_thresholds_from_bundles(params or DEFAULT_PARAMS, place_model_bundle, pair_model_bundle)
+    except Exception:
+        params = params or DEFAULT_PARAMS
+    params = validate_params(params or DEFAULT_PARAMS)
+    params['wide_mode'] = 'rules'
+    params['place_mode'] = 'rules'
+    # meta.pace is uncertain info; if missing/invalid, treat as 'M' without failing.
+    pace = str((meta or {}).get('pace', 'M') or 'M')
+    if pace.upper().strip() not in ['H','M','S']:
+        pace = 'M'
+    bias = (meta or {}).get('bias', 'Unknown')
+    map_summary = (meta or {}).get('map_summary', 'Unknown')
+
+    out = ''
+    out += '# STELLA v1.18 RULES-ONLY (LITE) + PLACE-ISO (AUTOFEATURE) 予想\n\n'
+    return params
+
+
+def _bam_section_header(meta: dict, race: str, pace: str, bias: str, map_summary: str) -> str:
+    """入力バリデーション要約 + 絶対厳守ルール文 + レース情報ヘッダーを Markdown 文字列で返す。"""
+    out = ''
+    # INPUT_VALIDATION_V1: always show data health summary
+    try:
+        out += '## 入力バリデーション（自動）\n'
+        out += f"- entries_rows={meta.get('validation_entries_rows','')} -> valid_rows={meta.get('validation_rows_after_drop_invalid_num','')}\n"
+        out += f"- unique_nums={meta.get('validation_unique_nums','')} / duplicates_removed={meta.get('validation_duplicates_removed','')}\n"
+        if str(meta.get('validation_warnings','')).strip():
+            out += f"- warnings: {meta.get('validation_warnings','')}\n"
+        out += f"- fatal={meta.get('validation_fatal','0')} reason={meta.get('validation_reason','')}\n\n"
+    except Exception:
+        pass
+    out += '\n'.join([
+        '## 絶対厳守ルール（確定 / 上書き保存）',
+        '買い目は『複勝・ワイド・三連複フォーメーション』の3本立て（出力セクションは必ず3つ用意する）。',
+        '買い目（絶対厳守 / 必ず出力・必ず作成）:',
+        '- 複勝：◎（1点）',
+        '- ワイド：◎軸流し4点以内',
+        '- 三連複：フォーメーション（画像パターン30点 / 2頭目はワイド4点そのもの固定）',
+        '- 市場データ（市場等）は予想ロジックに反映しない（p_place_mkt/Market*Fit/市場ガード等は無効）',
+        '',
+        '市場データ（市場等）は【ロジックにも表示にも一切含めない】（純粋データのみで予想を作成）。',
+        '',
+        '0. 予想時の確率サマリ出力（必須）',
+        '予想実行時、標準出力（console）に以下を必ず出すこと。',
+        '- ◎の複勝率：p_place_est=XX.X%（0.0–100.0、小数1位）',
+        '- ワイド（選定点）のヒット率：P(hit)=XX.X%、P_low=XX.X%（小数1位）',
+        '- ワイド合成ヒット率（どれか当たる）：P_any=XX.X%、P_any_low=XX.X%（小数1位、独立近似である旨も明記）',
+        '',
+        '1.◎の複勝率表示（必須）',
+        '◎の複勝率が「XX.X%（0.0-100.0%範囲、小数1位）」で出ていること。',
+        '',
+        '2.ワイド推奨（4点以内 / 絶対厳守ルール）',
+        'ワイドは「4点以内」を厳守（市場データは使わない）。',
+        '',
+        '3.三連複フォーメーション（30点以内 / 画像パターン30点）',
+        '1頭目=◎ / 2頭目=連軸（ワイド推奨馬を固定） / 3頭目=（2頭目）+追加推奨馬（画像パターンの点数<=30まで）',
+        '三連複は【1点=100円の均等買い】で、点数で調整する（厚張りしない）。',
+        '',
+        '4.安全ルール適用範囲',
+        '安全ルール（見送り判定などのゲート）は「複勝」のみに適用する。ワイドは下限ゲートなしで「4点以内」を満たす。',
+    ]) + '\n\n'
+
+
+
+    if race:
+        out += f'- race: {race}\n'
+    out += f'- pace: {pace}\n- bias: {bias}\n- map_summary: {map_summary}\n\n'
+
+
+
+
+    # -------------------------
+    # 調教（keibabook）サマリ：全体時計+終い（表示は監査用）
+    # -------------------------
+    return out
+
+def _bam_section_training_auto(df, params: dict) -> str:
+    """調教スコアテーブルと自動閾値採用結果を Markdown 文字列で返す。"""
+    out = ''
+    try:
+        if 'TrainingScore' in df.columns:
+            tmp = df[['num','name','TrainingScore','TrainingRank','delta_train','t4_latest','t3_latest','t1_latest','course_latest','load_latest','pair_latest']].copy()
+            for c in ['TrainingScore','delta_train','t4_latest','t3_latest','t1_latest']:
+                tmp[c] = _num_series(tmp[c], index=tmp.index)
+            tmp = tmp.sort_values(['TrainingScore','delta_train'], ascending=[False, False])
+            out += '## 調教スコア（keibabook：全体時計+終い）\n'
+            out += '※ 市場データ（市場等）は一切不使用。調教は相対正規化でSAS/AnchorScoreに最大±3点で反映。\n\n'
+            out += '|馬番|馬名|Rank|TrainingScore|Δtrain|最新4F|最新3F|最新1F|コース|負荷|併せ|\n|---:|---|---:|---:|---:|---:|---:|---:|---|---|---|\n'
+            for _, r in tmp.iterrows():
+                n = str(r.get('num',''))
+                nm = str(r.get('name',''))
+                ts = r.get('TrainingScore', float('nan'))
+                dt = r.get('delta_train', float('nan'))
+                t4 = r.get('t4_latest', float('nan'))
+                t3 = r.get('t3_latest', float('nan'))
+                t1 = r.get('t1_latest', float('nan'))
+                rk = r.get('TrainingRank', float('nan'))
+                course = str(r.get('course_latest','') or '')
+                load = str(r.get('load_latest','') or '')
+                pair = str(r.get('pair_latest','') or '')
+                out += f"|{n}|{nm}|{(int(rk) if rk==rk else 999)}|{(ts if ts==ts else float('nan')):.1f}|{(dt if dt==dt else float('nan')):.2f}|{(t4 if t4==t4 else float('nan')):.1f}|{(t3 if t3==t3 else float('nan')):.1f}|{(t1 if t1==t1 else float('nan')):.1f}|{course}|{load}|{pair}|\n"
+            out += '\n'
+    except Exception:
+        pass
+
+    # -------------------------
+    # Auto-threshold adoption summary
+    # -------------------------
+    try:
+        pr0 = (params.get('place_rules', {}) or {})
+        wr0 = (params.get('wide_rules', {}) or {})
+        at_place = pr0.get('_auto_threshold', None)
+        at_wide = wr0.get('_auto_threshold', None)
+
+        def _fmt_metric_best(best: dict) -> str:
+            """best メトリクス辞書（youden/fbeta2 キー）を整形して可読な文字列を返す。"""
+            try:
+                y = (best.get('youden', {}) or {})
+                f = (best.get('fbeta2', {}) or {})
+                ty, sy = float(y.get('t', float('nan'))), float(y.get('score', float('nan')))
+                tf, sf = float(f.get('t', float('nan'))), float(f.get('score', float('nan')))
+                return ty, sy, tf, sf
+            except Exception:
+                return float('nan'), float('nan'), float('nan'), float('nan')
+
+        out += '## 自動閾値（auto）採用結果\n'
+
+        # Place
+        if isinstance(at_place, dict):
+            best = at_place.get('metric_best', {}) or {}
+            ty, sy, tf, sf = _fmt_metric_best(best)
+            sel = at_place.get('selected', pr0.get('min_p_place_est', ''))
+            out += '### 複勝（Place）\n'
+            out += '|項目|値|\n|---|---:|\n'
+            out += f"|Youden 最適 t|{ty:.4f}|\n"
+            out += f"|Youden スコア|{sy:.4f}|\n"
+            out += f"|Fβ(β=2) 最適 t|{tf:.4f}|\n"
+            out += f"|Fβ(β=2) スコア|{sf:.4f}|\n"
+            out += f"|採用戦略|{str(at_place.get('strategy',''))}|\n"
+            out += f"|採用 min_p_place_est|{float(sel):.4f}|\n\n"
+        else:
+            out += '### 複勝（Place）\n- auto: 未使用（min_p_place_est は固定値）\n\n'
+
+        # Wide
+        if isinstance(at_wide, dict):
+            best = at_wide.get('metric_best', {}) or {}
+            ty, sy, tf, sf = _fmt_metric_best(best)
+            selp = at_wide.get('selected_prob', None)
+            selpct = at_wide.get('selected_pct', wr0.get('min_p_wide_model_pct', ''))
+            out += '### ワイド（Wide / Pair）\n'
+            out += '|項目|値|\n|---|---:|\n'
+            out += f"|Youden 最適 t|{ty:.4f}|\n"
+            out += f"|Youden スコア|{sy:.4f}|\n"
+            out += f"|Fβ(β=2) 最適 t|{tf:.4f}|\n"
+            out += f"|Fβ(β=2) スコア|{sf:.4f}|\n"
+            out += f"|採用戦略|{str(at_wide.get('strategy',''))}|\n"
+            if selp is not None:
+                out += f"|採用確率 t|{float(selp):.4f}|\n"
+            out += f"|採用 min_p_wide_model_pct（提案）|{float(selpct):.2f}%|\n"
+            out += f"|min_p_wide_model_pct（安全ゲート後）|{float(wr0.get('min_p_wide_model_pct', 0.0) or 0.0):.2f}%|\n\n"
+            out += '- 注：wide_rules は安全ゲートにより 8.0% 未満を指定できません（最終値は丸められます）。\n\n'
+        else:
+            out += '### ワイド（Wide / Pair）\n- auto: 未使用（min_p_wide_model_pct は固定値）\n\n'
+
+    except Exception:
+        pass
+
+    return out
+
+def _bam_section_anchor_place(df, params: dict) -> dict:
+    """アンカー馬を選定し、複勝ルール判定と出力テキストを生成して辞書で返す。
+
+    Returns:
+        Dict with keys: out, anchor, place_ok, p_place_pct, p_place,
+        _p_low_pct, stake_place, min_p_place, min_p_low, _cf, _ctags, _cshort.
+    """
+    out = ''
+    anchor = select_anchor(df, params=params)
+    score_col = str(params.get('anchor_score_col', 'AnchorScore'))
+    score_mode = str(params.get('anchor_score_mode', 'mul'))
+
+    # --- place rules ---
+    place_rule = params.get('place_rules', {}) or {}
+    stake_place = int(place_rule.get('stake_place', 1000) or 1000)
+    min_p_place = float(place_rule.get('min_p_place_est', 0.26) or 0.26)
+    min_place_market = 0.0  # PURE_DATA: market gate removed
+
+    p_place_pct = float(anchor.get('p_place_est_pct', float('nan')))
+    # strict: clamp for display and gating
+    # ABSOLUTE: even when missing/NaN, force a displayable value (0.0–100.0)
+    try:
+        p_place_pct = float(np.clip(p_place_pct, 0.0, 100.0)) if np.isfinite(float(p_place_pct)) else 0.0
+    except Exception:
+        p_place_pct = 0.0
+    p_place = p_place_pct / 100.0
+
+    place_market_min = None  # NO-MARKET
+    try:
+        place_market_min = float(place_market_min) if place_market_min is not None and np.isfinite(float(place_market_min)) else None
+    except Exception:
+        place_market_min = None
+
+    # 複勝は『◎の的中率が最も高い馬』を1点で買う（市場に左右されない / 絶対厳守）
+    # INPUT_VALIDATION_V2: hit-rate maximize -> require both mean and conservative low bound (if configured)
+    min_p_low = 0.0
+    try:
+        min_p_low = float(place_rule.get('min_p_place_low', 0.0) or 0.0)
+    except Exception:
+        min_p_low = 0.0
+    p_low = float('nan')
+    try:
+        p_low = float(anchor.get('p_place_low', float('nan')))
+    except Exception:
+        p_low = float('nan')
+    place_ok = bool(np.isfinite(p_place) and (float(p_place) >= float(min_p_place)))
+    if min_p_low > 0.0:
+        place_ok = bool(place_ok and np.isfinite(p_low) and (float(p_low) >= float(min_p_low)))  # PURE_DATA
+
+    # ===== R40: 信頼度フィルター（Place Confidence Filter）=====
+    _r40_conf = {}
+    _r40_skip_reason = ''
+    try:
+        _r40_conf = _r40_place_confidence_level(anchor, df, params)
+        cf_enabled = bool(place_rule.get('confidence_filter_enabled', True))
+        if cf_enabled and place_ok:
+            if _r40_conf.get('level') == 'LOW':
+                place_ok = False
+                _r40_skip_reason = f"信頼度LOW（{'; '.join(_r40_conf.get('reasons', []))}）"
+    except Exception:
+        pass
+
+
+    out += f"## ◎ {anchor['num']}.{anchor['name']}（複勝率(p_place_est_pct)最大で選定 / 絶対厳守）\n"
+    # ABSOLUTE: always print Place hit-rate field (user-visible rule)
+    out += f"- 複勝率（表示必須）: {p_place_pct:.1f}%\n"
+    out += f"- p_place_est={p_place_pct:.1f}% (0.0–100.0%)\n"
+    # R40: 信頼度レベル表示
+    try:
+        if _r40_conf:
+            _conf_level = _r40_conf.get('level', 'LOW')
+            _conf_gap = _r40_conf.get('score_gap', None)
+            _gap_str = f"{_conf_gap:.2f}pt" if _conf_gap is not None else "n/a"
+            _conf_emoji = {'HIGH': '🟢', 'MEDIUM': '🟡', 'LOW': '🔴'}.get(_conf_level, '⚪')
+            out += f"- 信頼度（R40）: {_conf_emoji} {_conf_level}（スコアギャップ={_gap_str}）\n"
+            if _r40_skip_reason:
+                out += f"- 複勝 SKIP追加理由: {_r40_skip_reason}\n"
+    except Exception:
+        pass
+    out += '\n'
+
+    # COMMENT display (PUREDATA)
+    try:
+        _cf = float(anchor.get('CommentFit', 50.0)) if anchor is not None else 50.0
+    except Exception:
+        _cf = 50.0
+    try:
+        _cshort = str(anchor.get('comment_short','') or '')
+    except Exception:
+        _cshort = ''
+    try:
+        _ctags = str(anchor.get('comment_tags','') or '')
+    except Exception:
+        _ctags = ''
+
+    if _cshort.strip() or _ctags.strip():
+        out += '### コメント（厩舎/前走インタビュー反映）\n'
+        out += f"- コメント評価(CommentFit): {_cf:.0f}/100\n"
+        if _ctags.strip():
+            out += f"- 要点: {_ctags}\n"
+        if _cshort.strip():
+            out += f"- 本文抜粋: {_cshort}\n"
+        out += '\n'
+
+
+    # NO-MARKET: 複勝の詳細分析（市場比較）は表示しない
+    out += '## 複勝（絶対厳守ルール）\n'
+    # 表形式で出力
+    out += '|判定|買い目|P(place)%|P_low%|stake|\n'
+    out += '|---|---|---:|---:|---:|' + '\n'
+
+    _p_low_pct = ''
+    try:
+        if anchor.get('p_place_low', None) is not None and np.isfinite(float(anchor.get('p_place_low'))):
+            _p_low_pct = f"{float(anchor.get('p_place_low'))*100.0:.1f}"
+    except Exception:
+        _p_low_pct = ''
+
+    # PURE_DATA: ev_place（市場依存）表示/計算は削除
+    # PURE_DATA: place_market 表示は削除
+    _judge = 'BUY' if place_ok else 'SKIP'
+    _bet = f"◎ {anchor['num']}.{anchor['name']}"
+    out += f"|{_judge}|複勝 {_bet}|{p_place_pct:.1f}|{_p_low_pct}|{stake_place}|\n\n"
+
+    if not place_ok:
+        out += f"- 複勝: 見送り理由（主ゲート）: p_place_est>= {min_p_place}\n"
+        try:
+            if float(min_p_low) > 0.0:
+                out += f"- 複勝: 見送り理由（下限ゲート）: p_place_low>= {float(min_p_low):.2f}\n"
+        except Exception:
+            pass
+        if _r40_skip_reason:
+            out += f"- 複勝: 見送り理由（R40信頼度フィルター）: {_r40_skip_reason}\n"
+        out += '\n'
+
+    # --- wide ---
+    return dict(
+        out=out, anchor=anchor, place_ok=place_ok,
+        p_place_pct=p_place_pct, p_place=p_place, _p_low_pct=_p_low_pct,
+        stake_place=stake_place, min_p_place=min_p_place, min_p_low=min_p_low,
+        _cf=_cf, _ctags=_ctags, _cshort=_cshort,
+        confidence_level=_r40_conf.get('level', 'LOW') if _r40_conf else None,
+        confidence_score_gap=_r40_conf.get('score_gap') if _r40_conf else None,
+    )
+
+def _bam_prepare_wide(df, params: dict, anchor: dict,
+                      pair_model_bundle, wide_market_df,
+                      analysis_cache, p_place: float) -> dict:
+    """ワイド相手候補確率を計算し、ルールモード選択と表示候補を返す。
+
+    Returns:
+        Dict with keys: opps, opps_display, rule_info, wr, _thr_skip.
+    """
+    wr = params.get('wide_rules', {}) or {}
+
+    if pair_model_bundle is not None:
+        # ML p_pair/p_low を selector で上書きする（ここではダミー）
+        p_mean_pct = pd.Series([np.nan]*len(df), index=df.index, name='p_wide_est_pct')
+        p_low_pct = pd.Series([np.nan]*len(df), index=df.index, name='p_wide_low_pct')
+    else:
+        _wc = analysis_cache or {}
+        if _wc.get('wide_p_mean_pct') is not None and _wc.get('wide_p_low_pct') is not None:
+            p_mean_pct = _wc.get('wide_p_mean_pct')
+            p_low_pct = _wc.get('wide_p_low_pct')
+        else:
+            p_mean_pct, p_low_pct = compute_p_wide_vs_anchor_runs(
+        df,
+        anchor_num=str(anchor['num']),
+        n_runs=int(wr.get('p_low_n_runs', 7) or 7),
+        n_samples=int(wr.get('p_low_n_samples', 8000) or 8000),
+        seed0=int(wr.get('p_low_seed0', 101) or 101),
+        q_low=float(wr.get('p_low_quantile', 0.05) or 0.05),
+        params=params,
+        )
+            # SPEED_OPT: store wide fallback estimates into analysis_cache for reuse
+            try:
+                if isinstance(analysis_cache, dict):
+                    analysis_cache['wide_p_mean_pct'] = p_mean_pct
+                    analysis_cache['wide_p_low_pct'] = p_low_pct
+            except Exception:
+                pass
+    # optional: skip wide if anchor is too weak (to avoid total collapse)
+    try:
+        _thr_skip = float(wr.get('skip_wide_if_anchor_p_place_lt', 0.0) or 0.0)
+    except Exception:
+        _thr_skip = 0.0
+    if _thr_skip > 0.0 and (p_place is not None) and (float(p_place) < float(_thr_skip)):
+        opps = pd.DataFrame(columns=['num','name','wide_market_text','wide_market_min','wide_market_max','wide_market_mid','wide_market','pick_score'])
+        rule_info = {'status':'SKIP', 'reason': f'skip_by_anchor_p_place<{_thr_skip:.3f}'}
+    else:
+
+        opps, rule_info = select_wide_opponents_rulemode(
+            df,
+            anchor_num=str(anchor['num']),
+            p_wide_est_pct=p_mean_pct,
+            p_wide_low_pct=p_low_pct,
+            wide_market_df=wide_market_df,
+            params=params,
+            rules=params.get('wide_rules', None),
+            meta=meta,
+            pair_model_bundle=pair_model_bundle,
+        )
+
+
+    # ALWAYS_DISPLAY_WIDE_V1: even when rules say SKIP, still display up to 4 wide candidates.
+    # - PASS時: opps（ルール合格した推奨）を使う
+    # - SKIP時: MC推定(p_wide_est_pct/p_wide_low_pct)上位から最大4点を表示（stake=0）
+    opps_display = opps
+    try:
+        if opps_display is None or len(opps_display) == 0:
+            wr0 = (params.get('wide_rules', {}) or {})
+            n_points0 = int(wr0.get('n_points', 4) or 4)
+            dtmp = df.copy()
+            dtmp['num'] = dtmp['num'].astype(str)
+            dtmp = dtmp[dtmp['num'] != str(anchor.get('num',''))].copy()
+            # attach MC estimates (index aligned)
+            try:
+                dtmp['p_wide_est_pct'] = _num_series(p_mean_pct, index=dtmp.index)
+            except Exception:
+                dtmp['p_wide_est_pct'] = np.nan
+            try:
+                dtmp['p_wide_low_pct'] = _num_series(p_low_pct, index=dtmp.index)
+            except Exception:
+                dtmp['p_wide_low_pct'] = np.nan
+            dtmp['pick_score'] = _num_series(dtmp.get('p_wide_est_pct', 0.0), 0.0, index=dtmp.index)
+            dtmp['p_wide_low_pct'] = _num_series(dtmp.get('p_wide_low_pct', 0.0), 0.0, index=dtmp.index)
+            opps_display = dtmp.sort_values(['pick_score','p_wide_low_pct','num'], ascending=[False, False, True]).head(max(0, n_points0)).reset_index(drop=True)
+    except Exception:
+        opps_display = opps
+
+
+    # -------------------------
+    return dict(
+        opps=opps, opps_display=opps_display,
+        rule_info=rule_info, wr=wr, _thr_skip=_thr_skip,
+    )
+
+def _bam_apply_senkyo_chui_tilt(tilt: float, meta: dict, wr_ft: dict) -> float:
+    """R22: meta.bias 等に「先行注意」が含まれる場合、tilt を boost する。
+
+    先行注意 = 逃げ先行馬が注意 → スロー→ 末脚有利のシナリオ重みを上げる。
+    実効値: min(tilt + boost, 0.40) でクランプ。
+    """
+    try:
+        _boost_raw = (wr_ft or {}).get('senkyo_chui_tilt_boost', 0.15)
+        boost = float(_boost_raw if _boost_raw is not None else 0.15)
+        if boost <= 0.0:
+            return tilt
+        _bias       = str((meta or {}).get('bias', '') or '')
+        _map_summary= str((meta or {}).get('map_summary', '') or '')
+        _course_info= str((meta or {}).get('course_info', '') or '')
+        _combined   = ' '.join([_bias, _map_summary, _course_info])
+        if '先行注意' in _combined or 'センコウチュウイ' in _combined.upper():
+            new_tilt = min(float(tilt) + boost, 0.40)
+            return new_tilt
+    except Exception:
+        pass
+    return tilt
+
+
+# R22: ペースシナリオ（M/S）別 ゾーンスコアリングマトリクス
+# ペースが M（ミドル）の場合: FRONT+2, MIDDLE+2, REAR+0（差し不利）
+# ペースが S（スロー）の場合: FRONT+4, MIDDLE+1, REAR-1（逃げ先行有利）
+_PACE_SCENARIO_MATRIX = {
+    'M': {'FRONT': 2.0, 'MIDDLE': 2.0, 'REAR': 0.0},
+    'S': {'FRONT': 4.0, 'MIDDLE': 1.0, 'REAR': -1.0},
+    'H': {'FRONT': -1.0, 'MIDDLE': 2.0, 'REAR': 3.0},  # ハイペース: 差し・追込有利
+    'DEFAULT': {'FRONT': 0.0, 'MIDDLE': 0.0, 'REAR': 0.0},
+}
+
+def _bam_abc_scenario_scores(dI, tilt: float, front_count: int,
+                             pace_label: str = 'M') -> tuple:
+    """ペース別（slow / close）スコアを dI に付与し、union 馬番リストを返す。
+
+    Args:
+        dI: アンカーを除いた馬 DataFrame。
+        tilt: ペース傾き係数。
+        front_count: FRONT ゾーン馬の頭数。
+        pace_label: ペースラベル（'H', 'M', 'S'）。R22追加。
+    Returns:
+        (dI, order_base, order_slow, order_close): スコア列追加済み dI と各ソートリスト。
+    """
+    slow_tilt  = float(tilt) * (1.0 if int(front_count) <= 1 else 0.5)
+    close_tilt = float(tilt) * (1.2 if int(front_count) >= 2 else 1.0)
+
+    # R22: ペースシナリオ別マトリクスボーナス
+    _pace_key = str(pace_label or 'M').upper().strip()
+    _psm = _PACE_SCENARIO_MATRIX.get(_pace_key, _PACE_SCENARIO_MATRIX['DEFAULT'])
+
+    def _slow_bonus(z: str) -> float:
+        """ゾーントークンに応じたスロー展開ボーナスを返す（FRONT=高, REAR=低）。"""
+        zz = str(z).upper()
+        if 'FRONT' in zz:
+            return 20.0 * slow_tilt
+        if 'MIDDLE' in zz:
+            return 10.0 * slow_tilt
+        return 0.0
+
+    def _close_bonus(z: str) -> float:
+        """ゾーントークンに応じたクロージングボーナスを返す（REAR=高, FRONT=低）。"""
+        zz = str(z).upper()
+        if 'REAR' in zz:
+            return 20.0 * close_tilt
+        if 'MIDDLE' in zz:
+            return 10.0 * close_tilt
+        return 0.0
+
+    def _pace_matrix_bonus(z: str) -> float:
+        """R22: ペースシナリオ別マトリクスに基づくゾーンボーナス。"""
+        zz = str(z).upper()
+        if 'FRONT' in zz:
+            return float(_psm.get('FRONT', 0.0))
+        if 'MIDDLE' in zz:
+            return float(_psm.get('MIDDLE', 0.0))
+        if 'REAR' in zz:
+            return float(_psm.get('REAR', 0.0))
+        return 0.0
+
+    z4 = dI.get('zone_4c', pd.Series([''] * len(dI))).astype(str)
+    dI['_slow_bonus']  = z4.map(_slow_bonus).astype(float)
+    dI['_close_bonus'] = z4.map(_close_bonus).astype(float)
+    dI['_pace_matrix_bonus'] = z4.map(_pace_matrix_bonus).astype(float)  # R22
+    dI['_score_base']  = dI['SAS']
+    dI['_score_slow']  = dI['SAS'] + dI['_slow_bonus']  + 0.05 * dI['PosFit']
+    dI['_score_close'] = dI['SAS'] + dI['_close_bonus'] + 0.05 * dI['PosFit']
+    # R22: ペースシナリオ別スコア（_score_base に matrix ボーナスを重畳）
+    dI['_score_pace']  = dI['SAS'] + dI['_pace_matrix_bonus'] + 0.03 * dI['PosFit']
+
+    order_base  = dI.sort_values(['_score_base',  'num'], ascending=[False, True])['num'].astype(str).values.tolist()
+    order_slow  = dI.sort_values(['_score_slow',  'num'], ascending=[False, True])['num'].astype(str).values.tolist()
+    order_close = dI.sort_values(['_score_close', 'num'], ascending=[False, True])['num'].astype(str).values.tolist()
+    # R22: pace_matrix ソート順も返す
+    order_pace  = dI.sort_values(['_score_pace',  'num'], ascending=[False, True])['num'].astype(str).values.tolist()
+    return dI, order_base, order_slow, order_close, order_pace
+
+
+
+def _bam_fp_apply_distance_neg_penalty(dI: "pd.DataFrame") -> "pd.DataFrame":
+    """R20: DistanceCommentRisk が閾値超の馬の _pwide_low_pct / _pwide_mean_pct に -40% ペナルティを適用する。
+
+    距離ネガコメント（「1800メートルあたりが良い」等）が検出された馬は
+    ワイド同時入着確率を下方修正して選出されにくくする。
+    閾値: DistanceCommentRisk >= 1.5 (neg_hits * 2.2 換算で 1 hit = 2.2)
+    """
+    DIST_PENALTY_RATE = 0.6   # -40%
+    DIST_RISK_THRESHOLD = 1.5  # DistanceCommentRisk の閾値
+    try:
+        dcr = _num_series(dI.get('DistanceCommentRisk', 0.0), 0.0, index=dI.index)
+        mask = dcr >= DIST_RISK_THRESHOLD
+        if mask.any():
+            for col in ['_pwide_low_pct', '_pwide_mean_pct']:
+                if col in dI.columns:
+                    dI.loc[mask, col] = (
+                        dI.loc[mask, col].astype(float) * DIST_PENALTY_RATE
+                    )
+    except Exception:
+        pass
+    return dI
+
+def _bam_abc_rank_pick(dI, anchor_num: str,
+                       order_base, order_slow, order_close,
+                       pace_union_enabled: bool, topk: int,
+                       p_mean_pct, p_low_pct,
+                       order_pace=None) -> tuple:  # R22: order_pace 追加
+    """ペース union / hit-rate 優先ソートで dU と A の初期リストを返す。
+
+    R22追加: order_pace（シナリオ別スコアリングマトリクス順）を union に加味。
+    """
+    union: list = []
+    _order_pace = order_pace or []
+    if pace_union_enabled:
+        # R22: order_pace も union に加える（上位 topk のみ）
+        for x in (order_base[:topk] + order_slow[:topk] + order_close[:topk] + _order_pace[:topk]):
+            xs = str(x)
+            if xs and xs != anchor_num and xs not in union:
+                union.append(xs)
+        for x in order_base:
+            xs = str(x)
+            if xs and xs != anchor_num and xs not in union:
+                union.append(xs)
+    else:
+        union = [str(x) for x in order_base if str(x) and str(x) != anchor_num]
+
+    try:
+        dI['_pwide_mean_pct'] = _num_series(p_mean_pct, index=dI.index)
+    except Exception:
+        dI['_pwide_mean_pct'] = np.nan
+    try:
+        dI['_pwide_low_pct'] = _num_series(p_low_pct, index=dI.index)
+    except Exception:
+        dI['_pwide_low_pct'] = np.nan
+    dI['_pwide_mean_pct'] = _num_series(dI.get('_pwide_mean_pct', np.nan), 0.0, index=dI.index)
+    dI['_pwide_low_pct']  = _num_series(dI.get('_pwide_low_pct',  np.nan), 0.0, index=dI.index)
+
+    # R20: 距離ネガコメントがある馬の pwide スコアに -40% ペナルティを適用
+    dI = _bam_fp_apply_distance_neg_penalty(dI)
+
+    dU = dI[dI['num'].astype(str).isin([str(x) for x in union])].copy()
+    if float(dU['_pwide_low_pct'].max()) <= 0.0:
+        dU['_pwide_low_pct']  = 0.0
+        dU['_pwide_mean_pct'] = 0.0
+        dU['_pick_main'] = dU['SAS']
+        dU = dU.sort_values(['_pick_main', 'num'], ascending=[False, True])
+    else:
+        dU = dU.sort_values(['_pwide_low_pct', '_pwide_mean_pct', 'SAS', 'num'],
+                            ascending=[False, False, False, True])
+    A = dU['num'].astype(str).values.tolist()[:4]
+    return dI, dU, A, union
+
+
+
+def _bam_fp_get_weight(dI, num_str: str) -> float:
+    """dI DataFrame から馬番号 num_str に対応する斤量(kg)を返す。"""
+    try:
+        _row = dI.loc[dI['num'].astype(str) == str(num_str)].iloc[0]
+        v = _row.get('load_latest', _row.get('load', _row.get('kg', 0.0)))
+        import math; return 0.0 if (v is None or (isinstance(v, float) and math.isnan(v))) else float(v or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _bam_fp_weight_penalty_pct(dI, num_str: str, sprint_mode: bool, pen_per_kg: float) -> float:
+    """スプリント戦のみ、57kg超過分に対する確率ペナルティ率(%)を返す。"""
+    if not sprint_mode:
+        return 0.0
+    _w = _bam_fp_get_weight(dI, num_str)
+    if _w <= 57.0:
+        return 0.0
+    return max(0.0, (_w - 57.0) * pen_per_kg)
+
+
+def _bam_fp_replace_into_a(dI, A_list: list, cand_num: str) -> tuple:
+    """A_list に cand_num を追加する。4頭超過時は最も弱い馬と入れ替える。
+
+    Returns:
+        tuple[list, str]: (更新後リスト, 置換された馬番号文字列)
+    """
+    if (cand_num in A_list) or (not cand_num):
+        return A_list, ''
+    if len(A_list) < 4:
+        return A_list + [cand_num], ''
+    try:
+        dA = dI[dI['num'].astype(str).isin([str(x) for x in A_list])].copy()
+        dA = dA.sort_values(['_pwide_low_pct', '_pwide_mean_pct', 'SAS', 'num'],
+                            ascending=[True, True, True, False])
+        weak = str(dA['num'].astype(str).values.tolist()[0]) if len(dA) else str(A_list[-1])
+    except Exception:
+        weak = str(A_list[-1])
+    A2 = [str(x) for x in A_list if str(x) != weak]
+    A2.append(str(cand_num))
+    return A2[:4], weak
+
+
+def _bam_fp_apply_sprint_penalty(dI, sprint_mode: bool, pen_per_kg: float) -> None:
+    """スプリント戦時に _pwide_low_pct / _pwide_mean_pct に斤量ペナルティを適用する。"""
+    if sprint_mode:
+        try:
+            dI['_pwide_low_raw']  = dI['_pwide_low_pct']
+            dI['_pwide_mean_raw'] = dI['_pwide_mean_pct']
+            dI['_pwide_low_pct']  = (
+                dI['_pwide_low_pct']
+                - dI['num'].astype(str).map(
+                    lambda n: _bam_fp_weight_penalty_pct(dI, n, sprint_mode, pen_per_kg)
+                ).astype(float)
+            ).clip(lower=0.0)
+            dI['_pwide_mean_pct'] = (
+                dI['_pwide_mean_pct']
+                - dI['num'].astype(str).map(
+                    lambda n: _bam_fp_weight_penalty_pct(dI, n, sprint_mode, pen_per_kg)
+                ).astype(float)
+            ).clip(lower=0.0)
+        except Exception:
+            pass
+    return dI
+
+
+def _bam_fp_posfit_closer(dI, A: list, wr_ft: dict) -> tuple:
+    """PosFit 強制選択と Closer 強制選択を実行し、結果を返す。
+
+    Returns:
+        tuple: (A, pos_num, removed, close_num, close_removed)
+    """
+    # PosFit
+    force_pos = bool(wr_ft.get('fixed_template_force_posfit_enabled', True))
+    sas_topn  = int(wr_ft.get('fixed_template_force_posfit_from_sas_topn', 10) or 10)
+    removed   = ''
+    pos_num   = ''
+    if force_pos:
+        try:
+            cand = dI.sort_values(['SAS', 'num'], ascending=[False, True]).head(max(1, sas_topn)).copy()
+            cand_best = cand.sort_values(
+                ['PosFit', '_pwide_low_pct', 'SAS', 'num'], ascending=[False, False, False, True]
+            ).head(1)
+            if len(cand_best):
+                pos_num = str(cand_best['num'].iloc[0])
+        except Exception:
+            pos_num = ''
+        A, removed = _bam_fp_replace_into_a(dI, A, pos_num)
+
+    # Closer
+    force_close  = bool(wr_ft.get('fixed_template_force_closer_enabled', True))
+    close_topn   = int(wr_ft.get('fixed_template_force_closer_from_sas_topn', 10) or 10)
+    close_removed = ''
+    close_num     = ''
+    if force_close:
+        try:
+            cand2 = dI.sort_values(['SAS', 'num'], ascending=[False, True]).head(max(1, close_topn)).copy()
+            cand2_best = cand2.sort_values(
+                ['_close_bonus', '_pwide_low_pct', 'SAS', 'num'], ascending=[False, False, False, True]
+            ).head(1)
+            if len(cand2_best) and float(cand2_best['_close_bonus'].iloc[0]) > 0.0:
+                close_num = str(cand2_best['num'].iloc[0])
+        except Exception:
+            close_num = ''
+        A, close_removed = _bam_fp_replace_into_a(dI, A, close_num)
+
+    return A, pos_num, removed, close_num, close_removed
+
+
+def _bam_fp_last3f(dI, dU, A: list, wr_ft: dict, fixed_info: dict,
+                   anchor_num: str, meta, pos_num: str, close_num: str) -> tuple:
+    """Last3f 強制選択を実行し、(A, fixed_info) を返す。"""
+    force_last3f = bool(wr_ft.get('fixed_template_force_last3f_enabled', True))
+    last3f_topn  = int(wr_ft.get('fixed_template_force_last3f_from_sas_topn', 12) or 12)
+    last3f_n     = int(wr_ft.get('fixed_template_force_last3f_n', 1) or 2)
+    last3f_n_effective = last3f_n
+    try:
+        thr = float(wr_ft.get('fixed_template_force_last3f_exception_pwide_low_max_pct', 10.0) or 10.0)
+        try:
+            pmax = float(dU['_pwide_low_pct'].max()) if dU is not None and len(dU) else 0.0
+        except Exception:
+            pmax = 0.0
+        sprint    = bool(fixed_info.get('sprint_mode', False)) if isinstance(fixed_info, dict) else False
+        pace_conf = str(meta.get('pace_conf', '')).lower() if isinstance(meta, dict) else ''
+        if int(last3f_n_effective) < 2:
+            if (pmax > 0.0) and (pmax < thr) and sprint:
+                last3f_n_effective = 2
+            elif (pmax > 0.0) and (pmax < (thr + 2.0)) and (pace_conf == 'low'):
+                last3f_n_effective = 2
+    except Exception:
+        last3f_n_effective = last3f_n
+
+    last3f_added    = []
+    last3f_replaced = []
+    if force_last3f and (last3f_n > 0):
+        try:
+            cand = dI.sort_values(['SAS', 'num'], ascending=[False, True]).head(max(1, last3f_topn)).copy()
+            if 'pred_last3f' in cand.columns:
+                import numpy as np
+                cand['_last3f'] = _num_series(cand.get('pred_last3f', np.nan), index=cand.index)
+                cand = cand[cand['_last3f'].notna() & np.isfinite(cand['_last3f'])].copy()
+                cand = cand.sort_values(['_last3f', '_pwide_low_pct', 'SAS', 'num'],
+                                        ascending=[True, False, False, True])
+                picks = [str(x) for x in cand['num'].astype(str).values.tolist()
+                         if str(x) and str(x) != anchor_num]
+                picks = [x for x in picks if x not in A]
+                speed_top_num_local = str(fixed_info.get('speed_top_num', '')) if isinstance(fixed_info, dict) else ''
+                forced = {str(pos_num), str(close_num), speed_top_num_local} - {''}
+                for x in picks[:max(0, last3f_n_effective)]:
+                    if x in A:
+                        continue
+                    try:
+                        dA = dI[dI['num'].astype(str).isin([str(z) for z in A])].copy()
+                        dA = dA[~dA['num'].astype(str).isin(list(forced))].copy() if len(forced) else dA
+                        if len(dA) == 0:
+                            dA = dI[dI['num'].astype(str).isin([str(z) for z in A])].copy()
+                        dA = dA.sort_values(['_pwide_low_pct', '_pwide_mean_pct', 'SAS', 'num'],
+                                            ascending=[True, True, True, False])
+                        weak = str(dA['num'].astype(str).values.tolist()[0]) if len(dA) else str(A[-1])
+                        if weak and weak in A:
+                            A = [str(z) for z in A if str(z) != weak] + [str(x)]
+                            A = A[:4]
+                            last3f_added.append(str(x))
+                            last3f_replaced.append(str(weak))
+                    except Exception:
+                        A2, weak = _bam_fp_replace_into_a(dI, A, x)
+                        if weak:
+                            last3f_added.append(str(x))
+                            last3f_replaced.append(str(weak))
+                        A = A2
+        except Exception:
+            pass
+
+    fixed_info['last3f_force_enabled']     = force_last3f
+    fixed_info['last3f_from_sas_topn']     = last3f_topn
+    fixed_info['last3f_force_n']           = last3f_n
+    fixed_info['last3f_force_n_effective'] = last3f_n_effective
+    fixed_info['last3f_added']             = ' '.join(last3f_added[:3])
+    fixed_info['last3f_replaced']          = ' '.join(last3f_replaced[:3])
+    return A, fixed_info
+
+
+def _bam_fp_speed(dI, A: list, d0, wr_ft: dict, anchor_num: str,
+                  pos_num: str, close_num: str) -> tuple:
+    """Speed 強制選択を実行し、(A, speed_top_num, speed_removed) を返す。"""
+    force_speed   = bool(wr_ft.get('fixed_template_force_speed_enabled', True))
+    speed_top_num = ''
+    speed_removed = ''
+    if force_speed:
+        try:
+            import numpy as np
+            if 'speed' in d0.columns:
+                _tmp = d0[['num', 'speed']].copy()
+                _tmp['speed'] = _num_series(_tmp['speed'], index=_tmp.index)
+                _tmp = _tmp.dropna(subset=['speed']).sort_values('speed', ascending=False)
+                if len(_tmp) > 0:
+                    speed_top_num = str(int(_tmp.iloc[0]['num']))
+        except Exception:
+            speed_top_num = ''
+        if speed_top_num and speed_top_num != anchor_num and speed_top_num not in A:
+            try:
+                forced = {str(pos_num), str(close_num)} - {''}
+                dA = dI[dI['num'].astype(str).isin([str(x) for x in A])].copy()
+                dA = dA[~dA['num'].astype(str).isin(list(forced))].copy() if len(forced) else dA
+                if len(dA) == 0:
+                    dA = dI[dI['num'].astype(str).isin([str(x) for x in A])].copy()
+                dA = dA.sort_values(['_pwide_low_pct', '_pwide_mean_pct', 'SAS', 'num'],
+                                    ascending=[True, True, True, False])
+                weak = str(dA['num'].astype(str).values.tolist()[0]) if len(dA) else str(A[-1])
+                A = [str(x) for x in A if str(x) != weak] + [str(speed_top_num)]
+                A = A[:4]
+                speed_removed = weak
+            except Exception:
+                A, speed_removed = _bam_fp_replace_into_a(dI, A, speed_top_num)
+    return A, speed_top_num, speed_removed
+
+
+def _bam_fp_zone_diversity(dI, dU, A: list, wr_ft: dict,
+                           pos_num: str, close_num: str) -> tuple:
+    """Zone diversity 強制選択を実行し、(A, zone_major, zone_added, zone_replaced) を返す。"""
+    import pandas as pd
+    avoid_same_zone = bool(wr_ft.get('fixed_template_avoid_same_zone_enabled', True))
+    zone_thr        = int(wr_ft.get('fixed_template_avoid_same_zone_threshold', 3) or 3)
+    zone_major   = ''
+    zone_replaced = ''
+    zone_added   = ''
+    if avoid_same_zone and len(A) >= 4:
+        try:
+            dA = dI[dI['num'].astype(str).isin([str(x) for x in A])].copy()
+            dA['_zone'] = dA.get('zone_4c', pd.Series([''] * len(dA))).astype(str).str.upper()
+            zc = dA['_zone'].value_counts()
+            if len(zc) and int(zc.iloc[0]) >= int(zone_thr):
+                zone_major = str(zc.index[0])
+                dCand = dU.copy()
+                dCand = dCand[~dCand['num'].astype(str).isin([str(x) for x in A])].copy()
+                dCand['_zone'] = dCand.get('zone_4c', pd.Series([''] * len(dCand))).astype(str).str.upper()
+                dCand = dCand[dCand['_zone'] != zone_major]
+                if len(dCand):
+                    dCand = dCand.sort_values(['_pwide_low_pct', '_pwide_mean_pct', 'SAS', 'num'],
+                                              ascending=[False, False, False, True])
+                    zone_added = str(dCand['num'].astype(str).iloc[0])
+                    forced = {str(pos_num), str(close_num)} - {''}
+                    dRem = dA[dA['_zone'] == zone_major].copy()
+                    if len(forced):
+                        dRem2 = dRem[~dRem['num'].astype(str).isin(list(forced))].copy()
+                        dRem = dRem2 if len(dRem2) else dRem
+                    dRem = dRem.sort_values(['_pwide_low_pct', '_pwide_mean_pct', 'SAS', 'num'],
+                                            ascending=[True, True, True, False])
+                    zone_replaced = str(dRem['num'].astype(str).iloc[0]) if len(dRem) else ''
+                    if zone_replaced and zone_added:
+                        A = [str(x) for x in A if str(x) != zone_replaced] + [zone_added]
+                        A = A[:4]
+        except Exception:
+            pass
+    return A, zone_major, zone_added, zone_replaced
+
+def _bam_fp_ai_rear_include(
+    dI: "pd.DataFrame",
+    A: list,
+    wr_ft: dict,
+    fixed_info: dict,
+    anchor_num: str,
+) -> tuple:
+    """R20: AI_REAR_CONFIRMED 馬 + pos_advantage_nums 指定馬をワイド相手 A リストに強制追加。
+
+    ai_rear_force_max (default=1) を上限として REAR 位置有利馬を追加する。
+    A がすでに 4 頭なら末尾を差し替える（スコア最低馬を除外）。
+
+    R20追加: pos_advantage_nums キーに馬番リスト（例: [12, 16, 17]）を指定すると
+             それらの馬も強制的にワイド相手として扱う。
+             設定例: params['wide_rules']['fixed_template_rules']['pos_advantage_nums'] = [12, 16, 17]
+    """
+    ai_rear_max = int(wr_ft.get('ai_rear_force_max', 1))
+    # R20: pos_advantage_nums (設定キーから馬番リストを取得)
+    _pan_raw = wr_ft.get('pos_advantage_nums', [])
+    pos_advantage_nums: list = (
+        [str(x) for x in _pan_raw] if isinstance(_pan_raw, (list, tuple)) else
+        [s.strip() for s in str(_pan_raw).split(',') if s.strip()] if _pan_raw else []
+    )
+    if ai_rear_max <= 0 and not pos_advantage_nums:
+        return A, fixed_info
+    try:
+        rear_col = dI.get('AI_REAR_CONFIRMED',
+                          pd.Series([False] * len(dI), index=dI.index))
+        rear_mask = rear_col.astype(bool)
+
+        # R20: pos_advantage_nums で指定された馬も REAR 扱いに追加
+        if pos_advantage_nums:
+            num_str_series = dI['num'].astype(str)
+            pan_mask = num_str_series.isin(pos_advantage_nums)
+            rear_mask = rear_mask | pan_mask
+
+        # スコア降順で REAR 馬を取得
+        rear_df = dI.loc[rear_mask].copy()
+        if len(rear_df) == 0:
+            return A, fixed_info
+        sort_col = '_pwide_low_pct' if '_pwide_low_pct' in rear_df.columns else 'SAS'
+        rear_df = rear_df.sort_values(sort_col, ascending=False)
+        rear_nums = rear_df['num'].astype(str).values.tolist()
+        added: list = []
+        _effective_max = max(ai_rear_max, len(pos_advantage_nums)) if pos_advantage_nums else ai_rear_max
+        for rn in rear_nums:
+            if rn == anchor_num or rn in A:
+                continue
+            if len(A) >= 4:
+                A = A[:3]  # 末尾1頭を除去して追加
+            A.append(rn)
+            added.append(rn)
+            if len(added) >= _effective_max:
+                break
+        if added:
+            fixed_info['ai_rear_forced'] = ','.join(added)
+        if pos_advantage_nums:
+            fixed_info['pos_advantage_nums'] = ','.join(pos_advantage_nums)
+    except Exception:
+        pass
+    return A, fixed_info
+
+
+def _bam_abc_force_picks(dI, dU, A: list, wr_ft: dict, fixed_info: dict,
+                         anchor_num: str, meta, d0,
+                         sprint_mode: bool, pen_per_kg: float) -> tuple:
+    """PosFit / closer / last3f / speed / zone 強制選択を適用して A と fixed_info を返す。
+
+    各ロジックはサブ関数 (_bam_fp_*) に委譲するオーケストレータ。
+    """
+    # 1. スプリント斤量ペナルティを pwide カラムに適用
+    dI = _bam_fp_apply_sprint_penalty(dI, sprint_mode, pen_per_kg)
+
+    # 2. PosFit + Closer 強制選択
+    A, pos_num, removed, close_num, close_removed = _bam_fp_posfit_closer(dI, A, wr_ft)
+
+    # 3. Last3f 強制選択
+    A, fixed_info = _bam_fp_last3f(dI, dU, A, wr_ft, fixed_info, anchor_num, meta, pos_num, close_num)
+
+    # 4. Speed 強制選択
+    A, speed_top_num, speed_removed = _bam_fp_speed(dI, A, d0, wr_ft, anchor_num, pos_num, close_num)
+    fixed_info['speed_top_num']        = speed_top_num
+    fixed_info['speed_forced_removed'] = speed_removed
+
+    # 5. Zone diversity 強制選択
+    A, zone_major, zone_added, zone_replaced = _bam_fp_zone_diversity(dI, dU, A, wr_ft, pos_num, close_num)
+
+    # 6. fixed_info まとめ書き
+    if zone_major:
+        fixed_info['zone_major'] = str(zone_major)
+    if zone_added:
+        fixed_info['zone_diversity_added'] = str(zone_added)
+    if zone_replaced:
+        fixed_info['zone_diversity_replaced'] = str(zone_replaced)
+    if pos_num:
+        fixed_info['posfit_forced_num'] = str(pos_num)
+    if removed:
+        fixed_info['posfit_replaced_num'] = str(removed)
+    if close_num:
+        fixed_info['closer_forced_num'] = str(close_num)
+    if close_removed:
+        fixed_info['closer_replaced_num'] = str(close_removed)
+
+    # 7. R19: AI位置有利馬 強制組み込み
+    A, fixed_info = _bam_fp_ai_rear_include(dI, A, wr_ft, fixed_info, anchor_num)
+
+    return A, dI, fixed_info
+
+
+def _bam_b_axis_priority_sort(
+    dI: "pd.DataFrame",
+    B_raw: list,
+    anchor_num: str,
+) -> list:
+    """R19: B軸候補リストを優先度スコアで降順ソートして返す。
+
+    優先度:
+      1. コース◎ + 参考外 (SankoGaiFlag > 0)   +40
+      2. 調教/レーティング上昇トレンド           +min(delta*5, 20)
+      3. SP最高値 (speed_norm / SpeedPeakBonus)  +0.3 * speed_norm
+      4. AI位置有利 (AI_REAR_CONFIRMED)           +15
+    """
+    try:
+        b_scores: dict = {}
+        for num in B_raw:
+            rows = dI[dI['num'].astype(str) == str(num)]
+            if len(rows) == 0:
+                b_scores[num] = 0.0
+                continue
+            row = rows.iloc[0]
+            score = 0.0
+            # Priority 1: コース◎ + 参考外
+            course_val = str(row.get('course', '') or '').strip()
+            sanko_val  = float(row.get('SankoGaiFlag', 0.0) or 0.0)
+            if course_val == '◎' and sanko_val > 0.5:
+                score += 40.0
+            elif course_val == '◎':
+                score += 10.0  # コース◎だけでも小ボーナス
+            # Priority 2: 上昇トレンド (delta_train or rating trend)
+            delta_t = float(row.get('delta_train', 0.0) or 0.0)
+            if delta_t > 0:
+                score += min(delta_t * 5.0, 20.0)
+            # Priority 3: SP最高値
+            sp_norm  = float(row.get('speed_norm',    50.0) or 50.0)
+            sp_bonus = float(row.get('SpeedPeakBonus', 0.0) or 0.0)
+            score += sp_norm * 0.3 + sp_bonus * 0.5
+            # Priority 4: AI位置有利
+            if bool(row.get('AI_REAR_CONFIRMED', False)):
+                score += 15.0
+            b_scores[num] = score
+        return sorted(B_raw, key=lambda n: b_scores.get(n, 0.0), reverse=True)
+    except Exception:
+        return B_raw
+
+
+def _bam_abc_finalise(dI, dU, A: list, anchor_num: str,
+                      pace_union_enabled: bool, topk: int, tilt: float,
+                      front_count: int, fixed_info: dict) -> tuple:
+    """extras / B リストを構築し diagnostics を fixed_info に追記して返す。
+
+    R22追加:
+      - 騎手データ（JockeyDistanceEvidenceScore）上位3頭を extras に優先追加
+      - PosFit（位置有利）上位3頭を extras に優先追加
+    """
+    extras = dU['num'].astype(str).values.tolist()[4:10]
+
+    # R22: 騎手データ上位3頭を extras に追加（三連複強化）
+    try:
+        _jkey_col = 'JockeyDistanceEvidenceScore'
+        if _jkey_col in dI.columns:
+            _jockey_top3 = (
+                dI[dI['num'].astype(str) != anchor_num]
+                .sort_values([_jkey_col, 'num'], ascending=[False, True])
+                .head(3)['num'].astype(str).values.tolist()
+            )
+            _added_j = []
+            for _jn in _jockey_top3:
+                if _jn not in A and _jn not in extras:
+                    extras.append(_jn)
+                    _added_j.append(_jn)
+            if _added_j:
+                fixed_info['trio_jockey_extras'] = ','.join(_added_j)
+    except Exception:
+        pass
+
+    # R22: PosFit（位置有利）上位3頭を extras に追加（三連複強化）
+    try:
+        _posfit_col = 'PosFit'
+        if _posfit_col in dI.columns:
+            _posfit_top3 = (
+                dI[dI['num'].astype(str) != anchor_num]
+                .sort_values([_posfit_col, 'num'], ascending=[False, True])
+                .head(3)['num'].astype(str).values.tolist()
+            )
+            _added_p = []
+            for _pn in _posfit_top3:
+                if _pn not in A:  # A に含まれていなければ候補として記録
+                    _added_p.append(_pn)
+                    if _pn not in extras:  # extras への追加は重複しない
+                        extras.append(_pn)
+            if _added_p:
+                fixed_info['trio_posfit_extras'] = ','.join(_added_p)
+    except Exception:
+        pass
+    # R19: B候補の素朴なユニオン → 優先度ソートに変更
+    _B_raw: list = []
+    for x in (A + extras):
+        xs = str(x)
+        if xs and xs != anchor_num and xs not in _B_raw:
+            _B_raw.append(xs)
+    B: list = _bam_b_axis_priority_sort(dI, _B_raw, anchor_num)
+    try:
+        fixed_info['pace_union_enabled'] = '1' if pace_union_enabled else '0'
+        fixed_info['pace_union_topk']    = str(topk)
+        fixed_info['pace_union_tilt']    = f"{tilt:.3f}"
+        fixed_info['front_count']        = str(front_count)
+        fixed_info['pick_mode']          = 'p_wide_low_pct'
+        fixed_info['pwide_low_max']      = f"{float(dI['_pwide_low_pct'].max()):.1f}"
+    except Exception:
+        pass
+    return A, B, extras, fixed_info
+
+
+def _bam_build_ab_candidates(
+    dI,
+    anchor_num: str,
+    params: dict,
+    wr_ft: dict,
+    tilt: float,
+    opps_display,
+) -> tuple:
+    """ワイド相手 A (4頭) / 三連複 3列目 B (10頭) / extras を選出する。
+
+    ペース別スコアリング → ユニオン集合 → 的中率優先ソート
+    → PosFit / 末脚 / 速度 / ゾーン分散ルールを順次適用。
+
+    Args:
+        dI: アンカーを除いた馬 DataFrame（num=str）。
+        anchor_num: アンカー馬番号（文字列）。
+        params: 正規化済みパラメータ辞書。
+        wr_ft: wide_rules サブ辞書。
+        tilt: ペース傾き係数。
+        opps_display: ワイド表示候補 DataFrame（fallback 用）。
+
+    Returns:
+        (A, B, extras, fixed_info) タプル。
+    """
+    fixed_info: dict = {}
+    A: list = []
+    B: list = []
+    extras: list = []
+    try:
+        # FRONT runner count
+        try:
+            _z4s_all  = dI.get('zone_4c', pd.Series([''] * len(dI))).astype(str).str.upper()
+            front_count = int(_z4s_all.str.contains('FRONT').sum())
+        except Exception:
+            front_count = 0
+
+        # R22: pace_label を meta から取得してシナリオスコアに渡す
+        _pace_label_r22 = str((meta or {}).get('pace', 'M') or 'M').upper().strip()
+        if _pace_label_r22 not in ['H', 'M', 'S']:
+            _pace_label_r22 = 'M'
+        dI, order_base, order_slow, order_close, order_pace = _bam_abc_scenario_scores(
+            dI, tilt, front_count, pace_label=_pace_label_r22
+        )
+
+        dI, dU, A, union = _bam_abc_rank_pick(
+            dI, anchor_num, order_base, order_slow, order_close,
+            pace_union_enabled, topk, p_mean_pct, p_low_pct,
+            order_pace=order_pace,  # R22
+        )
+
+        # sprint mode detection
+        sprint_mode = False
+        try:
+            _dist = float(meta.get('distance', '') or meta.get('dist', '') or 0)
+            sprint_mode = (_dist > 0 and _dist <= 1200)
+        except Exception:
+            sprint_mode = False
+        fixed_info['sprint_mode'] = sprint_mode
+        try:
+            pen_per_kg = float(wr_ft.get('sprint_weight_penalty_pct_per_kg', 1.2))
+        except Exception:
+            pen_per_kg = 1.2
+        fixed_info['sprint_weight_penalty_pct_per_kg'] = pen_per_kg
+
+        A, dI, fixed_info = _bam_abc_force_picks(
+            dI, dU, A, wr_ft, fixed_info, anchor_num, meta, d0, sprint_mode, pen_per_kg,
+        )
+
+        A, B, extras, fixed_info = _bam_abc_finalise(
+            dI, dU, A, anchor_num, pace_union_enabled, topk, tilt, front_count, fixed_info,
+        )
+    except Exception:
+        A, extras, B = [], [], []
+    return A, B, extras, fixed_info
+def _bsa_training_table(d0) -> str:
+    """調教スコア表と注目馬の調教×コメント要点を Markdown 文字列で返す。"""
+    import numpy as np
+    out = ''
+    out += '## 調教スコア（keibabook：全体+形）\n'
+    out += '（shape=形寄与。+は良い形、-は悪い形。坂路=加速形、W/CW=3F配分）\n\n'
+    try:
+        if 'TrainingScore' in d0.columns:
+            cols = ['num','name','TrainingScore','TrainingRank','delta_train','shape_latest','t4_latest','t3_latest','t1_latest','course_latest','load_latest','pair_latest']
+            tdf = d0.copy()
+            for c in cols:
+                if c not in tdf.columns:
+                    tdf[c] = np.nan if c not in ['num','name','course_latest','load_latest','pair_latest'] else ''
+            tdf = tdf[cols].copy()
+            for c in ['TrainingScore','delta_train','shape_latest','t4_latest','t3_latest','t1_latest']:
+                tdf[c] = _num_series(tdf.get(c, float('nan')), index=tdf.index)
+            tdf['TrainingScore'] = tdf['TrainingScore'].map(lambda x: f'{x:.1f}' if isinstance(x, float) and x == x else '-')
+            tdf['TrainingRank']  = tdf['TrainingRank'].map(lambda x: str(int(x)) if isinstance(x, (int,float)) and x == x and x < 900 else '-')
+            tdf['delta_train']   = tdf['delta_train'].map(lambda x: f'{x:+.2f}' if isinstance(x, float) and x == x else '-')
+            for c in ['shape_latest','t4_latest','t3_latest','t1_latest']:
+                tdf[c] = tdf[c].map(lambda x: f'{x:.2f}' if isinstance(x, float) and x == x else '-')
+            out += md_table(tdf) + '\n'
+    except Exception:
+        out += '- 調教スコア: 算出失敗\n\n'
+    out += '## 注目馬の「調教×コメント」要点（今回の評価調整ポイント）\n'
+    try:
+        if 'name' in d0.columns and 'CommentRisk' in d0.columns:
+            risk_df = d0.sort_values('CommentRisk', ascending=False).head(5)
+            for _, row in risk_df.iterrows():
+                score = _num_series(row.get('CommentRisk', np.nan))
+                if score > 30:
+                    out += f"- {row.get('name','?')}(#{row.get('num','?')}): リスク={score:.0f}\n"
+        out += '\n'
+    except Exception:
+        out += '\n'
+    return out
+
+
+def _bsa_final_verdict(d0, anchor_num: str, params: dict) -> str:
+    """最終結論（印）セクションを Markdown 文字列で返す。"""
+    import numpy as np
+    out = '## 最終結論（印）\n'
+    try:
+        anchor_row = d0.loc[d0['num'].astype(str) == str(anchor_num)]
+        if len(anchor_row):
+            r = anchor_row.iloc[0]
+            p_place = _num_series(r.get('p_place_est_pct', np.nan))
+            p_low   = _num_series(r.get('p_place_low_pct', np.nan))
+            sas     = _num_series(r.get('SAS', np.nan))
+            name    = str(r.get('name', '?'))
+            out += f"- ◎ {name}(#{anchor_num}): 複勝率={p_place:.1f}% / 下限={p_low:.1f}% / SAS={sas:.1f}\n"
+        out += '\n'
+    except Exception:
+        out += '- 最終結論: 算出失敗\n\n'
+    return out
+
+
+def _bsa_score_table(d0, meta: dict, params: dict) -> str:
+    """本命スコア表・危険人気チェック・穴拾い条件セクションを Markdown 文字列で返す。"""
+    import numpy as np
+    out = '## 本命スコア表\n'
+    try:
+        cols = ['num','name','SAS','AnchorScore','p_place_est_pct','p_place_low_pct','WinCandidateScore','PlaceAxisScore']
+        sdf = d0.copy()
+        for c in cols:
+            if c not in sdf.columns:
+                sdf[c] = np.nan
+        sdf = sdf[[c for c in cols if c in sdf.columns]].copy()
+        for c in sdf.columns:
+            if c not in ['num','name']:
+                sdf[c] = _num_series(sdf.get(c, np.nan), index=sdf.index)
+        sdf = sdf.sort_values('SAS', ascending=False) if 'SAS' in sdf.columns else sdf
+        out += md_table(sdf.head(16)) + '\n'
+    except Exception:
+        out += '- スコア表: 算出失敗\n\n'
+
+    out += '## 危険人気チェック\n'
+    try:
+        if 'CommentRisk' in d0.columns and 'PopRank' in d0.columns:
+            danger = d0.loc[(_num_series(d0['CommentRisk'], index=d0.index) > 40) &
+                            (_num_series(d0.get('PopRank', 999), index=d0.index) <= 5)].copy()
+            if len(danger):
+                for _, row in danger.iterrows():
+                    out += f"- ⚠️ {row.get('name','?')}(#{row.get('num','?')}): リスク高\n"
+            else:
+                out += '- 危険人気：なし\n'
+        else:
+            out += '- 危険人気：データ不足\n'
+        out += '\n'
+    except Exception:
+        out += '- 危険人気: 算出失敗\n\n'
+
+    out += '## 穴拾い条件\n'
+    try:
+        if 'WinCandidateScore' in d0.columns and 'PopRank' in d0.columns:
+            ana = d0.loc[(_num_series(d0['WinCandidateScore'], index=d0.index) >= 60) &
+                         (_num_series(d0.get('PopRank', 999), index=d0.index) >= 7)].copy()
+            if len(ana):
+                for _, row in ana.iterrows():
+                    out += f"- 穴候補: {row.get('name','?')}(#{row.get('num','?')})\n"
+            else:
+                out += '- 穴候補：なし\n'
+        else:
+            out += '- 穴候補：データ不足\n'
+        out += '\n'
+    except Exception:
+        out += '- 穴拾い: 算出失敗\n\n'
+    return out
+
+
+def _bsa_next_race(d0, params: dict) -> str:
+    """次走推奨馬（先物注目）セクションを Markdown 文字列で返す。"""
+    import numpy as np
+    out = '## 次走推奨馬（先物注目）\n'
+    try:
+        if 'comment_tags' in d0.columns:
+            next_picks = d0.loc[d0['comment_tags'].astype(str).str.contains('次走注目|先物|次走期待', na=False)].copy()
+            if len(next_picks):
+                for _, row in next_picks.iterrows():
+                    reason_tags    = str(row.get('comment_tags', ''))
+                    reason_comment = str(row.get('comment_raw', ''))
+                    out += f"- {row.get('name','?')}(#{row.get('num','?')})"
+                    out += f"  - 理由: {reason_tags if reason_tags.strip() else '総合点'}"
+                    if reason_comment.strip():
+                        out += f" / {reason_comment}"
+                    out += "\n"
+            else:
+                out += '- なし\n'
+        else:
+            out += '- データ不足\n'
+        out += '\n'
+    except Exception:
+        out += '- 次走推奨馬: 算出失敗\n\n'
+    return out
+
+def _bam_section_analysis(d0, meta: dict, anchor_num: str, params: dict) -> str:
+    """調教×コメント要点・最終結論（印）・スコア表を Markdown 文字列で返す。
+
+    4つのサブセクション (_bsa_*) を呼び出すオーケストレータ。
+    """
+    out = ''
+    out += _bsa_training_table(d0)
+    out += _bsa_final_verdict(d0, anchor_num, params)
+    out += _bsa_score_table(d0, meta, params)
+    out += _bsa_next_race(d0, params)
+    return out
+
+
+def _bam_section_betting_plan(
+    d0, anchor_num: str, A: list, B: list,
+    params: dict, dI, meta: dict, df,
+) -> str:
+    """買い目・三連複フォーメーション・データ使用状況を Markdown 文字列で返す。"""
+    out = ''
+    # -------------------------
+    # 買い目（複勝＋ワイド）※固定テンプレ（画像準拠）
+    # -------------------------
+    out += '## 買い目（複勝＋ワイド）\n'
+    out += '### 複勝（1点）\n'
+    out += f'- {anchor_num}\n\n'
+    out += f'### ワイド（4点） ※{anchor_num}軸\n'
+    for x in A:
+        out += f'- {anchor_num}−{x}\n'
+    out += '\n'
+    out += '（理由：相手はシナリオ和集合から抽出→最終的にワイド的中率優先（p_wide_low_pct優先）で4点に圧縮）\n'
+
+    # 追加説明（1行）：末脚枠（後半3F予測）
+    last3f_line = '- 末脚枠: なし\n'
+    try:
+        if isinstance(fixed_info, dict) and fixed_info.get('last3f_force_enabled') and str(fixed_info.get('last3f_added','')).strip():
+            _a = str(fixed_info.get('last3f_added','')).strip()
+            _r = str(fixed_info.get('last3f_replaced','')).strip()
+            _topn = str(fixed_info.get('last3f_from_sas_topn',''))
+            _n = str(fixed_info.get('last3f_force_n',''))
+            _ne = str(fixed_info.get('last3f_force_n_effective', _n))
+            last3f_line = f"- 末脚枠: SAS上位{_topn}内のpred_last3f上位から{_ne}頭確保（{_r}→{_a}）"
+            if str(_ne) != str(_n):
+                last3f_line += f"（例外で{_ne}頭）"
+            last3f_line += '\n'
+    except Exception:
+        pass
+    out += last3f_line
+
+    anchor_risk_line = '- 軸リスク警告: なし\n'
+    try:
+        if 'CommentRisk' in df.columns:
+            rr = df.loc[df['num'].astype(str) == str(anchor_num)].copy()
+            if len(rr):
+                _cr = _num_scalar(rr.get('CommentRisk', 0.0), 0.0, dtype=float)
+                if _cr >= float(params.get('anchor_comment_risk_threshold', 18.0) or 18.0):
+                    _ct = str(rr.get('comment_tags','').fillna('').iloc[0])
+                    anchor_risk_line = f"- 軸リスク警告: comment由来の注意語あり（CommentRisk={_cr:.0f} / tags={_ct[:40]}）→複勝は金額調整・ワイド重視推奨\n"
+    except Exception:
+        pass
+    out += anchor_risk_line
+    out += '\n'
+
+    # -------------------------
+    # 三連複フォーメーション（30点）
+    # -------------------------
+    out += '## 三連複フォーメーション（30点）\n'
+    try:
+        wr = params.get('wide_rules', {}) or {}
+        if bool(wr.get('trio_formation_enabled', True)):
+            wide_nums = []
+            try:
+                _base = None
+                if (opps is not None) and (len(opps) > 0) and ('num' in opps.columns):
+                    _base = opps
+                elif (opps_display is not None) and (len(opps_display) > 0) and ('num' in opps_display.columns):
+                    _base = opps_display
+                if _base is not None:
+                    wide_nums = [str(x) for x in _base.get('num', pd.Series([], dtype=str)).astype(str).tolist() if str(x)]
+            except Exception:
+                wide_nums = []
+            form = build_trio_formation_from_wide(anchor_num=str(anchor.get('num','')), wide_opp_nums=wide_nums, df=df, params=params)
+            a = str(form.get('a',''))
+            b = [str(x) for x in (form.get('b', []) or []) if str(x)]
+            c = [str(x) for x in (form.get('c', []) or []) if str(x)]
+            pts = int(form.get('points', 0) or 0)
+            out += f"- 1頭目: {a if a else '(なし)'}\n"
+            out += f"- 2頭目: {' '.join(b) if len(b) else '(なし)'}\n"
+            out += f"- 3頭目: {' '.join(c) if len(c) else '(なし)'}\n"
+            out += f"- 点数: {pts}点\n"
+            try:
+                y = int(wr.get('trio_formation_stake_yen_per_ticket', 100) or 100)
+            except Exception:
+                y = 100
+            if y > 0 and pts > 0:
+                out += f"- 購入金額: {y}円×{pts}点＝{y*pts}円（均等）\n"
+            try:
+                bud = int(wr.get('trio_formation_budget_yen', 3000) or 3000)
+            except Exception:
+                bud = 3000
+            if bud > 0:
+                out += f"- 予算上限: {bud}円\n"
+            out += '\n'
+        else:
+            out += '- 三連複フォーメーション: 見送り\n\n'
+    except Exception:
+        out += '- 三連複フォーメーション: 算出失敗\n\n'
+
+    # -------------------------
+    # データ使用状況（画像→特徴量→スコア反映）
+    # -------------------------
+    out += '## データ使用状況（画像→特徴量→スコア反映）\n'
+    try:
+        _rows = []
+        _rows.append(('調教', 'あり' if 'TrainingScore' in df.columns else 'なし', 'TrainingScore / TrainingRank / Δtrain'))
+        _rows.append(('コメント', 'あり' if (('CommentFit' in df.columns) or ('comment_tags' in df.columns) or ('CommentRisk' in df.columns)) else 'なし', 'CommentFit / comment_tags / CommentRisk'))
+        _rows.append(('展開・位置取り', 'あり' if (('PaceFit' in df.columns) or ('MapFit' in df.columns) or ('PosFit' in df.columns)) else 'なし', 'PaceFit / MapFit / PosFit'))
+        _rows.append(('勝ち切り・本命・複軸', 'あり' if (('WinThroughScore' in df.columns) or ('FavoriteScore' in df.columns) or ('PlaceAxisScore' in df.columns)) else 'なし', 'WinThroughScore / FavoriteScore / PlaceAxisScore'))
+        _rows.append(('危険人気・穴拾い', 'あり' if (('DangerousPopularityScore' in df.columns) or ('ValueHoleScore' in df.columns)) else 'なし', 'DangerousPopularityScore / ValueHoleScore'))
+        _rows.append(('次走注目', 'あり' if 'NextRunRecommendScore' in df.columns else 'なし', 'NextRunRecommendScore / NextRunReasonTags'))
+        out += '|項目|反映|主な列/スコア|\n'
+        out += '|---|---|---|\n'
+        for _label, _used, _desc in _rows:
+            out += f"|{_label}|{_used}|{_desc}|\n"
+        try:
+            _pem = str((meta or {}).get('pace_eval_mode', '') or '') if isinstance(meta, dict) else ''
+        except Exception:
+            _pem = ''
+        if _pem:
+            out += f"\n- pace_eval_mode: {_pem}\n"
+        try:
+            _favcand = str((meta or {}).get('favorite_num_candidate', '') or '') if isinstance(meta, dict) else ''
+        except Exception:
+            _favcand = ''
+        if _favcand:
+            out += f"- favorite_num_candidate: {_favcand}\n"
+        out += '\n'
+    except Exception:
+        out += '- データ使用状況: 集計失敗\n\n'
+    return out
+
+def _bam_fixed_template(
+    df,
+    meta: dict,
+    params: dict,
+    anchor: dict,
+    p_place_pct: float,
+    p_place: float,
+    place_ok: bool,
+    min_p_place: float,
+    min_p_low: float,
+    _judge: str,
+    _p_low_pct,
+    stake_place: int,
+    _cf: float,
+    _ctags: str,
+    _cshort: str,
+    opps_display,
+) -> str:
+    """固定テンプレ（FIXED_TEMPLATE_V1）を構築して Markdown 文字列を返す。
+
+    build_audit_markdown の主経路。成功すれば完全な予想 Markdown を返す。
+    失敗した場合は例外を送出し、呼び出し元が fallback 経路に切り替える。
+    """
+    # FIXED_TEMPLATE_V1: 旧監査出力を捨て、固定テンプレだけを出す
+    out = ''
+    out += '## 予想（固定テンプレ）\n'
+    out += '\n'
+    anchor_num = str(anchor.get('num', ''))
+    d0 = df.copy()
+    d0['num'] = d0['num'].astype(str)
+    out += f"## ◎ {anchor_num}.{str(anchor.get('name','') or '')}（複勝率(p_place_est_pct)最大で選定 / 絶対厳守）\n"
+    out += f"- 複勝率（表示必須）: {float(p_place_pct):.1f}%\n"
+    out += f"- p_place_est={float(p_place_pct):.1f}% (0.0–100.0%)\n\n"
+    out += '### コメント（厩舎/前走インタビュー反映）\n'
+    out += f"- コメント評価(CommentFit): {float(_cf):.0f}/100\n"
+    if str(_ctags).strip():
+        out += f"- 要点: {str(_ctags)}\n"
+    else:
+        out += '- 要点: 目立つタグなし\n'
+    if str(_cshort).strip():
+        out += f"- 本文抜粋: {str(_cshort)}\n"
+    else:
+        out += '- 本文抜粋: 抜粋なし\n'
+    out += '\n'
+    out += '## 複勝（絶対厳守ルール）\n'
+    out += '|判定|買い目|P(place)%|P_low%|stake|\n'
+    out += '|---|---|---:|---:|---:|\n'
+    out += f"|{_judge}|複勝 ◎ {anchor_num}.{str(anchor.get('name','') or '')}|{float(p_place_pct):.1f}|{_p_low_pct}|{stake_place}|\n\n"
+    if not place_ok:
+        out += f"- 複勝: 見送り理由（主ゲート）: p_place_est>= {float(min_p_place):.2f}\n"
+        try:
+            if float(min_p_low) > 0.0:
+                out += f"- 複勝: 見送り理由（下限ゲート）: p_place_low>= {float(min_p_low):.2f}\n"
+        except Exception:
+            pass
+        out += '\n'
+
+    def _name(num: str) -> str:
+        """馬番号 num から DataFrame d0 を検索して馬名を返す。見つからない場合は空文字列。"""
+        try:
+            r = d0[d0['num'] == str(num)].head(1)
+            if len(r):
+                return str(r['name'].iloc[0])
+        except Exception:
+            pass
+        return ''
+
+    fixed_info = {}  # FIXED_TEMPLATE: diagnostics for wide selection
+
+    # ---- A/B: 印順で完全固定 ----
+    # 定義：『印順』= ◎（anchor）以外を SAS 降順（同値は馬番昇順）で並べた順位。
+    # - A（2列目 / ワイド4点） = 印順2〜5位（4頭）
+    # - extras（押さえ6）      = 印順6〜11位（6頭）
+    # - B（3列目）             = 印順2〜11位（A4＋押さえ6 = 10頭）
+    # ---- dI セットアップ + A/B 候補選出 ----
+    # (L9182-9190 を dedent して inline 展開)
+    dI = d0[d0['num'] != anchor_num].copy()
+    dI['SAS'] = _num_series(dI.get('SAS', 50.0), 50.0, index=dI.index)
+    dI['PosFit'] = _num_series(dI.get('PosFit', 50.0), 50.0, index=dI.index)
+
+    # FIXED_TEMPLATE: hit-rate priority -> still build scenarios, but final A is chosen by p_wide_low_pct (if available)
+    wr_ft = params.get('wide_rules', {}) or {}
+    pace_union_enabled = bool(wr_ft.get('fixed_template_pace_union_enabled', True))
+    topk = int(wr_ft.get('fixed_template_pace_union_topk', 8) or 8)
+    tilt = float(wr_ft.get('scenario_pace_tilt', 0.08) or 0.08)  # small by design
+    # R22: 先行注意 → スロー展開ブースト
+    tilt = _bam_apply_senkyo_chui_tilt(tilt, meta, wr_ft)
+    A, B, extras, fixed_info = _bam_build_ab_candidates(
+        dI, anchor_num, params, wr_ft, tilt, opps_display,
+    )
+    if len(A) < 4 or len(B) < 10:
+        try:
+            pool = d0[d0['num'] != anchor_num]['num'].astype(str).values.tolist()
+            for x in pool:
+                if len(A) < 4 and x not in A:
+                    A.append(str(x))
+                if len(B) < 10 and x not in B:
+                    B.append(str(x))
+        except Exception:
+            pass
+    A = A[:4]
+    B = B[:10]
+    extras = [x for x in B if x not in A][:6]
+
+    # 30点固定（B=10, A=4 を想定）
+    points = 30
+    # ---- セクション出力 ----
+    out += _bam_section_analysis(d0, meta, anchor_num, params)
+    out += _bam_section_betting_plan(d0, anchor_num, A, B, params, dI, meta, df)
+    return out
+
+def _bfw_alloc_units_by_weights(weights: list, base_units: int) -> "List[int]":
+    """weights に比例した賭け単位リストを base_units をベースに配分する。"""
+    w = [max(0.0, float(x)) for x in (weights or [])]
+    if base_units <= 0 or len(w) == 0:
+        return [0] * len(w)
+    s = float(sum(w))
+    if (not np.isfinite(s)) or s <= 0:
+        per = base_units // len(w)
+        rem = base_units - per * len(w)
+        return [per + (1 if i < rem else 0) for i in range(len(w))]
+    raw  = [x / s * base_units for x in w]
+    flo  = [int(np.floor(x)) for x in raw]
+    rem  = int(base_units - sum(flo))
+    frac = [(raw[i] - flo[i], i) for i in range(len(w))]
+    frac.sort(reverse=True)
+    for k in range(max(0, rem)):
+        flo[frac[k % len(flo)][1]] += 1
+    return flo
+
+
+def _bfw_alloc_units_low_market_heavy(opps_head: "pd.DataFrame", base_units: int) -> "List[int]":
+    """NO-MARKET 環境では均等配分を返す（Markdown 配分ルール準拠）。
+
+    base_units は total_yen // unit_yen を想定。
+    """
+    import math
+    if opps_head is None or len(opps_head) == 0 or base_units <= 0:
+        return [0] * (len(opps_head) if opps_head is not None else 0)
+    lo  = _num_series(opps_head.get('wide_market_min', np.nan), index=opps_head.index)
+    hi  = _num_series(opps_head.get('wide_market_max', np.nan), index=opps_head.index)
+    mid = (lo + hi) / 2.0
+    if mid.notna().sum() == 0:
+        mid = _num_series(opps_head.get('wide_market_mid', np.nan), index=opps_head.index)
+    if mid.notna().sum() == 0:
+        mid = _num_series(opps_head.get('wide_market', np.nan), index=opps_head.index)
+    mid      = mid.astype(float).replace([np.inf, -np.inf], np.nan)
+    fillv    = float(mid.mean()) if mid.notna().sum() else 10.0
+    mid_filled = mid.fillna(fillv).clip(lower=1e-6, upper=1e6)
+    weights  = (1.0 / mid_filled.values).tolist()
+    s        = float(np.sum(weights)) if len(weights) else 0.0
+    if (not np.isfinite(s)) or s <= 0:
+        weights = [1.0] * len(mid_filled)
+        s = float(len(mid_filled))
+    raw   = [w / s * base_units for w in weights]
+    units = [int(math.floor(x + 0.5)) for x in raw]
+    diff  = int(base_units - sum(units))
+    order = np.argsort(mid_filled.values).tolist()
+    if len(order) == 0:
+        return [0] * len(units)
+    if diff > 0:
+        units[order[0]] += diff
+    elif diff < 0:
+        need = -diff
+        for idx in order:
+            if need <= 0:
+                break
+            take = min(int(units[idx]), int(need))
+            units[idx] -= take
+            need -= take
+    return [int(max(0, u)) for u in units]
+
+
+def _bfw_skip_table(opps_display, anchor: dict, params: dict) -> str:
+    """rule_info.status != 'PASS' のとき見送りテーブルを Markdown 文字列で返す。"""
+    out = ''
+    wr = params.get('wide_rules', {}) or {}
+    n_points = int(wr.get('n_points', 4) or 4)
+    out += '|#|買い目|ワイドヒット率%|ワイドヒット率_low%|stake|\n'
+    out += '|---:|---|---:|---:|---:|\n'
+    picked_pp: list = []
+    picked_pl: list = []
+    try:
+        _src = opps_display if (opps_display is not None and len(opps_display) > 0) else pd.DataFrame()
+        for i in range(min(n_points, len(_src))):
+            r = _src.iloc[i]
+            try:
+                pp = _num_scalar(r.get('p_pair', np.nan), float('nan'))
+            except Exception:
+                pp = float('nan')
+            try:
+                pl = _num_scalar(r.get('p_pair_low', np.nan), float('nan'))
+            except Exception:
+                pl = float('nan')
+            if not np.isfinite(pp):
+                try:
+                    pp_pct = _num_scalar(r.get('p_wide_est_pct', np.nan), float('nan'))
+                except Exception:
+                    pp_pct = float('nan')
+                pp = float(pp_pct) / 100.0 if np.isfinite(pp_pct) else 0.0
+            if not np.isfinite(pl):
+                try:
+                    pl_pct = _num_scalar(r.get('p_wide_low_pct', np.nan), float('nan'))
+                except Exception:
+                    pl_pct = float('nan')
+                pl = float(pl_pct) / 100.0 if np.isfinite(pl_pct) else 0.0
+            pp = float(np.clip(pp, 0.0, 1.0))
+            pl = float(np.clip(pl, 0.0, 1.0))
+            picked_pp.append(pp)
+            picked_pl.append(pl)
+            bet = f"◎ {anchor['num']}.{anchor['name']} − {r.get('num','')}.{r.get('name','')}"
+            out += f"|{i+1}|{bet}|{pp*100.0:.1f}|{pl*100.0:.1f}|0|\n"
+    except Exception:
+        pass
+    try:
+        p_any     = 1.0 - float(np.prod([1.0 - float(np.clip(p, 0.0, 1.0)) for p in picked_pp]))
+        p_any_low = 1.0 - float(np.prod([1.0 - float(np.clip(p, 0.0, 1.0)) for p in picked_pl]))
+        out += '### ワイド合成ヒット率（どれか当たる / 独立近似）\n'
+        out += f"- P_any={p_any*100.0:.1f}%, P_any_low={p_any_low*100.0:.1f}%（見送り判定だが候補は表示）\n\n"
+    except Exception:
+        out += '### ワイド合成ヒット率（どれか当たる / 独立近似）\n'
+        out += '- P_any=0.0%, P_any_low=0.0%（見送り判定だが候補は表示）\n\n'
+    return out
+
+
+def _bfw_hit_table(opps, anchor: dict, params: dict, rule_info: dict) -> str:
+    """rule_info.status == 'PASS' のとき買い目テーブルを Markdown 文字列で返す。"""
+    out = ''
+    wr       = params.get('wide_rules', {}) or {}
+    n_points = int(wr.get('n_points', 4) or 4)
+    total_yen = int(wr.get('stake_total_yen', 5000) or 5000)
+    unit_yen  = int(wr.get('stake_unit_yen',  100) or 100)
+    try:
+        tp = str((rule_info or {}).get('trio_plus_num', '') or '')
+    except Exception:
+        tp = ''
+    if tp:
+        out += f"- 連軸プラス推奨枠（固定）: {tp}（ワイド4点のうち1点）\n"
+    if bool(wr.get('front_longshot_enabled', True)):
+        out += "- 前残り穴（別財布）: 条件一致時に FRONT の穴を1点だけ追加（薄く）\n"
+    if bool(wr.get('scenario_split_enabled', False)):
+        try:
+            _when = wr.get('scenario_split_when_pace_in', ['H', 'M'])
+            _when_txt = ','.join([str(x) for x in (_when or [])])
+        except Exception:
+            _when_txt = 'H,M'
+        try:
+            _rear  = int(wr.get('scenario_split_rear_min_points', 0) or 0)
+        except Exception:
+            _rear = 0
+        try:
+            _front = int(wr.get('scenario_split_front_min_points', 0) or 0)
+        except Exception:
+            _front = 0
+        out += f"- 2シナリオ配分（差し軸+逃げ軸）: pace∈[{_when_txt}] で差し受け{_rear}点・前残り{_front}点を優先（ブレ対策）\n"
+
+    # stake allocation
+    stake_list = wr.get('stake_list', None)
+    stakes     = None
+    if stake_list is not None:
+        try:
+            stakes = [int(x) for x in stake_list]
+        except Exception:
+            stakes = None
+        if stakes is not None and len(stakes) != n_points:
+            stakes = None
+        if stakes is not None:
+            stakes = [int(max(0, (int(x) // unit_yen) * unit_yen)) for x in stakes]
+    if stakes is None:
+        base_units = max(0, total_yen // unit_yen)
+        mode = str(wr.get('stake_mode', 'low_market_heavy') or 'low_market_heavy').lower().strip()
+        k = min(n_points, len(opps))
+        if k <= 0:
+            stakes = [0] * n_points
+        else:
+            if mode == 'score_heavy':
+                sc = _num_series(opps.head(k).get('pick_score', np.nan), index=opps.head(k).index)
+                sc = sc.fillna(float(sc.mean()) if sc.notna().sum() else 0.0)
+                sc = sc - float(sc.min())
+                units = _bfw_alloc_units_by_weights((sc + 1e-6).tolist(), base_units)
+            else:
+                # NO-MARKET: 均等配分
+                units = _bfw_alloc_units_by_weights([1.0] * k, base_units)
+            stakes = [int(u) * unit_yen for u in units]
+            if len(stakes) < n_points:
+                stakes = stakes + [0] * (n_points - len(stakes))
+
+    # buy table
+    out += '|#|買い目|ワイドヒット率%|ワイドヒット率_low%|stake|\n'
+    out += '|---:|---|---:|---:|---:|\n'
+    picked_pp: list = []
+    picked_pl: list = []
+    for i in range(min(n_points, len(opps))):
+        r = opps.iloc[i]
+        try:
+            pp = _num_scalar(r.get('p_pair', np.nan), float('nan'))
+        except Exception:
+            pp = float('nan')
+        try:
+            pl = _num_scalar(r.get('p_pair_low', np.nan), float('nan'))
+        except Exception:
+            pl = float('nan')
+        if not np.isfinite(pp):
+            try:
+                pp_pct = _num_scalar(r.get('p_wide_est_pct', np.nan), float('nan'))
+            except Exception:
+                pp_pct = float('nan')
+            if np.isfinite(pp_pct):
+                pp = float(pp_pct) / 100.0
+        if not np.isfinite(pl):
+            try:
+                pl_pct = _num_scalar(r.get('p_wide_low_pct', np.nan), float('nan'))
+            except Exception:
+                pl_pct = float('nan')
+            if np.isfinite(pl_pct):
+                pl = float(pl_pct) / 100.0
+        pp = float(np.clip(pp if np.isfinite(pp) else 0.0, 0.0, 1.0))
+        pl = float(np.clip(pl if np.isfinite(pl) else 0.0, 0.0, 1.0))
+        picked_pp.append(pp)
+        picked_pl.append(pl)
+        bet = f"◎ {anchor['num']}.{anchor['name']} − {r.get('num','')}.{r.get('name','')}"
+        out += f"|{i+1}|{bet}|{pp*100.0:.1f}|{pl*100.0:.1f}|{int(stakes[i])}|\n"
+
+    try:
+        if len(picked_pp) >= 1:
+            p_any = float(np.clip(
+                1.0 - float(np.prod([1.0 - float(np.clip(p, 0.0, 1.0)) for p in picked_pp])),
+                0.0, 1.0))
+            p_any_low = float(np.clip(
+                1.0 - float(np.prod([1.0 - float(np.clip(p, 0.0, 1.0)) for p in picked_pl])),
+                0.0, 1.0))
+            out += f"|**合成**|**どれか当たる（独立近似）**|**{p_any*100.0:.1f}**|**{p_any_low*100.0:.1f}**||\n"
+    except Exception:
+        pass
+    out += '\n'
+    return out
+
+
+def _bam_fallback_wide(
+    df, params: dict, opps_display, opps,
+    rule_info: dict, anchor: dict,
+    p_place_pct: float, p_place: float, anchor_num: str,
+    stake_place: int, min_p_place: float,
+    place_ok: bool, wr: dict,
+) -> str:
+    """固定テンプレ失敗時の fallback ワイドセクションを Markdown 文字列で返す。"""
+    out = ''
+    out += '## ワイド（◎軸流し4点以内 / 絶対厳守ルール）\n'
+    if rule_info.get('status') != 'PASS':
+        out += f"- ワイド: 見送り（{rule_info.get('reason','')}）\n"
+        out += "- ワイドヒット率（表示必須）: 0.0%（見送り判定だが候補は表示）\n"
+        out += _bfw_skip_table(opps_display, anchor, params)
+    else:
+        out += _bfw_hit_table(opps, anchor, params, rule_info)
+    return out
+def _bft_sample_trio(df, te: dict, analysis_cache: dict) -> object:
+    """三連複確率の Monte Carlo サンプリングを実行し、trio_df を返す。
+
+    キャッシュヒット時はキャッシュから返す。
+    """
+    import numpy as np
+    base_samples = int(te.get('n_samples', 20000) or 20000)
+    n_runs = int(te.get('n_runs', 3) or 3)
+    seed   = int(te.get('seed', 0) or 0)
+    top_mass = float(te.get('top_mass', 0.22) or 0.22)
+    mode   = str(te.get('mode', 'global_then_filter_anchor') or 'global_then_filter_anchor')
+    z_ci   = float(te.get('z_ci', 1.281551565545) or 1.281551565545)
+    trio_df = None
+    _tc = analysis_cache or {}
+    if _tc.get('trio_top3') is not None:
+        top3 = _tc.get('trio_top3')
+        trio_df = top3 if hasattr(top3, 'columns') else None
+        return trio_df
+    # SPEED_OPT_TRIO_SAMPLE_ONCE_V1: sample once (n_runs*base_samples)
+    try:
+        from itertools import combinations
+        trio_df = _estimate_trio_probabilities(
+            df, n_samples=n_runs * base_samples, top_mass=top_mass,
+            seed=seed, mode=mode, z_ci=z_ci
+        )
+    except Exception:
+        trio_df = None
+    return trio_df
+
+
+def _bft_build_formation(trio_df, df, opps_display, params: dict, anchor: dict) -> str:
+    """三連複フォーメーション買い目 Markdown セクションを返す。"""
+    import numpy as np
+    out = ''
+    try:
+        wr = (params.get('wide_rules') or {})
+        trio_formation_max_points = int(wr.get('trio_formation_max_points', 30) or 30)
+        trio_budget = float(wr.get('trio_formation_budget_yen', 3000) or 3000)
+        anchor_num  = str(anchor.get('num', ''))
+
+        if trio_df is None or not hasattr(trio_df, 'columns') or len(trio_df) < 3:
+            out += '- 三連複: サンプル不足\n\n'
+            return out
+
+        # ABSOLUTE: ensure at least TOP 30 rows by widening top_mass if needed
+        _top_mass_use = float((params.get('trio_est') or {}).get('top_mass', 0.22) or 0.22)
+        if len(trio_df) < 30:
+            _top_mass_use = min(1.0, _top_mass_use * 2)
+        top30 = trio_df.head(min(30, len(trio_df)))
+
+        # de-dup while preserving order
+        seen = set()
+        deduped = []
+        for _, row in top30.iterrows():
+            key = tuple(sorted([str(row.get('h1','')), str(row.get('h2','')), str(row.get('h3',''))]))
+            if key not in seen:
+                seen.add(key)
+                deduped.append(row)
+        top30 = top30.iloc[:min(30, len(deduped))]
+
+        # ABSOLUTE: trio TOP 30 only
+        out += '## 三連複フォーメーション（参考）\n'
+        out += f'上位30組（確率計算）\n\n'
+        try:
+            wide_nums = []
+            if opps_display is not None and hasattr(opps_display, '__iter__'):
+                wide_nums = [str(x) for x in opps_display if str(x)]
+            # Build formation: anchor × wide × top30
+            if anchor_num and wide_nums:
+                h_set = set(wide_nums[:4])
+                h_set.add(anchor_num)
+                formation_strs = []
+                for _, row in top30.iterrows():
+                    nums = sorted([str(row.get('h1','')), str(row.get('h2','')), str(row.get('h3',''))])
+                    if anchor_num in nums:
+                        formation_strs.append('-'.join(nums))
+                if formation_strs:
+                    for combo in formation_strs[:30]:
+                        out += f'  {combo}\n'
+                out += '\n'
+                # STAKE_FLAT_V1
+                unit_yen = int((params.get('wide_rules') or {}).get('trio_formation_stake_per_ticket', 100) or 100)
+                n_tickets = min(30, len(formation_strs))
+                total_yen = unit_yen * n_tickets
+                out += f'買い目数: {n_tickets}点 / 合計: {total_yen:,}円（均等{unit_yen}円/点）\n\n'
+        except Exception:
+            out += '- フォーメーション組立失敗\n\n'
+    except Exception:
+        out += '- 三連複フォーメーション: 算出失敗\n\n'
+    return out
+
+
+def _bft_checklist(df, anchor: dict, params: dict, rule_info: dict) -> str:
+    """試運転後チェックリスト（絶対厳守 / report.md）セクションを返す。"""
+    import numpy as np
+    out = '\n## ✅ 試運転後チェック（絶対厳守 / report.md）\n'
+    try:
+        wr = (params.get('wide_rules') or {})
+        anchor_num = str(anchor.get('num', ''))
+
+        # 1) ◎ p_place_est display
+        _ok1 = False
+        try:
+            ar = df.loc[df['num'].astype(str) == anchor_num]
+            if len(ar):
+                pv = float(_num_series(ar.iloc[0].get('p_place_est_pct', np.nan)))
+                _ok1 = (0.0 <= pv <= 100.0)
+        except Exception:
+            _ok1 = False
+        out += f"- {'PASS' if _ok1 else 'FAIL'}: ◎の複勝率（p_place_est）が 0–100% で表示されている\n"
+
+        # 1.5) ワイドヒット率
+        _ok15 = True
+        out += f"- {'PASS' if _ok15 else 'FAIL'}: ワイドヒット率（0.0–100.0%）が表示されている\n"
+
+        # 2) Trio market zone bounds
+        _ok2 = True
+        out += f"- {'PASS' if _ok2 else 'FAIL'}: 三連複の想定配当ZONEが表示されている\n"
+
+        # 3) Wide: MUST be within <=4 points
+        _ok3 = False
+        try:
+            n_wide = int(rule_info.get('n_wide_final', rule_info.get('n_wide', 0)) or 0)
+            wide_skip = str(rule_info.get('wide_status', '')).lower() in ('skip','skipped')
+            _ok3 = wide_skip or (0 < n_wide <= 4)
+        except Exception:
+            _ok3 = False
+        out += f"- {'PASS' if _ok3 else 'FAIL'}: ワイドは 4 点以内（またはSKIP）\n"
+
+        # 4) Anchor must be AnchorScore #1
+        _ok4 = False
+        try:
+            if 'AnchorScore' in df.columns and 'p_place_est_pct' in df.columns:
+                top_anchor = df.sort_values(
+                    ['p_place_est_pct', 'AnchorScore', 'num'],
+                    ascending=[False, False, True]
+                ).iloc[0]
+                _ok4 = str(top_anchor.get('num','')) == anchor_num
+        except Exception:
+            _ok4 = False
+        out += f"- {'PASS' if _ok4 else 'FAIL'}: ◎はトータルバランス（AnchorScore）1位（同率は複勝率→馬番）\n"
+
+        out += '\n'
+    except Exception:
+        out += '- FAIL: checklist_generation_error\n\n'
+    return out
+
+def _bam_fallback_trio(
+    df, params: dict, anchor: dict,
+    opps_display, analysis_cache, rule_info: dict,
+) -> str:
+    """固定テンプレ失敗時の fallback 三連複フォーメーションセクションを Markdown 文字列で返す。
+
+    サンプリング・フォーメーション・チェックリストの 3 サブ関数 (_bft_*) を呼ぶオーケストレータ。
+    """
+    out = ''
+    te = params.get('trio_est', {}) or {}
+    trio_enabled = bool(te.get('enabled', True))
+
+    trio_df = None
+    if trio_enabled and len(df) >= 3:
+        trio_df = _bft_sample_trio(df, te, analysis_cache)
+
+    out += _bft_build_formation(trio_df, df, opps_display, params, anchor)
+    out += _bft_checklist(df, anchor, params, rule_info)
+    return out
+
+
+def build_audit_markdown(
+    meta: Dict[str, str],
+    df: pd.DataFrame,
+    norm_logs: Dict,
+    flags: AuditFlags,
+    wide_market_df: Optional[pd.DataFrame] = None,
+    params: Optional[dict] = None,
+    pair_model_bundle: Optional[PairModelBundle] = None,
+    place_model_bundle: Optional[PlaceModelBundle] = None,
+    analysis_cache: Optional[dict] = None,
+) -> str:
+    """rules-only（v1.14）最小Markdown（予想に必要な要素のみ）。
+
+    
+
+    省略するもの（出力軽量化目的）:
+
+      - 全体スコア表（7.1）
+
+      - 除外表（7.2）
+
+      - 監査用の詳細テーブル
+
+    
+
+    必ず残すもの（絶対厳守）:
+
+      - ◎（p_place_est を 0.0–100.0% レンジ・小数点1位で表示）
+
+      - 複勝率（モデル推定 vs （市場データは使用しない））の詳細分析テーブルを必ず表示
+
+      - 複勝ルールのBUY/見送り
+
+      - ワイド4点以内（的中率重視・下限市場固定ゲートなし）
+
+      - ワイドヒット率（P(hit)%）を小数点1位で必ず表示
+
+      - ワイドヒット率（モデル推定 vs （市場データは使用しない））の詳細分析テーブルを必ず表示
+
+      - 三連複 想定市場ZONE（market_lo/market_hi を小数点1位で表示）
+
+    """
+
+    # Resolve any 'auto' threshold placeholders using trained bundles, then enforce safety gates.
+    # ---- 初期化 ----
+    params = _bam_init_params(params, place_model_bundle, pair_model_bundle, meta)
+    pace = str(meta.get('pace', 'M') or 'M').upper().strip()
+    if pace not in ['H', 'M', 'S']:
+        pace = 'M'
+    bias = meta.get('bias', 'Unknown')
+    map_summary = meta.get('map_summary', 'Unknown')
+    race = str(meta.get('race', '') or '')
+    out = '# STELLA v1.32 RULES-ONLY (LITE) + PLACE-ISO (AUTOFEATURE) 予想\n\n'
+
+    # ---- ヘッダー / バリデーション / ルール文 ----
+    out += _bam_section_header(meta, race, pace, bias, map_summary)
+
+    # ---- 調教テーブル + 自動閾値 ----
+    out += _bam_section_training_auto(df, params)
+
+    # ---- アンカー + 複勝 ----
+    ap = _bam_section_anchor_place(df, params)
+    out        += ap['out']
+    anchor      = ap['anchor']
+    place_ok    = ap['place_ok']
+    p_place_pct = ap['p_place_pct']
+    p_place     = ap['p_place']
+    _p_low_pct  = ap['_p_low_pct']
+    stake_place = ap['stake_place']
+    min_p_place = ap['min_p_place']
+    min_p_low   = ap['min_p_low']
+    _cf         = ap['_cf']
+    _ctags      = ap['_ctags']
+    _cshort     = ap['_cshort']
+    _judge = 'BUY' if place_ok else 'SKIP'
+
+    # ---- ワイド相手候補 ----
+    wp = _bam_prepare_wide(df, params, anchor, pair_model_bundle,
+                           wide_market_df, analysis_cache, p_place)
+    opps         = wp['opps']
+    opps_display = wp['opps_display']
+    rule_info    = wp['rule_info']
+    wr           = wp['wr']
+    _thr_skip    = wp['_thr_skip']
+    anchor_num   = str(anchor.get('num', ''))
+
+    # ---- 固定テンプレ（主経路） ----
+    try:
+        return _bam_fixed_template(
+            df, meta, params, anchor,
+            p_place_pct, p_place, place_ok, min_p_place, min_p_low,
+            _judge, _p_low_pct, stake_place,
+            _cf, _ctags, _cshort,
+            opps_display,
+        )
+    except Exception:
+        pass
+
+    # ---- fallback: ワイド + 三連複 ----
+    out += _bam_fallback_wide(
+        df, params, opps_display, opps, rule_info,
+        anchor, p_place_pct, p_place, anchor_num,
+        stake_place, min_p_place, place_ok, wr,
+    )
+    out += _bam_fallback_trio(df, params, anchor, opps_display, analysis_cache, rule_info)
+    out += '---\n'
+    out += f"- wide_rules_status: {rule_info.get('status','')}\n"
+    out += f"- wide_rules_reason: {rule_info.get('reason','')}\n"
+    out += '- version: STELLA v1.18 RULES-ONLY (LITE) + PLACE-ISO (AUTOFEATURE)\n'
+    out += f'- note: {flags.reason}\n'
+    return out
+
+
+
+
+
+
+
+# ==========================================================================
+# Round-14 helpers: main() split into sub-functions
+# ==========================================================================
+
+def _main_build_argparser() -> "argparse.ArgumentParser":
+    """CLI 引数パーサーを構築して返す。main() から分離。"""
+    ap = argparse.ArgumentParser()
+
+    # --- legacy (v9) ---
+    ap.add_argument('--entries_img', type=str, default=None, help='出走表スクショ（列名付き / legacy）')
+    ap.add_argument('--entries_csv', type=str, default=None, help='出走表CSV（legacy / 任意）')
+    ap.add_argument('--meta_img', type=str, default=None, help='レース情報スクショ（任意）')
+
+    # --- v10 OCR-first inputs ---
+    ap.add_argument('--rating_img', type=str, default=None, help='【v10】レイティング表スクショ（必須候補）')
+    ap.add_argument('--speed_index_img', type=str, default=None, help='【v10】スピード指数表スクショ（必須候補）')
+    ap.add_argument('--factor_img', type=str, default=None, help='【v10】ファクター表スクショ（任意）')
+    ap.add_argument('--pred_times_imgs', type=str, nargs='*', default=None, help='【v10】各出走馬の予測タイム表スクショ（任意・複数可）')
+    ap.add_argument('--ai_time_img', type=str, default=None, help='【v10】AI展開予測/タイム予測スクショ（任意）')
+    ap.add_argument('--track_imgs', type=str, nargs='*', default=None, help='【JRA】馬場スクショ（任意）')
+    ap.add_argument('--training_keibabook_imgs', type=str, nargs='*', default=None, help='【追加】keibabook調教ページスクショ（複数可）')
+
+    # comments
+    ap.add_argument('--comments_csv', type=str, default=None, help='厩舎コメントCSV（num,type,text）')
+    ap.add_argument('--comments_inline', type=str, default=None, help='厩舎コメントCSV本文（貼り付け用）')
+    ap.add_argument('--comments_encoding', type=str, default='utf-8', help='comments_csv の文字コード')
+
+    # PURE_DATA: market-related CLI options removed
+
+    # ocr settings
+    ap.add_argument('--ocr_workers', type=int, default=None, help='OCR並列数（未指定なら最大4）')
+    ap.add_argument('--ocr_cache_dir', type=str, default=None, help='OCR結果キャッシュDIR')
+    ap.add_argument('--ocr_cache_force', action='store_true', help='キャッシュがあってもOCRを強制する')
+
+    # run cache
+    ap.add_argument('--run_cache_dir', type=str, default=None, help='実行結果キャッシュDIR')
+    ap.add_argument('--run_cache_force', action='store_true', help='run cacheがあっても再計算する')
+
+    # analysis cache
+    ap.add_argument('--analysis_cache_dir', type=str, default=None, help='解析キャッシュDIR')
+    ap.add_argument('--analysis_cache_force', action='store_true', help='analysis cacheがあっても再計算する')
+    ap.add_argument('--analysis_cache_key_mode', type=str, default='wide_only',
+                    choices=['wide_only', 'strict'], help='analysis cacheキーの厳密度')
+    ap.add_argument('--no_parallel_ocr', action='store_true', help='OCRを並列化しない（デバッグ用）')
+    ap.add_argument('--lang', type=str, default='jpn+eng')
+
+    # fast mode
+    ap.add_argument('--fast', action='store_true', help='高速運用モード（重い推定のサンプル数を落とす）')
+
+    # output / models
+    ap.add_argument('--params_json', type=str, default=None)
+    ap.add_argument('--pair_model_in', type=str, default=None, help='学習済みp_pairモデル(joblib)')
+    ap.add_argument('--pair_model_out', type=str, default=None, help='p_pairモデルの保存先(joblib)')
+    ap.add_argument('--place_model_in', type=str, default=None, help='複勝校正モデル(joblib)')
+    ap.add_argument('--place_model_out', type=str, default=None, help='複勝モデルの保存先(joblib)')
+    ap.add_argument('--place_train_csv', type=str, default=None, help='複勝モデル学習用CSV')
+    ap.add_argument('--place_feature_cols', type=str, default=None, help='複勝モデル特徴量カラム（カンマ区切り）')
+    ap.add_argument('--place_race_id_col', type=str, default='race_id')
+    ap.add_argument('--place_show_flag_col', type=str, default='show_flag')
+    ap.add_argument('--place_cv_splits', type=int, default=5)
+    ap.add_argument('--pair_train_csv', type=str, default=None, help='学習用の馬単位CSV')
+    ap.add_argument('--pair_feature_cols', type=str, default=None, help='p_pair学習に使う特徴量（カンマ区切り）')
+    ap.add_argument('--pair_race_id_col', type=str, default='race_id')
+    ap.add_argument('--pair_show_flag_col', type=str, default='show_flag')
+    ap.add_argument('--pair_horse_id_col', type=str, default='horse_id')
+    ap.add_argument('--pair_cv_splits', type=int, default=5)
+    ap.add_argument('--pair_low_q', type=float, default=0.05)
+    ap.add_argument('--out_md', type=str, default='report.md')
+    # R39: レース結果保存機能
+    ap.add_argument('--result_dir', type=str, default=None,
+                    help='R39: 予想結果JSONを保存するディレクトリ (例: output/results)')
+    ap.add_argument('--race_id', type=str, default=None,
+                    help='R39: レースID (未指定時はmeta情報から自動生成)')
+    # R57: 自動保存
+    ap.add_argument('--no_auto_save', action='store_true', default=False,
+                    help='R57: 予想・結果JSONとMarkdownの自動保存を無効化')
+    ap.add_argument('--auto_save_dir', type=str, default=None,
+                    help='R57: 自動保存先ディレクトリ '
+                         '(デフォルト: /mnt/aidrive/競馬/STELLA/results)')
+    # R41: 事後分析
+    ap.add_argument('--analyze_results', type=str, default=None,
+                    help='R41: 事後分析レポート生成。保存済みJSONディレクトリを指定 (例: output/results)')
+    ap.add_argument('--analyze_out_md', type=str, default=None,
+                    help='R41: 事後分析レポートの出力先MDファイル (省略時はresult_dir/analysis_report.md)')
+    # R42: confidence自動チューニング
+    ap.add_argument('--tune_confidence', type=str, default=None,
+                    help='R42: confidenceパラメータを自動チューニング。保存済みJSONディレクトリを指定')
+    ap.add_argument('--tune_out_json', type=str, default=None,
+                    help='R42: チューニング結果のJSON出力先 (省略時はresult_dir/tuning_result.json)')
+    ap.add_argument('--tune_min_high_n', type=int, default=3,
+                    help='R42: 有効HIGH件数の最小要件 (デフォルト: 3)')
+    # R43: ワイドROI最適化
+    ap.add_argument('--wide_roi', type=str, default=None,
+                    help='R43: ワイドROI最適化分析。保存済みJSONディレクトリを指定')
+    ap.add_argument('--wide_roi_out_md', type=str, default=None,
+                    help='R43: ワイドROI分析レポートの出力先MDファイル (省略時はresult_dir/wide_roi_report.md)')
+    ap.add_argument('--wide_roi_stake', type=float, default=100.0,
+                    help='R43: ワイド1点あたりの賭け金（円） (デフォルト: 100)')
+    # R44: 三連複ROI最適化
+    ap.add_argument('--trio_roi', type=str, default=None,
+                    help='R44: 三連複ROI最適化分析。保存済みJSONディレクトリを指定')
+    ap.add_argument('--trio_roi_out_md', type=str, default=None,
+                    help='R44: 三連複ROI分析レポートの出力先MDファイル')
+    ap.add_argument('--trio_roi_stake', type=float, default=100.0,
+                    help='R44: 三連複1点あたりの賭け金（円） (デフォルト: 100)')
+    # R45: 総合ダッシュボード
+    ap.add_argument('--dashboard', type=str, default=None,
+                    help='R45: 総合ダッシュボードレポート生成 (JSONデータディレクトリ)')
+    ap.add_argument('--dashboard_out_md', type=str, default=None,
+                    help='R45: ダッシュボードレポートの出力先MDファイル (省略時はresult_dir/dashboard_report.md)')
+    ap.add_argument('--dashboard_stake_place', type=float, default=1000.0,
+                    help='R45: 複勝掛け金/レース (デフォルト: 1000)')
+    ap.add_argument('--dashboard_stake_wide', type=float, default=100.0,
+                    help='R45: ワイド1点あたり掛け金 (デフォルト: 100)')
+    ap.add_argument('--dashboard_stake_trio', type=float, default=100.0,
+                    help='R45: 三連複1点あたり掛け金 (デフォルト: 100)')
+    # R46: レースカテゴリー別ROI
+    ap.add_argument('--category_roi', type=str, default=None,
+                    help='R46: レースカテゴリー別ROI分析 (JSONデータディレクトリ)')
+    ap.add_argument('--category_roi_out_md', type=str, default=None,
+                    help='R46: カテゴリーROIレポートの出力先MDファイル (省略時はresult_dir/category_roi_report.md)')
+    ap.add_argument('--category_roi_stake', type=float, default=1000.0,
+                    help='R46: 1点あたり掛け金（円） (デフォルト: 1000)')
+    # R47: アンカースコア精度分析
+    ap.add_argument('--anchor_accuracy', type=str, default=None,
+                    help='R47: アンカースコア精度分析 (JSONデータディレクトリ)')
+    ap.add_argument('--anchor_accuracy_out_md', type=str, default=None,
+                    help='R47: 精度分析レポートの出力先MDファイル (省略時はresult_dir/anchor_accuracy_report.md)')
+    # R48: 全分析統合レポート
+    ap.add_argument('--full_analysis', type=str, default=None,
+                    help='R48: 全分析 (R41-R47) を一括実行して統合レポートを生成')
+    ap.add_argument('--full_analysis_out_md', type=str, default=None,
+                    help='R48: 統合レポートの出力先MDファイル (省略時はresult_dir/full_analysis_report.md)')
+    ap.add_argument('--full_analysis_stake_place', type=float, default=1000.0,
+                    help='R48: 複勝1レースの賭け金 (デフォルト: 1000)')
+    ap.add_argument('--full_analysis_stake_wide', type=float, default=100.0,
+                    help='R48: ワイド1点の賭け金 (デフォルト: 100)')
+    ap.add_argument('--full_analysis_stake_trio', type=float, default=100.0,
+                    help='R48: 三連複1点の賭け金 (デフォルト: 100)')
+    # R49: 会場別ダッシュボード
+    ap.add_argument('--venue_dashboard', type=str, default=None,
+                    help='R49: 会場別ダッシュボード (JSONデータディレクトリ)')
+    ap.add_argument('--venue_dashboard_out_md', type=str, default=None,
+                    help='R49: 会場別ダッシュボードの出力先MDファイル (省略時はresult_dir/venue_dashboard_report.md)')
+    ap.add_argument('--venue_dashboard_stake_place', type=float, default=1000.0,
+                    help='R49: 複勝1レースの賭け金 (デフォルト: 1000)')
+    ap.add_argument('--venue_dashboard_stake_wide', type=float, default=100.0,
+                    help='R49: ワイド1点の賭け金 (デフォルト: 100)')
+    ap.add_argument('--venue_dashboard_stake_trio', type=float, default=100.0,
+                    help='R49: 三連複1点の賭け金 (デフォルト: 100)')
+    # R50: 馬場状態補正分析
+    ap.add_argument('--track_condition', type=str, default=None,
+                    help='R50: 馬場状態補正分析 (JSONデータディレクトリ)')
+    ap.add_argument('--track_condition_out_md', type=str, default=None,
+                    help='R50: 馬場状態補正分析レポートの出力先MDファイル')
+    ap.add_argument('--track_condition_stake_place', type=float, default=1000.0,
+                    help='R50: 複勝1レースの賭け金 (デフォルト: 1000)')
+    ap.add_argument('--track_condition_stake_wide', type=float, default=100.0,
+                    help='R50: ワイド1点の賭け金 (デフォルト: 100)')
+    ap.add_argument('--track_condition_stake_trio', type=float, default=100.0,
+                    help='R50: 三連複1点の賭け金 (デフォルト: 100)')
+    ap.add_argument('--score_adjust', type=str, default=None,
+                    help='R53: 信頼度スコア再調整（馬場条件補正係数）対象ディレクトリ')
+    ap.add_argument('--score_adjust_out_md', type=str, default=None,
+                    help='R53: スコア再調整レポート出力Markdownパス')
+    ap.add_argument('--score_adjust_stake_place', type=float, default=1000.0,
+                    help='R53: 複勝1点の賭け金 (デフォルト: 1000)')
+    # R54: 時系列トレンドレポート
+    ap.add_argument('--trend_report', type=str, default=None,
+                    help='R54: 時系列トレンドレポート生成対象ディレクトリ')
+    ap.add_argument('--trend_report_out_md', type=str, default=None,
+                    help='R54: トレンドレポートのMarkdown出力先パス')
+    ap.add_argument('--trend_report_stake_place', type=float, default=1000.0,
+                    help='R54: 複勝賭け金(円) [デフォルト 1000]')
+    ap.add_argument('--trend_report_stake_wide', type=float, default=100.0,
+                    help='R54: ワイド賭け金(円) [デフォルト 100]')
+    ap.add_argument('--trend_report_stake_trio', type=float, default=100.0,
+                    help='R54: 三連複賭け金(円) [デフォルト 100]')
+    # R55: 信頼度スコア補正 自動適用
+    ap.add_argument('--apply_alpha', type=str, default=None,
+                    help='R55: 信頼度スコア補正自動適用：結果ディレクトリ(補正係数を算出しJSON保存)')
+    ap.add_argument('--apply_alpha_out_md', type=str, default=None,
+                    help='R55: 補正適用レポートのMarkdown出力先パス')
+    ap.add_argument('--apply_alpha_out_json', type=str, default=None,
+                    help='R55: 補正係数を保存するJSONパス (省略時: result_dir/alphas.json)')
+    ap.add_argument('--apply_alpha_stake_place', type=float, default=1000.0,
+                    help='R55: 複勝賭け金(円) [デフォルト 1000]')
+
+    return ap
+
+
+def _main_setup_cache_dirs(args: "argparse.Namespace") -> None:
+    """デフォルトのキャッシュディレクトリを設定する（未指定時のみ）。"""
+    try:
+        from pathlib import Path as _P
+        _base = _P('/mnt/aidrive/競馬/STELLA/cache')
+        _base.mkdir(parents=True, exist_ok=True)
+        if getattr(args, 'ocr_cache_dir', None) in (None, '', 'None'):
+            args.ocr_cache_dir = str(_base / 'ocr')
+        if getattr(args, 'analysis_cache_dir', None) in (None, '', 'None'):
+            args.analysis_cache_dir = str(_base / 'analysis')
+        if getattr(args, 'run_cache_dir', None) in (None, '', 'None'):
+            args.run_cache_dir = str(_base / 'run')
+        # R57: 自動保存 result_dir のデフォルト設定
+        if not getattr(args, 'no_auto_save', False):
+            if getattr(args, 'result_dir', None) in (None, '', 'None'):
+                _auto_base = (
+                    getattr(args, 'auto_save_dir', None)
+                    or '/mnt/aidrive/競馬/STELLA/results'
+                )
+                args.result_dir = str(_auto_base)
+    except Exception:
+        pass
+
+
+def _main_load_place_model(args, th_grid: int, th_beta: float, th_strategy: str) -> object:
+    """複勝モデルを読み込むか学習して返す。失敗時は None を返す。"""
+    place_model_bundle = None
+    try:
+        if args.place_model_in:
+            place_model_bundle = load_place_model_bundle(args.place_model_in)
+        elif args.place_train_csv and args.place_model_out:
+            train_df = pd.read_csv(args.place_train_csv)
+            if args.place_feature_cols:
+                fcols = [c.strip() for c in str(args.place_feature_cols).split(',') if c.strip()]
+            else:
+                fcols = auto_select_place_feature_cols(
+                    train_df,
+                    y_col=str(args.place_show_flag_col),
+                    group_col=str(args.place_race_id_col),
+                )
+            place_model_bundle = train_place_model_bundle(
+                train_df,
+                feature_cols=fcols,
+                y_col=str(args.place_show_flag_col),
+                group_col=str(args.place_race_id_col),
+                n_splits=int(args.place_cv_splits or 5),
+                threshold_grid=th_grid,
+                threshold_strategy=th_strategy,
+                threshold_beta=th_beta,
+            )
+            save_place_model_bundle(place_model_bundle, args.place_model_out)
+    except Exception:
+        place_model_bundle = None
+    return place_model_bundle
+
+
+def _main_fast_params(args: "argparse.Namespace", params: dict) -> dict:
+    """--fast フラグが立っている場合にシミュレーション数を削減する。"""
+    if getattr(args, 'fast', False):
+        params.setdefault('trio_est', {})
+        params['trio_est'].update({'enabled': True, 'n_samples': 2500, 'n_runs': 1})
+        params.setdefault('wide_rules', {})
+        params['wide_rules'].update({'p_low_n_runs': 3})
+        params['wide_rules'].update({'p_low_n_samples': 5000})
+    return params
+
+
+def _main_check_run_cache(args: "argparse.Namespace", params: dict) -> "Tuple[str, Optional[str]]":
+    """run_cache にヒットすれば report テキストを返す。なければ None を返す。"""
+    run_cache_key = _run_cache_key_from_inputs(args, params)
+    if args.run_cache_dir and (not getattr(args, 'run_cache_force', False)):
+        cached_md = try_load_run_cache(args.run_cache_dir, run_cache_key)
+        if cached_md:
+            return run_cache_key, cached_md
+    return run_cache_key, None
+
+
+def _main_ocr_meta(args: "argparse.Namespace") -> "Dict[str, str]":
+    """meta_img / ai_time_img / track_imgs を（可能なら並列）OCR して meta dict を返す。"""
+    meta: Dict[str, str] = {}
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+        import os
+        _maxw = getattr(args, 'ocr_workers', None)
+        if _maxw is None:
+            try:
+                _maxw = min(4, max(1, (os.cpu_count() or 2) // 2))
+            except Exception:
+                _maxw = 2
+        _maxw = int(max(1, _maxw))
+        _jobs = {}
+
+        def _call(fn, *a, **kw) -> None:
+            """任意の関数 fn を可変引数で呼び出す薄いラッパ（ProcessPoolExecutor 用）。"""
+            return fn(*a, **kw)
+
+        with ProcessPoolExecutor(max_workers=_maxw) as ex:
+            if args.meta_img:
+                _jobs['meta'] = ex.submit(
+                    _call, ocr_meta_image_cached, args.meta_img,
+                    lang=args.lang, cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force,
+                )
+            if args.ai_time_img:
+                _jobs['ai_time'] = ex.submit(
+                    _call, ocr_ai_time_summary_v10_cached, args.ai_time_img,
+                    lang=args.lang, cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force,
+                )
+            if getattr(args, 'track_imgs', None):
+                _jobs['track'] = ex.submit(
+                    _call, ocr_track_images, list(args.track_imgs or []), lang=args.lang,
+                )
+            for k, f in _jobs.items():
+                try:
+                    r = f.result()
+                    if isinstance(r, dict):
+                        meta.update(r)
+                except Exception:
+                    pass
+    except Exception:
+        # sequential fallback
+        if args.meta_img:
+            meta = ocr_meta_image_cached(
+                args.meta_img, lang=args.lang,
+                cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force,
+            )
+        if args.ai_time_img:
+            try:
+                meta.update(ocr_ai_time_summary_v10_cached(
+                    args.ai_time_img, lang=args.lang,
+                    cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force,
+                ))
+            except Exception:
+                pass
+        if getattr(args, 'track_imgs', None):
+            try:
+                meta.update(ocr_track_images(list(args.track_imgs or []), lang=args.lang))
+            except Exception:
+                pass
+
+    # enrich meta with JRA moisture reference tables + course profile data
+    try:
+        if meta:
+            meta = enrich_meta_with_jra_moisture_refs(meta)
+            meta = enrich_meta_with_course_profile(meta)
+    except Exception:
+        pass
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# R23: _main_build_entries をサブ関数に分割（137行 → 各 14〜54行）
+# ---------------------------------------------------------------------------
+
+def _mbe_load_legacy(args: "argparse.Namespace") -> "Optional[pd.DataFrame]":
+    """R23: レガシーパス（entries_csv / entries_img）から DataFrame を返す。
+
+    どちらも指定されていない場合は None を返す。
+    """
+    if getattr(args, 'entries_csv', None):
+        return load_entries_from_csv(args.entries_csv)
+    if getattr(args, 'entries_img', None):
+        expected = [
+            'num', 'name', 'rating', 'speed_max', 'zone_3c', 'zone_4c', 'speed_hist',
+            'pred_first3f', 'pred_last3f', 'dirt', 'course', 'distance', 'last', 'training', 'record',
+        ]
+        return ocr_table_image(args.entries_img, expected_cols=expected, lang=args.lang)
+    return None
+
+
+def _mbe_ocr_parallel(args: "argparse.Namespace") -> "pd.DataFrame":
+    """R23: v10 OCR 4テーブルを並列取得し entries DataFrame を返す。
+
+    ProcessPoolExecutor 失敗時はシーケンシャルにフォールバック。
+    rating_img / speed_index_img が未指定なら SystemExit を送出。
+    """
+    if (not getattr(args, 'rating_img', None)) or (not getattr(args, 'speed_index_img', None)):
+        raise SystemExit('v10: rating_img と speed_index_img を指定してください（entries_img/csv を使わない場合）')
+
+    _EMPTY_FACTOR = pd.DataFrame(
+        columns=['num', 'name', 'cpu_mark', 'dirt', 'course', 'distance', 'last', 'training', 'record'])
+    _EMPTY_PRED   = pd.DataFrame(columns=['num', 'name', 'pred_first3f', 'pred_last3f'])
+
+    def _seq() -> tuple:
+        """シーケンシャルフォールバック: (rating_df, speed_df, factor_df, pred_df) を返す。"""
+        rating_df = ocr_rating_table_v10_cached(
+            args.rating_img, lang=args.lang, cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force)
+        speed_df = ocr_speed_index_table_v10_cached(
+            args.speed_index_img, lang=args.lang, cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force)
+        factor_df = (ocr_factor_table_v10_cached(
+            args.factor_img, lang=args.lang, cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force)
+            if getattr(args, 'factor_img', None) else _EMPTY_FACTOR)
+        pred_df = (ocr_pred_times_table_v10_cached(
+            args.pred_times_imgs or [], lang=args.lang, cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force)
+            if getattr(args, 'pred_times_imgs', None) else _EMPTY_PRED)
+        return rating_df, speed_df, factor_df, pred_df
+
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+        import os
+
+        def _call(fn, *a, **kw):
+            """任意の関数 fn を可変引数で呼び出す薄いラッパ（ProcessPoolExecutor 用）。"""
+            return fn(*a, **kw)
+
+        _maxw = getattr(args, 'ocr_workers', None)
+        if _maxw is None:
+            try:
+                _maxw = min(4, max(1, (os.cpu_count() or 2) // 2))
+            except Exception:
+                _maxw = 2
+        _maxw = int(max(1, _maxw))
+        _jobs: dict = {}
+        with ProcessPoolExecutor(max_workers=_maxw) as ex:
+            _jobs['rating_df'] = ex.submit(
+                _call, ocr_rating_table_v10_cached, args.rating_img,
+                lang=args.lang, cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force)
+            _jobs['speed_df'] = ex.submit(
+                _call, ocr_speed_index_table_v10_cached, args.speed_index_img,
+                lang=args.lang, cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force)
+            if getattr(args, 'factor_img', None):
+                _jobs['factor_df'] = ex.submit(
+                    _call, ocr_factor_table_v10_cached, args.factor_img,
+                    lang=args.lang, cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force)
+            if getattr(args, 'pred_times_imgs', None):
+                _jobs['pred_df'] = ex.submit(
+                    _call, ocr_pred_times_table_v10_cached, args.pred_times_imgs or [],
+                    lang=args.lang, cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force)
+            _res = {k: f.result() for k, f in _jobs.items()}
+        rating_df = _res['rating_df']
+        speed_df  = _res['speed_df']
+        factor_df = _res.get('factor_df') or _EMPTY_FACTOR
+        pred_df   = _res.get('pred_df')   or _EMPTY_PRED
+    except Exception:
+        rating_df, speed_df, factor_df, pred_df = _seq()
+
+    return _merge_entries_base([rating_df, speed_df, pred_df, factor_df])
+
+
+def _mbe_load_training_ocr(args: "argparse.Namespace") -> "Optional[pd.DataFrame]":
+    """R23: 調教 OCR（keibabook）ページを読み込んでマージ結果を返す。
+
+    training_keibabook_imgs が未設定 / 例外発生時は None を返す。
+    """
+    try:
+        imgs = getattr(args, 'training_keibabook_imgs', None)
+        if not imgs:
+            return None
+        pages = []
+        for p in list(imgs or []):
+            if not p:
+                continue
+            pages.append(ocr_training_keibabook_v1_cached(
+                p, lang=args.lang, cache_dir=args.ocr_cache_dir, force=args.ocr_cache_force))
+        return _merge_training_ocr_results(pages) if pages else None
+    except Exception:
+        return None
+
+
+def _mbe_map_and_validate(
+    entries: "pd.DataFrame",
+    meta: dict,
+) -> "pd.DataFrame":
+    """R23: entries の列マッピング（v9互換）と入力バリデーションを行う。
+
+    - rating / speed_max が欠損なら NaN で補完
+    - zone_3c / zone_4c が空なら 'MIDDLE' に置換
+    - validate_and_sanitize_entries を実行し _vmeta を meta に反映
+    """
+    if 'rating' not in entries.columns:
+        entries['rating'] = np.nan
+    if 'speed_max' not in entries.columns:
+        entries['speed_max'] = np.nan
+    for c in ['zone_3c', 'zone_4c', 'speed_hist', 'dirt', 'course', 'distance', 'last', 'training', 'record']:
+        if c not in entries.columns:
+            entries[c] = ''
+    entries['zone_3c'] = entries['zone_3c'].replace('', 'MIDDLE')
+    entries['zone_4c'] = entries['zone_4c'].replace('', 'MIDDLE')
+    try:
+        entries, _vmeta = validate_and_sanitize_entries(entries, expected_min=16)
+        if isinstance(_vmeta, dict):
+            meta.update({k: str(v) for k, v in _vmeta.items() if v is not None})
+    except Exception:
+        pass
+    return entries
+
+
+_TRAINING_COLS = [
+    'TrainingScore', 'TrainingRank', 'delta_train', 'WorkoutScore_latest',
+    't4_latest', 't3_latest', 't1_latest', 'course_latest', 'load_latest', 'pair_latest',
+]
+
+# ---------------------------------------------------------------------------
+# R24 Task 2: バックテスト用 CSV スキーマ定数
+# ---------------------------------------------------------------------------
+
+# バックテスト用 CSV のヘッダー定義（races_history.csv）
+# 列名: 型: 説明
+BACKTEST_CSV_SCHEMA: dict = {
+    # === レース識別 ===
+    'race_id':        str,   # 例: '20260322_CKY_7R'
+    'race_date':      str,   # 例: '2026-03-22'
+    'course':         str,   # 例: '中京'
+    'race_no':        int,   # 例: 7
+    'distance':       int,   # 例: 1400
+    'surface':        str,   # 例: 'turf' / 'dirt'
+    'pace_actual':    str,   # 実際のペース: 'H' / 'M' / 'S'
+    'pace_ai':        str,   # AI予測ペース: 'H' / 'M' / 'S'
+    # === 結果 ===
+    'result_1st':     str,   # 1着馬番
+    'result_2nd':     str,   # 2着馬番
+    'result_3rd':     str,   # 3着馬番
+    # === 払戻 ===
+    'payout_trio':    float, # 三連複払戻 (円) 例: 37950.0
+    'payout_wide_12': float, # ワイド 1着-2着 払戻
+    'payout_wide_13': float, # ワイド 1着-3着 払戻
+    'payout_wide_23': float, # ワイド 2着-3着 払戻
+    # === AI予想 ===
+    'anchor_num':     str,   # ◎馬番
+    'wide_A':         str,   # ワイド相手4頭 (カンマ区切り) 例: '9,12,7,11'
+    'trio_B':         str,   # 三連複3列目10頭 (カンマ区切り)
+    # === 賭け金 ===
+    'stake_fukusho':  int,   # 複勝賭け金 (円)
+    'stake_wide':     int,   # ワイド1点あたり賭け金 (円)
+    'stake_trio':     int,   # 三連複1点あたり賭け金 (円)
+}
+
+# バックテスト CSV に必ず必要な最小列セット
+BACKTEST_REQUIRED_COLS: list = [
+    'race_id', 'race_date', 'anchor_num',
+    'result_1st', 'result_2nd', 'result_3rd',
+    'wide_A', 'trio_B',
+    'stake_wide', 'stake_trio',
+]
+
+
+def backtest_pnl_from_row(row: dict) -> dict:
+    """R24: バックテスト CSV 1行から P&L（損益）を計算して dict で返す。
+
+    計算ロジック:
+      - ワイド: wide_A 4頭 × anchor に対して (1着,2着),(1着,3着),(2着,3着) の払戻を確認
+      - 三連複: trio_B 10頭 × anchor で 30通りをチェックし、(1着,2着,3着) が一致すれば的中
+      - 複勝: anchor が 3着以内なら的中
+
+    Returns:
+        dict: hit_fukusho, hit_wide, hit_trio,
+              pnl_wide, pnl_trio, pnl_fukusho, pnl_total (全て円)
+    """
+    def _nums(s) -> list:
+        if not s:
+            return []
+        return [str(x).strip() for x in str(s).split(',') if str(x).strip()]
+
+    anchor   = str(row.get('anchor_num', '') or '').strip()
+    res1     = str(row.get('result_1st', '') or '').strip()
+    res2     = str(row.get('result_2nd', '') or '').strip()
+    res3     = str(row.get('result_3rd', '') or '').strip()
+    result3  = {res1, res2, res3} - {''}
+    wide_A   = _nums(row.get('wide_A', ''))
+    trio_B   = _nums(row.get('trio_B', ''))
+    sw       = int(row.get('stake_wide',  100) or 100)
+    st       = int(row.get('stake_trio',  100) or 100)
+    sf       = int(row.get('stake_fukusho', 200) or 200)
+
+    # 複勝
+    hit_fukusho = (anchor in result3)
+    payout_fuk  = float(row.get('payout_fukusho', 0.0) or 0.0)
+    pnl_fukusho = (payout_fuk / 100.0 * sf) - sf if hit_fukusho else -sf
+
+    # ワイド (anchor × wide_A)
+    wide_pairs = [(anchor, a) for a in wide_A if a != anchor]
+    hit_wide   = 0
+    pnl_wide   = -sw * len(wide_pairs)
+    for (a, b) in wide_pairs:
+        pair = {a, b}
+        if pair.issubset(result3):
+            key = f'payout_wide_{min(a,b,key=lambda x:int(x) if x.isdigit() else 99)}'
+            # payout_wide_12/13/23 のいずれかを参照
+            w12 = float(row.get('payout_wide_12', 0.0) or 0.0)
+            w13 = float(row.get('payout_wide_13', 0.0) or 0.0)
+            w23 = float(row.get('payout_wide_23', 0.0) or 0.0)
+            # 当たりペアに対応する払戻を取得
+            _r  = sorted(result3, key=lambda x: int(x) if x.isdigit() else 99)
+            if pair == {_r[0], _r[1]}: payout_w = w12
+            elif pair == {_r[0], _r[2]}: payout_w = w13
+            else: payout_w = w23
+            pnl_wide += (payout_w / 100.0 * sw)
+            hit_wide += 1
+
+    # 三連複 (anchor × trio_B 2頭組み合わせ)
+    trio_combs = [(anchor, b1, b2)
+                  for idx, b1 in enumerate(trio_B) if b1 != anchor
+                  for b2 in trio_B[idx+1:] if b2 != anchor and b2 != b1]
+    hit_trio  = 0
+    pnl_trio  = -st * len(trio_combs)
+    for (a, b1, b2) in trio_combs:
+        if {a, b1, b2} == result3:
+            payout_t = float(row.get('payout_trio', 0.0) or 0.0)
+            pnl_trio += (payout_t / 100.0 * st)
+            hit_trio += 1
+
+    return {
+        'race_id':      str(row.get('race_id', '')),
+        'hit_fukusho':  hit_fukusho,
+        'hit_wide':     hit_wide,
+        'hit_trio':     hit_trio,
+        'pnl_fukusho':  round(pnl_fukusho, 0),
+        'pnl_wide':     round(pnl_wide,     0),
+        'pnl_trio':     round(pnl_trio,     0),
+        'pnl_total':    round(pnl_fukusho + pnl_wide + pnl_trio, 0),
+    }
+
+
+def backtest_summary_from_csv(path: str) -> pd.DataFrame:
+    """R24: バックテスト CSV (races_history.csv) を読み込み P&L サマリを返す。
+
+    必須列: BACKTEST_REQUIRED_COLS 参照。
+    Returns:
+        DataFrame: 各行に backtest_pnl_from_row の結果 + cumulative pnl_total
+    """
+    df = pd.read_csv(path)
+    # 必須列チェック
+    missing = [c for c in BACKTEST_REQUIRED_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f'バックテスト CSV に必須列がない: {missing}')
+    rows = [backtest_pnl_from_row(r) for r in df.to_dict('records')]
+    result = pd.DataFrame(rows)
+    result['cum_pnl_total'] = result['pnl_total'].cumsum()
+    result['roi_pct'] = (
+        result['pnl_total'].cumsum()
+        / result.index.map(lambda i: (i + 1)).astype(float)
+        * 100.0
+    ).round(1)
+    return result
+
+
+
+def _mbe_merge_training(
+    entries: "pd.DataFrame",
+    training_keibabook_all: "Optional[pd.DataFrame]",
+    params: dict,
+) -> "pd.DataFrame":
+    """R23: 調教スコア計算と entries へのマージを行う。
+
+    training_keibabook_all が None または例外発生時は _TRAINING_COLS を NaN で補完して返す。
+    """
+    def _fill_nan(df: "pd.DataFrame") -> "pd.DataFrame":
+        for c in _TRAINING_COLS:
+            if c not in df.columns:
+                df[c] = np.nan
+        return df
+
+    try:
+        if training_keibabook_all is not None:
+            trdf = compute_training_scores_keibabook(entries, training_keibabook_all, params=params)
+            if trdf is not None and len(trdf) > 0:
+                entries = entries.merge(trdf, on='num', how='left')
+            else:
+                entries = _fill_nan(entries)
+        else:
+            entries = _fill_nan(entries)
+    except Exception:
+        entries = _fill_nan(entries)
+    return entries
+
+
+def _main_build_entries(args: "argparse.Namespace", meta: dict, params: dict) -> "pd.DataFrame":
+    """OCR または CSV から entries DataFrame を構築して返す。(R23: サブ関数に分割)
+
+    処理フロー:
+      1. _mbe_load_legacy   : entries_csv / entries_img からロード（レガシー）
+      2. _mbe_ocr_parallel  : v10 OCR 4テーブル並列取得（v10パス）
+      3. _mbe_load_training_ocr  : 調教OCRページのロード
+      4. _mbe_map_and_validate   : 列マッピング + バリデーション
+      5. _mbe_merge_training     : 調教スコアのマージ
+    """
+    # Step 1: legacy path
+    entries = _mbe_load_legacy(args)
+
+    # Step 2: v10 OCR path（legacy で取得できなかった場合のみ）
+    if entries is None:
+        entries = _mbe_ocr_parallel(args)
+
+        # Step 3: 調教OCR
+        training_keibabook_all = _mbe_load_training_ocr(args)
+
+        # Step 4: 列マッピング + バリデーション
+        entries = _mbe_map_and_validate(entries, meta)
+
+        # Step 5: 調教マージ
+        entries = _mbe_merge_training(entries, training_keibabook_all, params)
+
+    return entries
+
+
+def _main_merge_comments(args: "argparse.Namespace", entries: "pd.DataFrame", params: dict) -> "pd.DataFrame":
+    """厩舎コメントを entries にマージして返す。"""
+    comments_df = None
+    try:
+        if getattr(args, 'comments_inline', None):
+            comments_df = read_comments_inline(str(args.comments_inline))
+        elif getattr(args, 'comments_csv', None):
+            comments_df = read_comments_csv(
+                str(args.comments_csv),
+                encoding=str(getattr(args, 'comments_encoding', 'utf-8') or 'utf-8'),
+            )
+    except Exception:
+        comments_df = None
+
+    if comments_df is not None and len(comments_df) > 0:
+        try:
+            entries = build_comment_features(entries, comments_df, params=params)
+        except Exception:
+            pass
+    else:
+        try:
+            entries = entries.copy()
+            if 'CommentFit' not in entries.columns:
+                entries['CommentFit'] = 50.0
+            if 'comment_short' not in entries.columns:
+                entries['comment_short'] = ''
+            if 'comment_tags' not in entries.columns:
+                entries['comment_tags'] = ''
+        except Exception:
+            pass
+    return entries
+
+
+def _main_score_and_anchor(args, entries: "pd.DataFrame", meta: dict, params: dict, place_model_bundle) -> tuple:
+    """スコア計算・複勝モデル適用・アンカー選択を行い結果をまとめて返す。"""
+    scored, norm_logs, flags = compute_scores_v1_1(entries, meta, params=params)
+
+    # Apply place model bundle (v10.11)
+    if place_model_bundle is not None:
+        try:
+            Xp = scored.copy()
+            p_cal = predict_place_probs(place_model_bundle, Xp)
+            scored['p_place_est'] = p_cal
+            scored['p_place_est'] = _num_series(scored['p_place_est'], index=scored.index)
+            scored['p_place_est'] = scored['p_place_est'].clip(lower=0.0, upper=1.0)
+            scored['p_place_est_pct'] = (scored['p_place_est'] * 100.0).astype(float)
+
+            pr = params.get('place_rules', {}) or {}
+            q  = float(pr.get('beta_q_low', 0.05) or 0.05)
+            a0 = float(pr.get('beta_a0', 1.0) or 1.0)
+            b0 = float(pr.get('beta_b0', 1.0) or 1.0)
+            n  = int(pr.get('place_beta_n', 100) or 100)
+            scored['p_place_low'] = _beta_low_heuristic(scored['p_place_est'].values, q=q, a0=a0, b0=b0, n=n)
+            scored['p_place_low'] = _num_series(scored['p_place_low'], index=scored.index)
+        except Exception as e:
+            try:
+                import sys as _sys
+                print(f'[WARN] place_model_bundle apply failed: {e}', file=_sys.stderr)
+            except Exception:
+                pass
+
+    anchor = select_anchor(scored, params=params)
+    anchor_num = str(anchor.get('num', '')).strip()
+
+    p_place_pct = float(anchor.get('p_place_est_pct', float('nan')))
+    try:
+        p_place_pct = float(np.clip(p_place_pct, 0.0, 100.0)) if np.isfinite(p_place_pct) else float('nan')
+    except Exception:
+        p_place_pct = float('nan')
+
+    print(f"◎ {anchor.get('num','')}.{anchor.get('name','')}  p_place_est={p_place_pct:.1f}% (0.0–100.0%)")
+    try:
+        _pl = float(anchor.get('p_place_low', float('nan')))
+        if _pl == _pl and _pl >= 0.0:
+            print(f'   p_place_low={_pl * 100.0:.1f}% (lower-bound)')
+    except Exception:
+        pass
+
+    # PURE_DATA: wide_market_df は使わない
+    wide_market_df = None
+
+    return scored, norm_logs, flags, anchor, anchor_num, wide_market_df
+
+
+def main() -> None:
+    """CLI エントリポイント。引数を解析し OCR → スコア計算 → 出力 MD を実行する。"""
+    ap = _main_build_argparser()
+    args = ap.parse_args()
+
+    # PROD_FAST_DEFAULT_CACHE_V1: デフォルトキャッシュDIR設定
+    _main_setup_cache_dirs(args)
+
+    pair_model_bundle = None
+
+    # threshold params (place / pair モデル共通)
+    raw_params = load_params(args.params_json)
+    topt = raw_params.get('threshold_opt', {}) or {}
+    th_grid     = int(topt.get('grid', 1001) or 1001)
+    th_beta     = float(topt.get('beta', 2.0) or 2.0)
+    th_strategy = str(topt.get('strategy', 'conservative_max') or 'conservative_max')
+
+    # 複勝モデル 読み込み / 学習
+    place_model_bundle = _main_load_place_model(args, th_grid, th_beta, th_strategy)
+
+    # OCR 依存チェック
+    if any([
+        args.entries_img, args.meta_img,
+        args.rating_img, args.speed_index_img, args.factor_img,
+        args.pred_times_imgs, args.ai_time_img, args.track_imgs,
+    ]):
+        require_ocr_deps()
+
+    params = validate_params(load_params(args.params_json))
+    params = _main_fast_params(args, params)
+    params['wide_mode']  = 'rules'
+    params['place_mode'] = 'rules'
+
+    # run cache チェック（ヒットすれば即 return）
+    run_cache_key, cached_md = _main_check_run_cache(args, params)
+    if cached_md:
+        from pathlib import Path
+        Path(args.out_md).write_text(cached_md, encoding='utf-8')
+        print(f'[CACHE] run_cache hit -> wrote {args.out_md}')
+        return
+
+    # analysis cache ロード
+    analysis_cache = None
+    analysis_key   = None
+    if args.analysis_cache_dir:
+        analysis_key = _analysis_cache_key_from_inputs(args, params)
+        if not getattr(args, 'analysis_cache_force', False):
+            analysis_cache = try_load_analysis_cache(args.analysis_cache_dir, analysis_key)
+            if analysis_cache is None:
+                analysis_cache = {}
+
+    # meta (OCR)
+    meta: Dict[str, str] = _main_ocr_meta(args)
+
+    # entries 構築
+    entries = _main_build_entries(args, meta, params)
+
+    # コメントマージ
+    entries = _main_merge_comments(args, entries, params)
+
+    # スコア計算 + アンカー選択
+    scored, norm_logs, flags, anchor, anchor_num, wide_market_df = _main_score_and_anchor(
+        args, entries, meta, params, place_model_bundle
+    )
+
+    # pair モデル 読み込み / 学習
+    try:
+        if args.pair_model_in:
+            pair_model_bundle = load_pair_model_bundle(args.pair_model_in)
+        elif args.pair_train_csv and args.pair_model_out:
+            _require_pair_ml_deps()
+            horse_df = pd.read_csv(args.pair_train_csv)
+            if args.pair_feature_cols:
+                fcols = [c.strip() for c in str(args.pair_feature_cols).split(',') if c.strip()]
+            else:
+                default = ['AnchorScore', 'SAS', 'rating', 'speed_max', 'Ability', 'PosFit',
+                           'Consist', 'MapFit', 'TimeFit', 'FactorFit']
+                fcols = [c for c in default if c in horse_df.columns]
+                if not fcols:
+                    ban = {args.pair_race_id_col, args.pair_show_flag_col, args.pair_horse_id_col, 'num', 'name'}
+                    fcols = [c for c in horse_df.columns
+                             if c not in ban and pd.api.types.is_numeric_dtype(horse_df[c])]
+            pair_model_bundle = train_pair_model_bundle(
+                horse_df,
+                feature_cols=fcols,
+                race_id_col=args.pair_race_id_col,
+                horse_id_col=args.pair_horse_id_col,
+                show_flag_col=args.pair_show_flag_col,
+                n_splits=int(args.pair_cv_splits or 5),
+                low_q=float(args.pair_low_q or 0.05),
+                threshold_grid=th_grid,
+                threshold_strategy=th_strategy,
+                threshold_beta=th_beta,
+            )
+            save_pair_model_bundle(pair_model_bundle, args.pair_model_out)
+    except Exception:
+        pair_model_bundle = None
+
+    # レポート生成
+    report = build_audit_markdown(
+        meta, scored, norm_logs, flags,
+        wide_market_df=wide_market_df,
+        params=params,
+        pair_model_bundle=pair_model_bundle,
+        place_model_bundle=place_model_bundle,
+        analysis_cache=analysis_cache,
+    )
+
+    from pathlib import Path
+    Path(args.out_md).write_text(report, encoding='utf-8')
+
+    # キャッシュ保存
+    if args.analysis_cache_dir and analysis_key:
+        try:
+            if isinstance(analysis_cache, dict) and len(analysis_cache) > 0:
+                save_analysis_cache(args.analysis_cache_dir, analysis_key, analysis_cache)
+        except Exception:
+            pass
+
+    if args.run_cache_dir:
+        save_run_cache(args.run_cache_dir, run_cache_key, md_text=report, meta={'out_md': args.out_md})
+
+    print(f'OK: wrote {args.out_md}')
+
+    # R41: レース結果保存（R40 confidence情報付き）
+    if getattr(args, 'result_dir', None):
+        try:
+            _r41_conf_info = {}
+            try:
+                _r41_conf_info = _r40_place_confidence_level(anchor, scored, params) or {}
+            except Exception:
+                pass
+            _r41_place_ok = bool(anchor.get('p_place_est', 0.0) >= float(
+                (params.get('place_rules', {}) or {}).get('min_p_place_est', 0.26) or 0.26
+            ))
+            _r39_result_path = save_race_result(
+                result_dir=str(args.result_dir),
+                meta=meta,
+                anchor=anchor,
+                scored_df=scored,
+                params=params,
+                race_id=getattr(args, 'race_id', None),
+                place_ok=_r41_place_ok,
+                confidence_level=_r41_conf_info.get('level'),
+                confidence_score_gap=_r41_conf_info.get('score_gap'),
+            )
+            if _r39_result_path:
+                print(f'[R41] result saved -> {_r39_result_path}')
+                # R57: Markdownも同ディレクトリに自動保存
+                try:
+                    import shutil as _shutil
+                    _r57_report_dir = Path(str(args.result_dir)) / 'reports'
+                    _r57_report_dir.mkdir(parents=True, exist_ok=True)
+                    _r57_safe_id = str(
+                        getattr(args, 'race_id', None)
+                        or _r39_race_id_from_meta(meta)
+                    ).replace('/', '_').replace(' ', '_')
+                    _r57_md_path = _r57_report_dir / f'{_r57_safe_id}.md'
+                    _r57_md_path.write_text(report, encoding='utf-8')
+                    print(f'[R57] report saved -> {_r57_md_path}')
+                except Exception as _r57e:
+                    print(f'[R57] report save failed: {_r57e}')
+        except Exception as _e:
+            print(f'[R41] result save failed: {_e}')
+
+    # R42: confidence自動チューニング（--tune_confidence 指定時）
+    if getattr(args, 'tune_confidence', None):
+        try:
+            _tune_out = getattr(args, 'tune_out_json', None) or (
+                str(args.tune_confidence).rstrip('/') + '/tuning_result.json')
+            _r42_result = tune_confidence_params(
+                result_dir=str(args.tune_confidence),
+                params=params,
+                min_high_n=getattr(args, 'tune_min_high_n', 3),
+                out_json=_tune_out,
+                verbose=True,
+            )
+            # 最適パラメータをparams.jsonに書き出し
+            if _r42_result.get('best_score') is not None:
+                _best_p = _r42_result['best_params']
+                print('[R42] 推奨パラメータ:')
+                for _k, _v in _best_p.items():
+                    print(f'  {_k}: {_v}')
+                print(f'[R42] チューニング結果保存 -> {_tune_out}')
+        except Exception as _e:
+            print(f'[R42] tune_confidence failed: {_e}')
+        return  # チューニングのみで終了
+
+    # R44: 三連複ROI最適化（--trio_roi 指定時）
+    if getattr(args, 'trio_roi', None):
+        try:
+            _t44_out = getattr(args, 'trio_roi_out_md', None) or (
+                str(args.trio_roi).rstrip('/') + '/trio_roi_report.md')
+            _t44_stake = float(getattr(args, 'trio_roi_stake', 100.0) or 100.0)
+            _r44_result = analyze_trio_roi(
+                result_dir=str(args.trio_roi),
+                params=params,
+                stake_trio_per=_t44_stake,
+                out_md=_t44_out,
+                verbose=True,
+            )
+            print('[R44] 三連複ROI分析完了: n_races={}, best_max_points={}'.format(
+                _r44_result.get('n_races', 0), _r44_result.get('best_max_points', 10)))
+            print('[R44] レポート保存 -> {}'.format(_t44_out))
+        except Exception as _e:
+            print('[R44] trio_roi failed: {}'.format(_e))
+        return  # 三連複ROI分析のみで終了
+
+    # R43: ワイドROI最適化（--wide_roi 指定時）
+    if getattr(args, 'wide_roi', None):
+        try:
+            _w43_out = getattr(args, 'wide_roi_out_md', None) or (
+                str(args.wide_roi).rstrip('/') + '/wide_roi_report.md')
+            _w43_stake = float(getattr(args, 'wide_roi_stake', 100.0) or 100.0)
+            _r43_result = analyze_wide_roi(
+                result_dir=str(args.wide_roi),
+                params=params,
+                stake_wide_per=_w43_stake,
+                out_md=_w43_out,
+                verbose=True,
+            )
+            print(f'[R43] ワイドROI分析完了: n_races={_r43_result.get("n_races",0)}, '
+                  f'推奨n_points={_r43_result.get("best_n_points",4)}, '
+                  f'推奨rank_by={_r43_result.get("best_rank_by","AnchorScore")}')
+            print(f'[R43] レポート保存 -> {_w43_out}')
+        except Exception as _e:
+            print(f'[R43] wide_roi failed: {_e}')
+        return  # ワイドROI分析のみで終了
+
+    # R47: アンカースコア精度分析（--anchor_accuracy 指定時）
+    if getattr(args, 'anchor_accuracy', None):
+        try:
+            _a47_out = getattr(args, 'anchor_accuracy_out_md', None) or (
+                str(args.anchor_accuracy).rstrip('/') + '/anchor_accuracy_report.md')
+            _r47_result = analyze_anchor_accuracy(
+                result_dir=str(args.anchor_accuracy),
+                params=params,
+                out_md=_a47_out,
+                verbose=True,
+            )
+            pr = _r47_result.get('correlation', {}).get('pearson_r')
+            print('[R47] 精度分析完了: n_races={}, pearson_r={}'.format(
+                _r47_result.get('n_races', 0),
+                '{:.4f}'.format(pr) if pr is not None else 'N/A'))
+            print('[R47] レポート保存 -> {}'.format(_a47_out))
+        except Exception as _e:
+            print('[R47] anchor_accuracy failed: {}'.format(_e))
+        return  # 精度分析のみで終了
+
+    # R46: レースカテゴリー別ROI分析（--category_roi 指定時）
+    if getattr(args, 'category_roi', None):
+        try:
+            _c46_out = getattr(args, 'category_roi_out_md', None) or (
+                str(args.category_roi).rstrip('/') + '/category_roi_report.md')
+            _c46_stake = float(getattr(args, 'category_roi_stake', 1000.0) or 1000.0)
+            _r46_result = analyze_category_roi(
+                result_dir=str(args.category_roi),
+                params=params,
+                stake_per=_c46_stake,
+                out_md=_c46_out,
+                verbose=True,
+            )
+            print('[R46] カテゴリーROI分析完了: n_races={}, best_venue={}, best_slot={}'.format(
+                _r46_result.get('n_races', 0),
+                _r46_result.get('best_venue', '不明'),
+                _r46_result.get('best_slot', '不明')))
+            print('[R46] レポート保存 -> {}'.format(_c46_out))
+        except Exception as _e:
+            print('[R46] category_roi failed: {}'.format(_e))
+        return  # カテゴリーROI分析のみで終了
+
+    # R45: 総合ダッシュボードレポート（--dashboard 指定時）
+    if getattr(args, 'dashboard', None):
+        try:
+            _d45_out = getattr(args, 'dashboard_out_md', None) or (
+                str(args.dashboard).rstrip('/') + '/dashboard_report.md')
+            _d45_sp = float(getattr(args, 'dashboard_stake_place', 1000.0) or 1000.0)
+            _d45_sw = float(getattr(args, 'dashboard_stake_wide', 100.0) or 100.0)
+            _d45_st = float(getattr(args, 'dashboard_stake_trio', 100.0) or 100.0)
+            _r45_result = analyze_dashboard(
+                result_dir=str(args.dashboard),
+                params=params,
+                stake_place=_d45_sp,
+                stake_wide=_d45_sw,
+                stake_trio=_d45_st,
+                out_md=_d45_out,
+                verbose=True,
+            )
+            print('[R45] ダッシュボード完了: composite_score={:.1f}, out={}'.format(
+                _r45_result.get('composite_score', 0), _d45_out))
+        except Exception as _e:
+            print('[R45] dashboard failed: {}'.format(_e))
+        return  # ダッシュボード分析のみで終了
+
+    # R41: 事後分析レポート生成（--analyze_results 指定時）
+    if getattr(args, 'analyze_results', None):
+        try:
+            _r41_report = analyze_race_results(
+                result_dir=str(args.analyze_results),
+                params=params,
+                stake_place=float((params.get('place_rules', {}) or {}).get('stake_place', 1000) or 1000),
+                out_md=getattr(args, 'analyze_out_md', None),
+            )
+            print(_r41_report)
+            if not getattr(args, 'analyze_out_md', None):
+                # 分析のみ実行して終了する場合はout_mdにも書き出し
+                _ana_path = str(args.analyze_results).rstrip('/') + '/analysis_report.md'
+                try:
+                    from pathlib import Path as _Path
+                    _Path(_ana_path).write_text(_r41_report, encoding='utf-8')
+                    print(f'[R41] analysis report -> {_ana_path}')
+                except Exception:
+                    pass
+        except Exception as _e:
+            print(f'[R41] analyze failed: {_e}')
+
+
+    # R48: 全分析統合レポート（--full_analysis 指定時）
+    if getattr(args, 'full_analysis', None):
+        try:
+            _f48_out = getattr(args, 'full_analysis_out_md', None) or (
+                str(args.full_analysis).rstrip('/') + '/full_analysis_report.md')
+            _f48_sp = float(getattr(args, 'full_analysis_stake_place', 1000.0) or 1000.0)
+            _f48_sw = float(getattr(args, 'full_analysis_stake_wide', 100.0) or 100.0)
+            _f48_st = float(getattr(args, 'full_analysis_stake_trio', 100.0) or 100.0)
+            _r48_result = analyze_full(
+                result_dir=str(args.full_analysis),
+                params=params,
+                stake_place=_f48_sp,
+                stake_wide=_f48_sw,
+                stake_trio=_f48_st,
+                out_md=_f48_out,
+                verbose=True,
+            )
+            _r48_cs = _r48_result.get('kpis', {}).get('composite_score')
+            print('[R48] 全分析統合完了: 成功={}/{}, composite_score={}'.format(
+                _r48_result.get('success_count', 0),
+                _r48_result.get('total_count', 7),
+                '{:.1f}'.format(float(_r48_cs)) if _r48_cs is not None else 'N/A'))
+            print('[R48] レポート保存 -> {}'.format(_f48_out))
+        except Exception as _e:
+            print('[R48] full_analysis failed: {}'.format(_e))
+        return  # 全分析のみで終了
+
+
+    # R49: 会場別ダッシュボード（--venue_dashboard 指定時）
+    if getattr(args, 'venue_dashboard', None):
+        try:
+            _v49_out = getattr(args, 'venue_dashboard_out_md', None) or (
+                str(args.venue_dashboard).rstrip('/') + '/venue_dashboard_report.md')
+            _v49_sp = float(getattr(args, 'venue_dashboard_stake_place', 1000.0) or 1000.0)
+            _v49_sw = float(getattr(args, 'venue_dashboard_stake_wide', 100.0) or 100.0)
+            _v49_st = float(getattr(args, 'venue_dashboard_stake_trio', 100.0) or 100.0)
+            _r49_result = analyze_venue_dashboard(
+                result_dir=str(args.venue_dashboard),
+                params=params,
+                stake_place=_v49_sp,
+                stake_wide=_v49_sw,
+                stake_trio=_v49_st,
+                out_md=_v49_out,
+                verbose=True,
+            )
+            print('[R49] 会場別ダッシュボード完了: n_venues={}, n_races={}'.format(
+                _r49_result.get('n_venues', 0),
+                _r49_result.get('n_races', 0)))
+            print('[R49] 推奨: 複勝={}, ワイド={}, 三連複={}'.format(
+                _r49_result.get('best_venue_place', '不明'),
+                _r49_result.get('best_venue_wide', '不明'),
+                _r49_result.get('best_venue_trio', '不明')))
+            print('[R49] レポート保存 -> {}'.format(_v49_out))
+        except Exception as _e:
+            print('[R49] venue_dashboard failed: {}'.format(_e))
+        return  # 会場別ダッシュボードのみで終了
+
+
+    # R50: 馬場状態補正分析（--track_condition 指定時）
+    if getattr(args, 'track_condition', None):
+        try:
+            _t50_out = getattr(args, 'track_condition_out_md', None) or (
+                str(args.track_condition).rstrip('/') + '/track_condition_report.md')
+            _t50_sp = float(getattr(args, 'track_condition_stake_place', 1000.0) or 1000.0)
+            _t50_sw = float(getattr(args, 'track_condition_stake_wide', 100.0) or 100.0)
+            _t50_st = float(getattr(args, 'track_condition_stake_trio', 100.0) or 100.0)
+            _r50_result = analyze_track_condition(
+                result_dir=str(args.track_condition),
+                params=params,
+                stake_place=_t50_sp,
+                stake_wide=_t50_sw,
+                stake_trio=_t50_st,
+                out_md=_t50_out,
+                verbose=True,
+            )
+            print('[R50] 馬場状態補正分析完了: n_races={}, n_categories={}'.format(
+                _r50_result.get('n_races', 0),
+                _r50_result.get('n_categories', 0)))
+            print('[R50] 推奨: 複勝={}, ワイド={}, 三連複={}'.format(
+                _r50_result.get('best_going_place', '不明'),
+                _r50_result.get('best_going_wide', '不明'),
+                _r50_result.get('best_going_trio', '不明')))
+            print('[R50] レポート保存 -> {}'.format(_t50_out))
+        except Exception as _e:
+            print('[R50] track_condition failed: {}'.format(_e))
+        return  # 馬場状態分析のみで終了
+
+    # R52: ペース×会場×馬場条件 3軸クロス分析（--cross_analysis 指定時）
+    if getattr(args, 'cross_analysis', None):
+        try:
+            _a52_out = getattr(args, 'cross_analysis_out_md', None) or (
+                str(args.cross_analysis).rstrip('/') + '/cross_analysis_report.md')
+            _a52_sp = float(getattr(args, 'cross_analysis_stake_place', 1000.0) or 1000.0)
+            _a52_sw = float(getattr(args, 'cross_analysis_stake_wide', 100.0) or 100.0)
+            _a52_st = float(getattr(args, 'cross_analysis_stake_trio', 100.0) or 100.0)
+            _r52_result = analyze_cross_analysis(
+                result_dir=str(args.cross_analysis),
+                params=params,
+                stake_place=_a52_sp,
+                stake_wide=_a52_sw,
+                stake_trio=_a52_st,
+                out_md=_a52_out,
+                verbose=True,
+            )
+            print('[R52] 3軸クロス分析完了: n_races={}, top10件数={}'.format(
+                _r52_result.get('n_races', 0),
+                len(_r52_result.get('top10', []))))
+            if _r52_result.get('top10'):
+                _t = _r52_result['top10'][0]
+                print('[R52] TOP1: pace={}, venue={}, going={}, ROI={}'.format(
+                    _t.get('pace','?'), _t.get('venue_cat','?'),
+                    _t.get('going_cat','?'), _t.get('place_roi','?')))
+            print('[R52] レポート保存 -> {}'.format(_a52_out))
+        except Exception as _e:
+            print('[R52] cross_analysis failed: {}'.format(_e))
+
+    # R53: 信頼度スコア再調整（馬場条件補正係数）
+    if getattr(args, 'score_adjust', None):
+        try:
+            _a53_out = getattr(args, 'score_adjust_out_md', None) or (
+                str(args.score_adjust).rstrip('/') + '/score_adjust_report.md')
+            _a53_sp = float(getattr(args, 'score_adjust_stake_place', 1000.0) or 1000.0)
+            _r53_result = analyze_score_adjust(
+                result_dir=str(args.score_adjust),
+                params=params,
+                stake_place=_a53_sp,
+                out_md=_a53_out,
+                verbose=True,
+            )
+            print('[R53] スコア再調整完了: n_races={}, n_ok={}'.format(
+                _r53_result.get('n_races', 0),
+                _r53_result.get('n_ok', 0)))
+            _alphas = _r53_result.get('alphas', {})
+            print('[R53] 補正係数: {}'.format(
+                {k: v.get('alpha', 1.0) for k, v in _alphas.items()}))
+            print('[R53] レポート保存 -> {}'.format(_a53_out))
+        except Exception as _e:
+            print('[R53] score_adjust failed: {}'.format(_e))
+        return  # スコア再調整のみで終了
+
+    # R54: 時系列トレンドレポート
+    if getattr(args, 'trend_report', None):
+        try:
+            _a54_out = getattr(args, 'trend_report_out_md', None) or (
+                str(args.trend_report).rstrip('/') + '/trend_report.md')
+            _a54_sp = float(getattr(args, 'trend_report_stake_place', 1000.0) or 1000.0)
+            _a54_sw = float(getattr(args, 'trend_report_stake_wide',  100.0) or 100.0)
+            _a54_st = float(getattr(args, 'trend_report_stake_trio',  100.0) or 100.0)
+            _r54_result = analyze_trend_report(
+                result_dir=str(args.trend_report),
+                params=params,
+                stake_place=_a54_sp,
+                stake_wide=_a54_sw,
+                stake_trio=_a54_st,
+                out_md=_a54_out,
+                verbose=True,
+            )
+            print('[R54] トレンドレポート完了: n_races={}, n_months={}'.format(
+                _r54_result.get('n_races', 0),
+                _r54_result.get('n_months', 0)))
+            print('[R54] レポート保存 -> {}'.format(_a54_out))
+        except Exception as _e:
+            print('[R54] trend_report failed: {}'.format(_e))
+        return  # 時系列トレンドレポートのみで終了
+
+    # R55: 信頼度スコア補正 自動適用
+    if getattr(args, 'apply_alpha', None):
+        try:
+            _a55_out_md   = getattr(args, 'apply_alpha_out_md', None)
+            _a55_out_json = getattr(args, 'apply_alpha_out_json', None)
+            _a55_sp = float(getattr(args, 'apply_alpha_stake_place', 1000.0) or 1000.0)
+            _r55_result = analyze_alpha_application(
+                result_dir=str(args.apply_alpha),
+                params=params,
+                stake_place=_a55_sp,
+                out_md=_a55_out_md,
+                out_json=_a55_out_json,
+                verbose=True,
+            )
+            print('[R55] 補正自動適用完了: n_races={}, n_ok={}'.format(
+                _r55_result.get('n_races', 0),
+                _r55_result.get('n_ok', 0)))
+            _alphas = _r55_result.get('alphas', {})
+            print('[R55] 補正係数: {}'.format(
+                {k: round(v.get('alpha', 1.0), 3) if isinstance(v, dict) else v
+                 for k, v in _alphas.items()}))
+            print('[R55] ╲u03b1JSON保存 -> {}'.format(_r55_result.get('alpha_json', '')))
+        except Exception as _e:
+            print('[R55] apply_alpha failed: {}'.format(_e))
+        return  # 信頼度スコア補正のみで終了
+
+
+if __name__ == '__main__':
+    main()
