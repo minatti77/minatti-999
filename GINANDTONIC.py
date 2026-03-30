@@ -440,6 +440,11 @@ DEFAULT_PARAMS = {
         # スコアギャップ閾値（1位 - 2位 AnchorScore）
         'confidence_score_gap_min': 3.0,    # HIGH用
         'confidence_score_gap_medium': 1.5, # MEDIUM用
+        # 添付資料反映: コースプロファイル/東京芝1400/クラス別ラップ補正を複勝確率へ反映
+        'course_profile_place_weight': 0.18,
+        'pace_class_place_weight': 0.10,
+        'rail_bias_place_weight': 0.06,
+        'tokyo1400_place_weight': 0.08,
     },
 
     # rules preset (used when wide_mode='rules')
@@ -635,6 +640,14 @@ DEFAULT_PARAMS = {
         'style_compat_bonus_mid': 0.025,            # FRONT×MIDDLE、MIDDLE×REAR
         'style_compat_penalty_same': -0.01,         # 同ゾーンまたがりペナルティ
         'style_compat_penalty_front_front': -0.04,  # FRONT×FRONTの先行過密ペナルティ
+        # 添付資料反映: 脚質ファミリー(E/P/S/C)の実出現率ベース補正
+        'style_family_bonus_enabled': True,
+        'style_family_bonus_scale': 0.035,
+        'style_family_rare_combo_scale': 0.015,
+        'trio_style_set_bonus_scale': 2.2,
+        'tokyo1400_outer_hold_bonus': 0.020,
+        'tokyo1400_b_course_outer_bonus': 0.030,
+        'tokyo1400_c_course_inner_bonus': 0.025,
 
     },
 
@@ -1775,24 +1788,86 @@ def _r40_place_confidence_level(
     )
 
 
+def _style_family_from_row(row: dict) -> str:
+    """既存脚質を添付資料の E/P/S/C ファミリーへ近似変換する。"""
+    zone = normalize_zone_token(str(row.get('RunningStyleLabel', row.get('zone_4c', row.get('zone4c', 'MIDDLE'))) or 'MIDDLE'))
+    first_rank = float('nan')
+    for key in ['pred_first3f_rank', 'first3f_rank', 'rank_pred_first3f']:
+        try:
+            v = row.get(key, np.nan)
+            if v is not None and str(v).strip() != '':
+                first_rank = float(v)
+                break
+        except Exception:
+            pass
+    first_val = float('nan')
+    try:
+        first_val = float(row.get('pred_first3f', np.nan))
+    except Exception:
+        pass
+    if zone == 'FRONT':
+        if (np.isfinite(first_rank) and first_rank <= 1.0) or (np.isfinite(first_val) and first_val <= 34.2):
+            return 'E'
+        return 'P'
+    if zone == 'MIDDLE':
+        return 'S'
+    if zone == 'REAR':
+        return 'C'
+    return 'S'
+
+
+
+def _style_pair_key(style_a: str, style_b: str) -> str:
+    key = '-'.join(sorted([str(style_a or 'S').upper(), str(style_b or 'S').upper()]))
+    return key if key in STYLE_FAMILY_WIDE_PRIORS else 'other'
+
+
+
+def _style_set_key(styles: list[str]) -> str:
+    key = '-'.join(sorted([str(x or 'S').upper() for x in styles[:3]]))
+    return key if key in STYLE_FAMILY_TRIO_PRIORS else 'other'
+
+
+
+def _style_pair_prior_bonus(style_a: str, style_b: str, params: Optional[dict] = None) -> float:
+    """添付資料の脚質コンビ出現率をワイド相手評価へ変換する。"""
+    params = params or {}
+    wr = params.get('wide_rules', {}) or {}
+    if not bool(wr.get('style_family_bonus_enabled', True)):
+        return 0.0
+    scale = float(wr.get('style_family_bonus_scale', 0.035) or 0.035)
+    rare_scale = float(wr.get('style_family_rare_combo_scale', 0.015) or 0.015)
+    pri = STYLE_FAMILY_WIDE_PRIORS.get(_style_pair_key(style_a, style_b), STYLE_FAMILY_WIDE_PRIORS.get('other', {}))
+    bonus = float(pri.get('bonus', 0.0) or 0.0) * (scale / 0.035 if 0.035 else 1.0)
+    share = float(pri.get('share', 0.0) or 0.0)
+    payout = float(pri.get('avg_payout', 0.0) or 0.0)
+    if payout >= 1400.0 and share >= 0.06:
+        bonus += rare_scale
+    return float(bonus)
+
+
+
+def _style_set_prior_bonus(styles: list[str], params: Optional[dict] = None) -> float:
+    """添付資料の脚質セット統計を三連複フォーメーション評価へ変換する。"""
+    params = params or {}
+    wr = params.get('wide_rules', {}) or {}
+    scale = float(wr.get('trio_style_set_bonus_scale', 2.2) or 2.2)
+    pri = STYLE_FAMILY_TRIO_PRIORS.get(_style_set_key(styles), STYLE_FAMILY_TRIO_PRIORS.get('other', {}))
+    bonus = float(pri.get('bonus', 0.0) or 0.0) * (scale / 2.2 if 2.2 else 1.0)
+    share = float(pri.get('share', 0.0) or 0.0)
+    payout = float(pri.get('avg_payout', 0.0) or 0.0)
+    if payout >= 18000.0 and share >= 0.08:
+        bonus += 0.35 * scale
+    return float(bonus)
+
+
+
 def _r40_style_compat_bonus(
     anchor: dict,
     opp_row: dict,
     params: Optional[dict] = None,
 ) -> float:
-    """ワイド相手のスタイル互換性ボーナス（0.0〜bonus_max）を返す。
-
-    互換性ロジック（zone_4c ベース）:
-      - FRONT × REAR   → 高ボーナス（ペース分散カバー）
-      - FRONT × MIDDLE → 中ボーナス
-      - MIDDLE × REAR  → 中ボーナス
-      - 同ゾーン        → ペナルティ（-bonus_min）
-      - FRONT × FRONT  → 大ペナルティ（先行過密リスク）
-      - その他          → 0.0
-
-    Returns:
-        float: bonus（正=ボーナス、負=ペナルティ）
-    """
+    """ワイド相手のスタイル互換性ボーナス（添付資料の脚質統計を含む）を返す。"""
     params = params or {}
     wr = params.get('wide_rules', {}) or {}
     style_bonus_enabled = bool(wr.get('style_compat_bonus_enabled', True))
@@ -1800,28 +1875,29 @@ def _r40_style_compat_bonus(
         return 0.0
 
     bonus_high = float(wr.get('style_compat_bonus_high', 0.05) or 0.05)
-    bonus_mid  = float(wr.get('style_compat_bonus_mid', 0.025) or 0.025)
+    bonus_mid = float(wr.get('style_compat_bonus_mid', 0.025) or 0.025)
     penalty_same = float(wr.get('style_compat_penalty_same', -0.01) or -0.01)
     penalty_front_front = float(wr.get('style_compat_penalty_front_front', -0.04) or -0.04)
 
     try:
-        az = str(anchor.get('zone_4c', anchor.get('zone4c', '')) or '').upper().strip()
-        oz = str(opp_row.get('zone_4c', opp_row.get('zone4c', '')) or '').upper().strip()
-
+        az = normalize_zone_token(str(anchor.get('RunningStyleLabel', anchor.get('zone_4c', anchor.get('zone4c', ''))) or ''))
+        oz = normalize_zone_token(str(opp_row.get('RunningStyleLabel', opp_row.get('zone_4c', opp_row.get('zone4c', ''))) or ''))
         if not az or not oz:
             return 0.0
 
         pair = frozenset([az, oz])
-
+        bonus = 0.0
         if az == oz:
-            if az == 'FRONT':
-                return penalty_front_front
-            return penalty_same
-        if pair == frozenset(['FRONT', 'REAR']):
-            return bonus_high
-        if pair in (frozenset(['FRONT', 'MIDDLE']), frozenset(['MIDDLE', 'REAR'])):
-            return bonus_mid
-        return 0.0
+            bonus = penalty_front_front if az == 'FRONT' else penalty_same
+        elif pair == frozenset(['FRONT', 'REAR']):
+            bonus = bonus_high
+        elif pair in (frozenset(['FRONT', 'MIDDLE']), frozenset(['MIDDLE', 'REAR'])):
+            bonus = bonus_mid
+
+        family_a = _style_family_from_row(anchor)
+        family_b = _style_family_from_row(opp_row)
+        bonus += _style_pair_prior_bonus(family_a, family_b, params)
+        return float(bonus)
     except Exception:
         return 0.0
 
@@ -11174,6 +11250,43 @@ JRA_COURSE_PROFILE_DATA = {
     },
 }
 
+TOKYO_TURF_1400_CLASS_PACE = {
+    0: {'label': '未勝利', 'front3f': 34.58, 'back3f': 35.33, 'pace_dev': -0.75, 'f6': 11.96},
+    1: {'label': '1勝クラス', 'front3f': 34.35, 'back3f': 35.50, 'pace_dev': -1.15, 'f6': 11.92},
+    2: {'label': '2勝クラス', 'front3f': 34.05, 'back3f': 35.55, 'pace_dev': -1.50, 'f6': 11.87},
+    3: {'label': '3勝クラス', 'front3f': 33.85, 'back3f': 35.85, 'pace_dev': -2.00, 'f6': 11.83},
+    4: {'label': 'オープン/L', 'front3f': 33.63, 'back3f': 36.14, 'pace_dev': -2.51, 'f6': 11.80},
+    5: {'label': '重賞', 'front3f': 33.55, 'back3f': 36.25, 'pace_dev': -2.70, 'f6': 11.78},
+}
+
+TOKYO_TURF_1400_RAIL_BIAS = {
+    'A': {'inner_bonus': 0.00, 'outer_bonus': 0.01, 'front_bonus': 0.00, 'rear_bonus': 0.02},
+    'B': {'inner_bonus': -0.05, 'outer_bonus': 0.10, 'front_bonus': -0.02, 'rear_bonus': 0.06},
+    'C': {'inner_bonus': 0.08, 'outer_bonus': 0.00, 'front_bonus': 0.03, 'rear_bonus': 0.00},
+}
+
+STYLE_FAMILY_WIDE_PRIORS = {
+    'P-S': {'share': 0.281, 'avg_payout': 640.0, 'bonus': 0.028},
+    'S-S': {'share': 0.183, 'avg_payout': 820.0, 'bonus': 0.018},
+    'P-P': {'share': 0.118, 'avg_payout': 760.0, 'bonus': 0.010},
+    'S-C': {'share': 0.097, 'avg_payout': 1060.0, 'bonus': 0.010},
+    'E-P': {'share': 0.081, 'avg_payout': 1240.0, 'bonus': 0.008},
+    'E-S': {'share': 0.072, 'avg_payout': 1480.0, 'bonus': 0.007},
+    'P-C': {'share': 0.060, 'avg_payout': 1620.0, 'bonus': 0.006},
+    'other': {'share': 0.108, 'avg_payout': 2030.0, 'bonus': 0.003},
+}
+
+STYLE_FAMILY_TRIO_PRIORS = {
+    'P-S-S': {'share': 0.209, 'avg_payout': 11200.0, 'bonus': 2.8},
+    'S-S-S': {'share': 0.153, 'avg_payout': 9400.0, 'bonus': 2.1},
+    'P-P-S': {'share': 0.131, 'avg_payout': 13500.0, 'bonus': 2.0},
+    'E-P-S': {'share': 0.090, 'avg_payout': 18600.0, 'bonus': 1.7},
+    'P-S-C': {'share': 0.082, 'avg_payout': 20400.0, 'bonus': 1.6},
+    'S-S-C': {'share': 0.067, 'avg_payout': 24800.0, 'bonus': 1.4},
+    'P-P-P': {'share': 0.060, 'avg_payout': 15200.0, 'bonus': 1.1},
+    'other': {'share': 0.208, 'avg_payout': 29300.0, 'bonus': 0.4},
+}
+
 
 def _normalize_racecourse_name(name: Optional[str]) -> str:
     """競馬場名をJRA10場の標準名へ正規化する。"""
@@ -11216,6 +11329,70 @@ def _course_style_adjust(profile: Dict[str, object], label: str, delta: float) -
         profile['style_bias'] = sb
     except Exception:
         pass
+
+
+
+def _meta_text(meta: Dict[str, str], keys: list[str]) -> str:
+    """meta の候補キー群から文字列を連結して返す。"""
+    m = meta or {}
+    return ' '.join(str(m.get(k, '') or '') for k in keys)
+
+
+
+def _infer_race_class_id(meta: Dict[str, str]) -> int:
+    """レース名・クラス名から簡易 class_id を推定する。"""
+    s = _meta_text(meta, ['class_name', 'class', 'race_class', 'grade', 'race', 'course_info']).replace('　', ' ')
+    if any(x in s for x in ['G1', 'ＧⅠ', 'GⅠ', 'GI', 'Jpn1', 'Ｇ１', 'G2', 'ＧⅡ', 'GⅡ', 'Jpn2', 'Ｇ２', 'G3', 'ＧⅢ', 'GⅢ', 'Jpn3', 'Ｇ３', '重賞']):
+        return 5
+    if ('オープン' in s) or ('リステッド' in s) or re.search(r'(^|[^A-Z])L([^A-Z]|$)', s):
+        return 4
+    if ('3勝' in s) or ('1600万' in s):
+        return 3
+    if ('2勝' in s) or ('1000万' in s):
+        return 2
+    if ('1勝' in s) or ('500万' in s):
+        return 1
+    if any(x in s for x in ['未勝利', '新馬', 'メイクデビュー']):
+        return 0
+    return -1
+
+
+
+def _infer_rail_setting(meta: Dict[str, str]) -> str:
+    """meta からレール設定 A/B/C を推定する。"""
+    s = _meta_text(meta, ['rail_course', 'rail', 'course_info']).upper()
+    for key in ['A', 'B', 'C']:
+        if (f'{key}コース' in s) or re.search(fr'(^|[^A-Z]){key}([^A-Z]|$)', s):
+            return key
+    return ''
+
+
+
+def _infer_race_month(meta: Dict[str, str]) -> int:
+    """meta から開催月を推定する。"""
+    s = _meta_text(meta, ['date', 'race_date', 'race', 'course_info'])
+    m = re.search(r'(?:19|20)\d{2}[/-](\d{1,2})[/-]\d{1,2}', s)
+    if not m:
+        m = re.search(r'(\d{1,2})月', s)
+    try:
+        if m:
+            mm = int(m.group(1))
+            return mm if 1 <= mm <= 12 else 0
+    except Exception:
+        pass
+    return 0
+
+
+
+def _is_tokyo_turf_1400(meta: Dict[str, str]) -> bool:
+    """東京芝1400m 戦かどうかを判定する。"""
+    venue = ''
+    for k in ['racecourse_inferred', 'venue', 'racecourse', 'place_name', 'track_name', 'race', 'course_info']:
+        venue = _normalize_racecourse_name((meta or {}).get(k, ''))
+        if venue:
+            break
+    dist, surface = _meta_distance_surface(meta or {})
+    return venue == '東京' and surface == 'turf' and np.isfinite(dist) and 1350.0 <= float(dist) <= 1450.0
 
 
 
@@ -11283,6 +11460,57 @@ def _resolve_course_profile(meta: Dict[str, str]) -> tuple[str, str, dict]:
         _course_profile_adjust(profile, 'corner', 0.04)
         _course_style_adjust(profile, 'MIDDLE', 0.04)
 
+    if _is_tokyo_turf_1400(meta):
+        rail = _infer_rail_setting(meta) or 'A'
+        month = _infer_race_month(meta)
+        class_id = _infer_race_class_id(meta)
+        rail_bias = TOKYO_TURF_1400_RAIL_BIAS.get(rail, TOKYO_TURF_1400_RAIL_BIAS.get('A', {}))
+        _course_style_adjust(profile, 'FRONT', float(rail_bias.get('front_bonus', 0.0) or 0.0))
+        _course_style_adjust(profile, 'REAR', float(rail_bias.get('rear_bonus', 0.0) or 0.0))
+        _course_profile_adjust(profile, 'gate', float(rail_bias.get('inner_bonus', 0.0) or 0.0) * 0.20)
+        _course_profile_adjust(profile, 'straight', float(rail_bias.get('outer_bonus', 0.0) or 0.0) * 0.35)
+        if rail == 'B':
+            _course_profile_adjust(profile, 'straight', 0.05)
+            _course_style_adjust(profile, 'REAR', 0.04)
+        elif rail == 'C':
+            _course_profile_adjust(profile, 'corner', 0.05)
+            _course_profile_adjust(profile, 'agility', 0.05)
+            _course_style_adjust(profile, 'FRONT', 0.04)
+        if month in {4, 5}:
+            _course_profile_adjust(profile, 'straight', 0.06)
+            _course_style_adjust(profile, 'REAR', 0.10)
+            _course_style_adjust(profile, 'FRONT', -0.08)
+        elif month == 6:
+            _course_profile_adjust(profile, 'speed', 0.08)
+            _course_profile_adjust(profile, 'gate', 0.04)
+            _course_style_adjust(profile, 'FRONT', 0.08)
+        elif month in {10, 11}:
+            _course_profile_adjust(profile, 'speed', 0.05)
+            _course_style_adjust(profile, 'FRONT', 0.06)
+            _course_style_adjust(profile, 'MIDDLE', 0.03)
+        if class_id >= 4:
+            _course_profile_adjust(profile, 'straight', 0.06)
+            _course_profile_adjust(profile, 'stamina', 0.05)
+            _course_style_adjust(profile, 'REAR', 0.08)
+        elif class_id >= 2:
+            _course_profile_adjust(profile, 'straight', 0.03)
+            _course_style_adjust(profile, 'REAR', 0.04)
+            _course_style_adjust(profile, 'MIDDLE', 0.02)
+        elif class_id in {0, 1}:
+            _course_profile_adjust(profile, 'speed', 0.04)
+            _course_profile_adjust(profile, 'gate', 0.03)
+            _course_style_adjust(profile, 'FRONT', 0.03)
+        class_pace_ref = TOKYO_TURF_1400_CLASS_PACE.get(class_id, {})
+        if class_pace_ref:
+            profile['front3f_ref'] = float(class_pace_ref.get('front3f', np.nan))
+            profile['back3f_ref'] = float(class_pace_ref.get('back3f', np.nan))
+            profile['pace_dev_ref'] = float(class_pace_ref.get('pace_dev', np.nan))
+            profile['f6_ref'] = float(class_pace_ref.get('f6', np.nan))
+        profile['rail_setting'] = rail
+        profile['class_id'] = float(class_id) if class_id >= 0 else np.nan
+        profile['month'] = float(month) if month else np.nan
+        profile['tokyo1400'] = 1.0
+
     return venue, surface, profile
 
 
@@ -11298,6 +11526,17 @@ def enrich_meta_with_course_profile(meta: Dict[str, str]) -> Dict[str, str]:
         meta['course_profile_surface'] = surface
     if venue and surface:
         meta['course_profile_key'] = f'{venue}_{surface}'
+    if _is_tokyo_turf_1400(meta):
+        rail = str(profile.get('rail_setting', '') or _infer_rail_setting(meta))
+        class_id = _infer_race_class_id(meta)
+        month = _infer_race_month(meta)
+        meta['course_profile_tokyo1400'] = '1'
+        if rail:
+            meta['course_profile_rail'] = rail
+        if class_id >= 0:
+            meta['course_profile_class_id'] = str(class_id)
+        if month:
+            meta['course_profile_month'] = str(month)
     try:
         sb = dict(profile.get('style_bias', {}) or {})
         meta['course_profile_style_bias'] = 'F={:.2f},M={:.2f},R={:.2f}'.format(
@@ -11305,8 +11544,12 @@ def enrich_meta_with_course_profile(meta: Dict[str, str]) -> Dict[str, str]:
             float(sb.get('MIDDLE', 0.0) or 0.0),
             float(sb.get('REAR', 0.0) or 0.0),
         )
-        for k in ['straight', 'corner', 'stamina', 'power', 'speed', 'gate', 'agility']:
-            meta[f'course_profile_{k}'] = f"{float(profile.get(k, 0.5) or 0.5):.2f}"
+        for k in ['straight', 'corner', 'stamina', 'power', 'speed', 'gate', 'agility', 'front3f_ref', 'back3f_ref', 'pace_dev_ref', 'f6_ref']:
+            if k in profile:
+                try:
+                    meta[f'course_profile_{k}'] = f"{float(profile.get(k, 0.0) or 0.0):.2f}"
+                except Exception:
+                    meta[f'course_profile_{k}'] = str(profile.get(k, ''))
     except Exception:
         pass
     return meta
@@ -12598,6 +12841,11 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     venue, surface, profile = _resolve_course_profile(meta)
     dist, _ = _meta_distance_surface(meta)
     style_bias = dict(profile.get('style_bias', {}) or {})
+    is_tokyo1400 = _is_tokyo_turf_1400(meta)
+    rail_setting = str(profile.get('rail_setting', '') or _infer_rail_setting(meta) or '')
+    class_id = _infer_race_class_id(meta)
+    class_ref = TOKYO_TURF_1400_CLASS_PACE.get(class_id, {}) if is_tokyo1400 else {}
+    month = _infer_race_month(meta)
 
     if 'RunningStyleLabel' in d.columns:
         style_col = d['RunningStyleLabel'].astype(str).apply(normalize_zone_token)
@@ -12645,6 +12893,67 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     if surface == 'dirt' and np.isfinite(dist) and dist <= 1400:
         speed_fit = (0.60 * speed_fit + 0.40 * early_speed).clip(lower=0.0, upper=100.0)
 
+    draw_raw = pd.Series([np.nan] * len(d), index=d.index, dtype=float)
+    for c in ['frame', 'waku', 'draw', 'draw_num', 'post_position']:
+        if c in d.columns:
+            cand = pd.to_numeric(d[c], errors='coerce')
+            if cand.notna().sum() > 0:
+                draw_raw = cand
+                break
+    draw_zone = pd.Series(['middle'] * len(d), index=d.index, dtype=object)
+    if draw_raw.notna().sum() > 0:
+        if float(draw_raw.max(skipna=True)) <= 8.5:
+            draw_zone = draw_raw.apply(lambda x: 'inner' if np.isfinite(x) and x <= 4.0 else ('outer' if np.isfinite(x) and x >= 5.0 else 'middle'))
+        else:
+            draw_zone = draw_raw.apply(lambda x: 'inner' if np.isfinite(x) and x <= 6.0 else ('outer' if np.isfinite(x) and x >= 13.0 else 'middle'))
+
+    rail_bias_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+    class_pace_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+    tokyo1400_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+
+    if is_tokyo1400:
+        rail_bias = TOKYO_TURF_1400_RAIL_BIAS.get(rail_setting or 'A', TOKYO_TURF_1400_RAIL_BIAS.get('A', {}))
+        rail_bias_fit = rail_bias_fit + draw_zone.map(
+            lambda z: 100.0 * float(rail_bias.get('outer_bonus', 0.0) or 0.0) if z == 'outer' else (100.0 * float(rail_bias.get('inner_bonus', 0.0) or 0.0) if z == 'inner' else 0.0)
+        ).astype(float)
+        rail_bias_fit = rail_bias_fit + style_col.map(
+            lambda z: 100.0 * float(rail_bias.get('front_bonus', 0.0) or 0.0) if z == 'FRONT' else (100.0 * float(rail_bias.get('rear_bonus', 0.0) or 0.0) if z == 'REAR' else 0.0)
+        ).astype(float)
+        if month in {4, 5}:
+            rail_bias_fit = rail_bias_fit + style_col.map(lambda z: 5.0 if z == 'REAR' else (-4.0 if z == 'FRONT' else 1.0)).astype(float)
+        elif month == 6:
+            rail_bias_fit = rail_bias_fit + style_col.map(lambda z: 4.0 if z == 'FRONT' else (1.5 if z == 'MIDDLE' else -1.0)).astype(float)
+        elif month in {10, 11}:
+            rail_bias_fit = rail_bias_fit + style_col.map(lambda z: 3.0 if z == 'FRONT' else (1.0 if z == 'MIDDLE' else 0.0)).astype(float)
+        rail_bias_fit = rail_bias_fit.clip(lower=0.0, upper=100.0)
+
+        if class_ref:
+            target_front = float(class_ref.get('front3f', np.nan))
+            target_back = float(class_ref.get('back3f', np.nan))
+            target_dev = float(class_ref.get('pace_dev', np.nan))
+            pace_dev = (pf - pl).astype(float)
+            early_pen = (pf - target_front).abs() * 18.0
+            late_pen = (pl - target_back).abs() * 15.0
+            dev_pen = (pace_dev - target_dev).abs() * 12.0
+            class_pace_fit = (100.0 - early_pen - late_pen - dev_pen).clip(lower=0.0, upper=100.0)
+            if class_id >= 4:
+                class_pace_fit = (class_pace_fit + style_col.map(lambda z: 4.0 if z == 'REAR' else (1.5 if z == 'MIDDLE' else -2.5)).astype(float)).clip(lower=0.0, upper=100.0)
+            elif class_id >= 2:
+                class_pace_fit = (class_pace_fit + style_col.map(lambda z: 2.0 if z == 'REAR' else (1.0 if z == 'MIDDLE' else -1.0)).astype(float)).clip(lower=0.0, upper=100.0)
+            elif class_id in {0, 1}:
+                class_pace_fit = (class_pace_fit + style_col.map(lambda z: 3.0 if z == 'FRONT' else (1.0 if z == 'MIDDLE' else -1.5)).astype(float)).clip(lower=0.0, upper=100.0)
+
+        tokyo1400_fit = (
+            0.28 * rail_bias_fit
+            + 0.32 * class_pace_fit
+            + 0.14 * late_speed
+            + 0.10 * speed_fit
+            + 0.08 * straight_fit
+            + 0.08 * power_fit
+        ).clip(lower=0.0, upper=100.0)
+        if _is_wet_track(meta):
+            tokyo1400_fit = (tokyo1400_fit + 0.14 * (power_fit - 50.0) + 0.06 * (michfit - 50.0)).clip(lower=0.0, upper=100.0)
+
     style_w = 0.22
     straight_w = 0.12 + 0.10 * float(profile.get('straight', 0.5) or 0.5)
     corner_w = 0.10 + 0.10 * float(profile.get('corner', 0.5) or 0.5)
@@ -12653,7 +12962,10 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     speed_w = 0.08 + 0.08 * float(profile.get('speed', 0.5) or 0.5)
     gate_w = 0.05 + 0.05 * float(profile.get('gate', 0.5) or 0.5)
     agility_w = 0.07 + 0.08 * float(profile.get('agility', 0.5) or 0.5)
-    total_w = style_w + straight_w + corner_w + stamina_w + power_w + speed_w + gate_w + agility_w
+    rail_w = 0.05 if is_tokyo1400 else 0.0
+    classpace_w = 0.06 if is_tokyo1400 else 0.0
+    tokyo_w = 0.08 if is_tokyo1400 else 0.0
+    total_w = style_w + straight_w + corner_w + stamina_w + power_w + speed_w + gate_w + agility_w + rail_w + classpace_w + tokyo_w
 
     d['CourseStyleFit'] = _num_series(style_fit, 50.0, index=d.index)
     d['CourseStraightFit'] = _num_series(straight_fit, 50.0, index=d.index)
@@ -12662,6 +12974,9 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     d['CoursePowerFit'] = _num_series(power_fit, 50.0, index=d.index)
     d['CourseSpeedFit'] = _num_series(speed_fit, 50.0, index=d.index)
     d['CourseAgilityFit'] = _num_series(agility_fit, 50.0, index=d.index)
+    d['CourseRailBiasFit'] = _num_series(rail_bias_fit, 50.0, index=d.index)
+    d['CourseClassPaceFit'] = _num_series(class_pace_fit, 50.0, index=d.index)
+    d['CourseTokyo1400Fit'] = _num_series(tokyo1400_fit, 50.0, index=d.index)
     d['CourseProfileFit'] = (
         style_w * d['CourseStyleFit']
         + straight_w * d['CourseStraightFit']
@@ -12671,6 +12986,9 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
         + speed_w * d['CourseSpeedFit']
         + gate_w * gatefit
         + agility_w * d['CourseAgilityFit']
+        + rail_w * d['CourseRailBiasFit']
+        + classpace_w * d['CourseClassPaceFit']
+        + tokyo_w * d['CourseTokyo1400Fit']
     ) / max(1e-9, float(total_w))
     d['CourseProfileFit'] = _num_series(d['CourseProfileFit'], 50.0, index=d.index, lower=0.0, upper=100.0)
     d['CourseBiasDelta'] = (d['CourseProfileFit'] - 50.0).clip(lower=-20.0, upper=20.0).astype(float)
@@ -15475,6 +15793,9 @@ def _csp_compute_win_place_probs(
     df['PlaceAxisScore'] = _num_series(df, 'PlaceAxisScore', 50.0).clip(lower=0.0, upper=100.0).astype(float)
     course_fit_delta = _num_series(df.get('CourseProfileFit', 50.0), 50.0, index=df.index) - 50.0
     course_stamina_delta = _num_series(df.get('CourseStaminaFit', 50.0), 50.0, index=df.index) - 50.0
+    course_rail_delta = _num_series(df.get('CourseRailBiasFit', 50.0), 50.0, index=df.index) - 50.0
+    course_class_pace_delta = _num_series(df.get('CourseClassPaceFit', 50.0), 50.0, index=df.index) - 50.0
+    course_tokyo1400_delta = _num_series(df.get('CourseTokyo1400Fit', 50.0), 50.0, index=df.index) - 50.0
     df['AnchorScore'] = (
         0.62 * df['PlaceAxisScore']
         + 0.20 * _num_series(df.get('AxisReadinessScore', df['PlaceAxisScore']), df['PlaceAxisScore'], index=df.index)
@@ -15482,6 +15803,9 @@ def _csp_compute_win_place_probs(
         + 0.08 * _num_series(df.get('StabilityComposite', df.get('SAS', 50.0)), 50.0, index=df.index)
         + 0.10 * course_fit_delta
         + 0.04 * course_stamina_delta
+        + 0.06 * course_class_pace_delta
+        + 0.04 * course_rail_delta
+        + 0.05 * course_tokyo1400_delta
     ).clip(lower=0.0, upper=100.0).astype(float)
 
     # R26: ペースH時の先行馬 AnchorScore ペナルティ
@@ -15498,6 +15822,18 @@ def _csp_compute_win_place_probs(
     _sc_mean = float(_num_series(df[score_col_for_place], 50.0, index=df.index).mean())
     df["p_place_model"] = df[score_col_for_place].apply(
         lambda x: _place_prob_from_score(float(x), _pc, _sc_mean)).astype(float)
+    pr = (params.get('place_rules', {}) or {}) if isinstance(params, dict) else {}
+    course_place_weight = float(pr.get('course_profile_place_weight', 0.18) or 0.18)
+    pace_class_place_weight = float(pr.get('pace_class_place_weight', 0.10) or 0.10)
+    rail_bias_place_weight = float(pr.get('rail_bias_place_weight', 0.06) or 0.06)
+    tokyo1400_place_weight = float(pr.get('tokyo1400_place_weight', 0.08) or 0.08)
+    place_adj = (
+        course_place_weight * course_fit_delta
+        + pace_class_place_weight * course_class_pace_delta
+        + rail_bias_place_weight * course_rail_delta
+        + tokyo1400_place_weight * course_tokyo1400_delta
+    ) / 100.0
+    df["p_place_model"] = (df["p_place_model"] + place_adj).clip(lower=0.05, upper=0.72)
 
     # --- Place probability (PURE_DATA) ---
     df["p_place_mkt"] = np.nan
@@ -16508,6 +16844,34 @@ def build_trio_formation_from_wide(anchor_num: str, wide_opp_nums: list[str], df
     if 'trap_score' not in d.columns:
         d['trap_score'] = 0.0
     d['trap_score'] = _num_series(d.get('trap_score', 0.0), 0.0, index=d.index)
+    try:
+        anchor_src = df[df['num'].astype(str) == a].head(1)
+        anchor_family = _style_family_from_row(anchor_src.iloc[0].to_dict()) if len(anchor_src) else 'P'
+    except Exception:
+        anchor_family = 'P'
+    try:
+        seed_styles = [
+            _style_family_from_row(r.to_dict())
+            for _, r in df[df['num'].astype(str).isin([str(x) for x in (wide_opp_nums or [])])].iterrows()
+            if str(r.get('num', '')) != a
+        ]
+    except Exception:
+        seed_styles = []
+    d['_style_family'] = d.apply(lambda r: _style_family_from_row(r.to_dict()), axis=1)
+    d['_wide_style_bonus'] = d['_style_family'].apply(lambda fam: _style_pair_prior_bonus(anchor_family, fam, params)).astype(float)
+
+    def _trio_style_bonus_for_family(fam: str) -> float:
+        vals = []
+        if seed_styles:
+            for ss in seed_styles[:4]:
+                vals.append(_style_set_prior_bonus([anchor_family, ss, fam], params))
+        else:
+            vals.append(_style_pair_prior_bonus(anchor_family, fam, params) * 24.0)
+        return max(vals or [0.0])
+
+    d['_trio_style_bonus'] = d['_style_family'].apply(_trio_style_bonus_for_family).astype(float)
+    course_rail_delta = _num_series(d.get('CourseRailBiasFit', 50.0), 50.0, index=d.index) - 50.0
+    course_tokyo_delta = _num_series(d.get('CourseTokyo1400Fit', 50.0), 50.0, index=d.index) - 50.0
     d['_support_signal'] = (
         (d['TrainingScore'] >= 58.0) | (d['CommentTrend'] >= 56.0) | (d['JockeyDistanceEvidenceScore'] >= 60.0) | (d['CourseProfileFit'] >= 60.0)
     ).astype(float)
@@ -16519,6 +16883,10 @@ def build_trio_formation_from_wide(anchor_num: str, wide_opp_nums: list[str], df
         + 0.06 * d['CourseProfileFit']
         + 0.04 * d['CourseCornerFit']
         + d['_support_signal'] * 2.4
+        + 28.0 * d['_wide_style_bonus']
+        + d['_trio_style_bonus']
+        + 0.04 * course_rail_delta
+        + 0.03 * course_tokyo_delta
         - 0.05 * d['trap_score']
     ).astype(float)
     d['_closing_main'] = (
@@ -16529,6 +16897,10 @@ def build_trio_formation_from_wide(anchor_num: str, wide_opp_nums: list[str], df
         + 0.08 * d['CourseProfileFit']
         + 0.04 * d['CourseStraightFit']
         + 0.04 * d['CourseStaminaFit']
+        + 22.0 * d['_wide_style_bonus']
+        + 0.90 * d['_trio_style_bonus']
+        + 0.03 * course_rail_delta
+        + 0.04 * course_tokyo_delta
         - 0.05 * d['trap_score']
     ).astype(float)
 
