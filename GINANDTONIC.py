@@ -17120,11 +17120,15 @@ def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = No
     trainer_roi = _normalize_roi_score(_first_existing_series(out, [
         'trainer_place_roi', 'trainer_win_roi', '厩舎複回', '厩舎単回', '厩舎回収率', '厩舎ROI', '調教師ROI'
     ]), idx)
-    combo_rate = _normalize_rate_score(_first_existing_series(out, [
-        'jockey_trainer_combo_place_rate', 'jockey_trainer_combo_win_rate',
-        'trainer_jockey_place_rate', 'trainer_jockey_win_rate',
-        'コンビ複勝率', 'コンビ勝率', '騎手厩舎コンビ複勝率', '騎手厩舎コンビ勝率',
-        '調教師騎手複勝率', '調教師騎手勝率'
+    combo_win_rate = _normalize_rate_score(_first_existing_series(out, [
+        'jockey_trainer_combo_win_rate', 'trainer_jockey_win_rate',
+        'コンビ勝率', '騎手厩舎コンビ勝率', '調教師騎手勝率'
+    ]), idx)
+    combo_place_rate = _normalize_rate_score(_first_existing_series(out, [
+        'jockey_trainer_combo_place_rate', 'trainer_jockey_place_rate',
+        'jockey_trainer_combo_quinella_rate', 'trainer_jockey_quinella_rate',
+        'コンビ複勝率', '騎手厩舎コンビ複勝率', '調教師騎手複勝率',
+        'コンビ連対率', '騎手厩舎コンビ連対率', '調教師騎手連対率'
     ]), idx)
     combo_roi = _normalize_roi_score(_first_existing_series(out, [
         'jockey_trainer_combo_roi', 'trainer_jockey_roi', 'combo_roi', 'コンビROI', 'コンビ回収率',
@@ -17145,10 +17149,21 @@ def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = No
     trainer_n = _first_existing_series(out, ['trainer_sample_n', '厩舎出走数', '調教師出走数', 'trainer_runs'], default=0.0)
     combo_n = _first_existing_series(out, ['trainer_jockey_sample_n', 'jockey_trainer_combo_sample_n', 'コンビ出走数', '騎手厩舎コンビ出走数', 'combo_runs', '調教師騎手出走数'], default=0.0)
 
+    main_jockey_share_raw = _first_existing_series(out, [
+        'main_jockey_share', 'trainer_main_jockey_share', 'stable_main_jockey_share',
+        '主戦騎手比率', '厩舎主戦騎手比率', '主戦割合', '主戦シェア', '厩舎騎手シェア'
+    ], default=np.nan)
+    main_jockey_share_score = _normalize_rate_score(main_jockey_share_raw, idx)
+
     stable_jockey_raw = _first_existing_series(out, ['is_stable_jockey', '主戦騎手', '厩舎主戦騎手', 'stable_jockey_flag'], default=np.nan)
-    stable_jockey_score = _num_series(stable_jockey_raw, np.nan, index=idx)
-    stable_jockey_score = stable_jockey_score.where(np.isfinite(stable_jockey_score), _normalize_rate_score(stable_jockey_raw, idx))
-    stable_jockey_score = stable_jockey_score.apply(lambda x: 70.0 if np.isfinite(x) and float(x) >= 0.5 else (35.0 if np.isfinite(x) else np.nan))
+    stable_jockey_num = pd.to_numeric(stable_jockey_raw, errors='coerce')
+    stable_jockey_text = stable_jockey_raw.infer_objects(copy=False).fillna('').astype(str)
+    stable_jockey_known = stable_jockey_num.notna() | stable_jockey_text.str.strip().ne('')
+    stable_jockey_flag = (stable_jockey_num >= 0.5) | stable_jockey_text.str.contains(r'1|true|yes|主戦|固定|専属|乗り替わりなし', case=False, regex=True, na=False)
+    stable_jockey_score = pd.Series(np.nan, index=idx, dtype=float)
+    stable_jockey_score.loc[stable_jockey_known & stable_jockey_flag] = 70.0
+    stable_jockey_score.loc[stable_jockey_known & (~stable_jockey_flag)] = 35.0
+    stable_jockey_score = stable_jockey_score.where(np.isfinite(stable_jockey_score), 0.55 * main_jockey_share_score + 17.5)
     stable_jockey_score = stable_jockey_score.fillna(50.0).clip(lower=0.0, upper=100.0).astype(float)
 
     breeder_owner_affinity = _normalize_roi_score(_first_existing_series(out, [
@@ -17160,19 +17175,31 @@ def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = No
 
     out['JockeyRecentFormScore'] = _shrink_score_by_sample(jockey_recent, jockey_n, max_n=36.0)
     out['TrainerRecentFormScore'] = _shrink_score_by_sample(trainer_recent, trainer_n, max_n=36.0)
-    out['JockeyTrainerComboROIScore'] = _shrink_score_by_sample(0.50 * combo_rate + 0.50 * combo_roi, combo_n, max_n=24.0)
+    out['TrainerJockeyWinRateScore'] = _shrink_score_by_sample(combo_win_rate, combo_n, max_n=24.0)
+    out['TrainerJockeyPlaceRateScore'] = _shrink_score_by_sample(combo_place_rate, combo_n, max_n=24.0)
+    out['MainJockeyShareScore'] = main_jockey_share_score.astype(float)
+    out['JockeyTrainerComboROIScore'] = _shrink_score_by_sample(
+        0.25 * combo_win_rate + 0.35 * combo_place_rate + 0.40 * combo_roi,
+        combo_n,
+        max_n=24.0,
+    )
     out['JockeyTrainerComboFormScore'] = _shrink_score_by_sample(combo_recent, combo_n, max_n=24.0)
-    out['TrainerJockeyWinRateScore'] = _shrink_score_by_sample(combo_rate, combo_n, max_n=24.0)
+    out['TrainerJockeyChemistryScore'] = _shrink_score_by_sample(
+        0.30 * combo_win_rate + 0.30 * combo_place_rate + 0.22 * combo_roi + 0.18 * main_jockey_share_score,
+        combo_n,
+        max_n=24.0,
+    )
     out['StableJockeyScore'] = stable_jockey_score
     out['BreederOwnerAffinityScore'] = breeder_owner_affinity.astype(float)
     out['OwnerClassPriorityScore'] = owner_class_priority.astype(float)
     out['JockeyConnectionScore'] = _shrink_score_by_sample(0.60 * jockey_rate + 0.25 * jockey_roi + 0.15 * jockey_recent, jockey_n, max_n=36.0)
     out['TrainerConnectionScore'] = _shrink_score_by_sample(0.60 * trainer_rate + 0.25 * trainer_roi + 0.15 * trainer_recent, trainer_n, max_n=36.0)
     out['ConnectionRecentFormScore'] = (
-        0.28 * out['JockeyRecentFormScore']
-        + 0.22 * out['TrainerRecentFormScore']
-        + 0.30 * out['JockeyTrainerComboFormScore']
-        + 0.20 * out['StableJockeyScore']
+        0.24 * out['JockeyRecentFormScore']
+        + 0.20 * out['TrainerRecentFormScore']
+        + 0.26 * out['JockeyTrainerComboFormScore']
+        + 0.16 * out['MainJockeyShareScore']
+        + 0.14 * out['StableJockeyScore']
     ).clip(lower=0.0, upper=100.0).astype(float)
 
     jockey_rel = (_num_series(jockey_n, 0.0, index=idx, lower=0.0).clip(0.0, 36.0) / 36.0)
@@ -17181,24 +17208,29 @@ def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = No
     breeder_owner_rel = (_first_existing_series(out, ['breeder_owner_affinity', '生産者馬主相性', '生産者馬主期待値'], default=np.nan).notna()).astype(float)
     owner_class_rel = (_first_existing_series(out, ['owner_class_priority', '馬主クラス優先度', 'owner_class_bias'], default=np.nan).notna()).astype(float)
     stable_rel = (_first_existing_series(out, ['is_stable_jockey', '主戦騎手', '厩舎主戦騎手', 'stable_jockey_flag'], default=np.nan).notna()).astype(float)
+    share_rel = (_first_existing_series(out, ['main_jockey_share', 'trainer_main_jockey_share', 'stable_main_jockey_share', '主戦騎手比率', '厩舎主戦騎手比率', '主戦割合', '主戦シェア', '厩舎騎手シェア'], default=np.nan).notna()).astype(float)
     out['HumanConnectionReliability'] = (
-        100.0 * (jockey_rel + trainer_rel + combo_rel + breeder_owner_rel + owner_class_rel + stable_rel) / 6.0
+        100.0 * (jockey_rel + trainer_rel + combo_rel + breeder_owner_rel + owner_class_rel + stable_rel + share_rel) / 7.0
     ).clip(lower=0.0, upper=100.0).astype(float)
 
     out['HumanNetworkScore'] = (
-        0.34 * out['JockeyTrainerComboROIScore']
-        + 0.20 * out['TrainerJockeyWinRateScore']
-        + 0.16 * out['StableJockeyScore']
-        + 0.16 * out['BreederOwnerAffinityScore']
-        + 0.14 * out['OwnerClassPriorityScore']
+        0.24 * out['TrainerJockeyChemistryScore']
+        + 0.18 * out['JockeyTrainerComboROIScore']
+        + 0.14 * out['TrainerJockeyWinRateScore']
+        + 0.10 * out['TrainerJockeyPlaceRateScore']
+        + 0.10 * out['MainJockeyShareScore']
+        + 0.08 * out['StableJockeyScore']
+        + 0.08 * out['BreederOwnerAffinityScore']
+        + 0.08 * out['OwnerClassPriorityScore']
     ).clip(lower=0.0, upper=100.0).astype(float)
 
     out['HumanConnectionScore'] = (
-        0.24 * out['JockeyConnectionScore']
-        + 0.20 * out['TrainerConnectionScore']
-        + 0.18 * out['JockeyTrainerComboROIScore']
-        + 0.12 * out['ConnectionRecentFormScore']
-        + 0.26 * out['HumanNetworkScore']
+        0.22 * out['JockeyConnectionScore']
+        + 0.18 * out['TrainerConnectionScore']
+        + 0.16 * out['TrainerJockeyChemistryScore']
+        + 0.12 * out['JockeyTrainerComboROIScore']
+        + 0.10 * out['ConnectionRecentFormScore']
+        + 0.22 * out['HumanNetworkScore']
     ).clip(lower=0.0, upper=100.0).astype(float)
     return out
 
@@ -21057,6 +21089,7 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "調教師出走数": "trainer_sample_n",
         "コンビ勝率": "jockey_trainer_combo_win_rate",
         "コンビ複勝率": "jockey_trainer_combo_place_rate",
+        "コンビ連対率": "jockey_trainer_combo_place_rate",
         "コンビROI": "jockey_trainer_combo_roi",
         "コンビ回収率": "jockey_trainer_combo_roi",
         "騎手厩舎コンビROI": "jockey_trainer_combo_roi",
@@ -21073,9 +21106,18 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "trainer_jockey_recent_form": "trainer_jockey_recent_form",
         "調教師騎手勝率": "trainer_jockey_win_rate",
         "調教師騎手複勝率": "trainer_jockey_place_rate",
+        "調教師騎手連対率": "trainer_jockey_place_rate",
         "調教師騎手ROI": "trainer_jockey_roi",
         "調教師騎手出走数": "trainer_jockey_sample_n",
         "調教師騎手直近調子": "trainer_jockey_recent_form",
+        "main_jockey_share": "main_jockey_share",
+        "trainer_main_jockey_share": "main_jockey_share",
+        "stable_main_jockey_share": "main_jockey_share",
+        "主戦騎手比率": "main_jockey_share",
+        "厩舎主戦騎手比率": "main_jockey_share",
+        "主戦割合": "main_jockey_share",
+        "主戦シェア": "main_jockey_share",
+        "厩舎騎手シェア": "main_jockey_share",
         "is_stable_jockey": "is_stable_jockey",
         "主戦騎手": "is_stable_jockey",
         "厩舎主戦騎手": "is_stable_jockey",
