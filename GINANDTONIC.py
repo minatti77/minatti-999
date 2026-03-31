@@ -15679,12 +15679,22 @@ def _extract_weeks_since_last(df: pd.DataFrame) -> pd.Series:
     return weeks.astype(float)
 
 
+def _normalize_count_score(series_like, index, *, max_count: float = 8.0) -> pd.Series:
+    """本数系の値を 0-100 スコアへ正規化して返す。"""
+    s = _num_series(series_like, np.nan, index=index, lower=0.0)
+    finite = s[np.isfinite(s)]
+    if len(finite) == 0:
+        return pd.Series([50.0] * len(index), index=index, dtype=float)
+    max_ref = max(float(max_count), float(finite.max()), 1.0)
+    return (100.0 * s.clip(lower=0.0, upper=max_ref) / max_ref).clip(lower=0.0, upper=100.0).fillna(50.0).astype(float)
+
+
 def add_training_adjustment_features(
     df: pd.DataFrame,
     meta: Optional[Dict[str, str]] = None,
     params: Optional[dict] = None,
 ) -> pd.DataFrame:
-    """外厩帰り・調教時計順位・調教方法を数値化して調整系特徴量を追加する。"""
+    """外厩帰り・調教時計順位・調教方法に加えて、休み明け負荷質と装蹄コメントも数値化する。"""
     _ = meta, params
     if df is None or len(df) == 0:
         return df
@@ -15740,6 +15750,72 @@ def add_training_adjustment_features(
     training_method_score.loc[(method_bucket != '') & (pref_bucket != '') & (method_bucket == pref_bucket)] = 72.0
     training_method_score.loc[(method_bucket != '') & (pref_bucket != '') & (method_bucket != pref_bucket)] = 38.0
 
+    mid_work_raw = _first_existing_series(out, [
+        'mid_work_count', 'middle_work_count', 'intermediate_work_count',
+        '中間追い切り本数', '中間追切本数', '中間本数', '追い切り本数', '追切本数', '中間調教本数'
+    ], default=np.nan)
+    finish_work_raw = _first_existing_series(out, [
+        'finish_work_count', 'final_work_count', '仕上げ本数', '最終追い切り本数',
+        '最終追切本数', '1週前追い本数', '一週前追い本数', '最終追い本数'
+    ], default=np.nan)
+    cw_index_raw = _first_existing_series(out, [
+        'cw_index', 'CW指数', 'CW指標', 'ウッド指数', 'cw_score', 'clock_index',
+        '1週前追い指数', '一週前追い指数', '追い切り負荷指数'
+    ], default=np.nan)
+    mid_work_count = _num_series(mid_work_raw, np.nan, index=idx, lower=0.0)
+    finish_work_count = _num_series(finish_work_raw, np.nan, index=idx, lower=0.0)
+    cw_index = _num_series(cw_index_raw, np.nan, index=idx, lower=0.0)
+    mid_work_count = mid_work_count.where(
+        np.isfinite(mid_work_count),
+        pd.to_numeric(comment_text.str.extract(r'中間[^0-9]{0,6}([0-9]{1,2})本', expand=False), errors='coerce'),
+    )
+    finish_work_count = finish_work_count.where(
+        np.isfinite(finish_work_count),
+        pd.to_numeric(comment_text.str.extract(r'(?:1週前|一週前|最終)[^0-9]{0,6}([0-9]{1,2})本', expand=False), errors='coerce'),
+    )
+    cw_comment_flag = (
+        method_text.str.contains(r'CW|Wコース|南W|美W|栗W|ウッド', case=False, regex=True, na=False)
+        | comment_text.str.contains(r'CW|南W|美W|栗W|ウッド', case=False, regex=True, na=False)
+    )
+    cw_index = cw_index.where(np.isfinite(cw_index), cw_comment_flag.astype(float) * 1.8)
+    prep_load = (
+        0.55 * mid_work_count.fillna(0.0)
+        + 1.05 * finish_work_count.fillna(0.0)
+        + 1.65 * np.log1p(cw_index.clip(lower=0.0).fillna(0.0))
+    )
+    rest_need = np.log1p(weeks.clip(lower=0.0).fillna(0.0))
+    rest_load_score = (50.0 + 18.0 * (prep_load - 1.35 * rest_need)).clip(lower=0.0, upper=100.0)
+    long_rest_underwork = ((weeks >= 10.0) & (prep_load < (rest_need + 0.8))).astype(float)
+    long_rest_sufficient = ((weeks >= 10.0) & (prep_load >= (rest_need + 1.5))).astype(float)
+    rest_load_score = (rest_load_score - 10.0 * long_rest_underwork + 4.0 * long_rest_sufficient).clip(lower=0.0, upper=100.0)
+    rest_present = (np.isfinite(mid_work_count) | np.isfinite(finish_work_count) | np.isfinite(cw_index) | np.isfinite(weeks) | cw_comment_flag).astype(float)
+    rest_load_score = rest_load_score.where(rest_present > 0.0, 50.0)
+
+    shoe_raw = _first_existing_series(out, [
+        'shoe_change_comment', 'shoeing_comment', 'shoe_change', '蹄鉄変更', '蹄鉄コメント',
+        '装蹄コメント', '装蹄', '蹄鉄', 'shoe_change_note', 'plate_change_comment'
+    ], default='').infer_objects(copy=False).fillna('').astype(str)
+    track_text = _first_existing_series(out, [
+        'track_condition', '馬場状態', 'baba_condition', 'condition', '馬場', 'weather_track'
+    ], default='').infer_objects(copy=False).fillna('').astype(str)
+    muddy_signal = (
+        (_num_series(out, 'MichiakuFit', 50.0, index=idx) >= 55.0)
+        | track_text.str.contains(r'重|不良|稍重|道悪', regex=True, na=False)
+        | comment_text.str.contains(r'道悪|渋馬場|力の要る馬場|時計かか', regex=True, na=False)
+    )
+    shoe_text = (shoe_raw + ' ' + comment_text).astype(str)
+    aluminum_to_steel = shoe_text.str.contains(r'アルミ\s*[→>\-／/]\s*スチール|アルミからスチール|アルミ.*スチール', regex=True, na=False)
+    steel_to_aluminum = shoe_text.str.contains(r'スチール\s*[→>\-／/]\s*アルミ|スチールからアルミ', regex=True, na=False)
+    shoe_change_flag = shoe_text.str.contains(r'蹄鉄|装蹄|アルミ|スチール', regex=True, na=False)
+    shoe_change_score = pd.Series([50.0] * len(out), index=idx, dtype=float)
+    shoe_change_score.loc[shoe_change_flag] = 54.0
+    shoe_change_score.loc[aluminum_to_steel] = 60.0
+    shoe_change_score.loc[aluminum_to_steel & muddy_signal] = 72.0
+    shoe_change_score.loc[steel_to_aluminum & (~muddy_signal)] = 60.0
+    shoe_change_score.loc[steel_to_aluminum & muddy_signal] = 42.0
+    shoe_change_score.loc[shoe_text.str.contains(r'パワー|踏ん張|力強|重馬場対応', regex=True, na=False) & muddy_signal] = 74.0
+    shoe_present = shoe_change_flag.astype(float)
+
     method_present = ((method_text.str.strip() != '') | (trainer_pref_text.str.strip() != '')).astype(float)
     rank_present = _first_existing_series(out, [
         'training_time_rank', '調教時計順位', '追い切り時計順位', '追切時計順位',
@@ -15753,12 +15829,27 @@ def add_training_adjustment_features(
     out['GaikyuReturnScore'] = gaikyu_score.clip(lower=0.0, upper=100.0).astype(float)
     out['TrainingTimeRankScore'] = training_rank_score.astype(float)
     out['TrainingMethodScore'] = training_method_score.astype(float)
-    out['TrainingAdjustmentReliability'] = (100.0 * (gaikyu_present + rank_present + method_present) / 3.0).clip(lower=0.0, upper=100.0).astype(float)
+    out['mid_work_count'] = mid_work_count.fillna(0.0).astype(float)
+    out['finish_work_count'] = finish_work_count.fillna(0.0).astype(float)
+    out['cw_index'] = cw_index.fillna(0.0).astype(float)
+    out['RestLoadCompensationScore'] = rest_load_score.astype(float)
+    out['ShoeingChangeFlag'] = shoe_change_flag.astype(int)
+    out['ShoeingCommentScore'] = shoe_change_score.astype(float)
+    out['HorseConditionScore'] = (
+        0.56 * rest_load_score
+        + 0.22 * shoe_change_score
+        + 0.22 * _num_series(out, 'TrainingScore', 50.0)
+    ).clip(lower=0.0, upper=100.0).astype(float)
+    out['TrainingAdjustmentReliability'] = (
+        100.0 * (gaikyu_present + rank_present + method_present + rest_present + shoe_present) / 5.0
+    ).clip(lower=0.0, upper=100.0).astype(float)
     out['TrainingAdjustmentScore'] = (
-        0.22 * out['GaikyuReturnScore']
-        + 0.43 * out['TrainingTimeRankScore']
-        + 0.15 * out['TrainingMethodScore']
-        + 0.20 * _num_series(out, 'TrainingScore', 50.0)
+        0.18 * out['GaikyuReturnScore']
+        + 0.30 * out['TrainingTimeRankScore']
+        + 0.10 * out['TrainingMethodScore']
+        + 0.24 * out['RestLoadCompensationScore']
+        + 0.08 * out['ShoeingCommentScore']
+        + 0.10 * out['HorseConditionScore']
     ).clip(lower=0.0, upper=100.0).astype(float)
     return out
 
@@ -17489,6 +17580,102 @@ def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = No
         + 0.08 * out['OwnerRacePlacementScore']
         + 0.08 * out['BreederGaikyuCoordinationScore']
     ).clip(lower=0.0, upper=100.0).astype(float)
+    return out
+
+
+def add_meta_derived_features(
+    df: pd.DataFrame,
+    meta: Optional[Dict[str, str]] = None,
+    params: Optional[dict] = None,
+) -> pd.DataFrame:
+    """モデル出力を二次加工し、クラスタ乖離・説明可能性・疑似アンサンブル多様性を追加する。"""
+    _ = meta, params
+    if df is None or len(df) == 0:
+        return df
+
+    out = df.copy()
+    idx = out.index
+    win = _num_series(out, 'WinCandidateScore', 50.0, index=idx)
+    place = _num_series(out, 'PlaceAxisScore', 50.0, index=idx)
+    p_place_pct = _num_series(out, 'p_place_est_pct', np.nan, index=idx)
+    blended_place = p_place_pct.where(np.isfinite(p_place_pct), 0.55 * place + 0.45 * win)
+    model_score = (0.46 * win + 0.36 * place + 0.18 * blended_place).clip(lower=0.0, upper=100.0)
+    out['ModelScoreForMeta'] = model_score.astype(float)
+
+    trainer_key = _first_existing_series(out, [
+        'trainer_id', '調教師ID', 'trainer_name', '調教師', '厩舎'
+    ], default='').infer_objects(copy=False).fillna('').astype(str).replace('', 'UNK')
+    class_key = _first_existing_series(out, [
+        'class', 'race_class', 'class_name', 'クラス', 'クラス名', 'race_grade', 'grade', 'class_id'
+    ], default='').infer_objects(copy=False).fillna('').astype(str)
+    cluster_key = (trainer_key + '|' + class_key).astype(str)
+    cluster_mean = model_score.groupby(cluster_key).transform('mean')
+    trainer_mean = model_score.groupby(trainer_key).transform('mean')
+    global_mean_val = float(model_score.mean()) if np.isfinite(model_score.mean()) else 50.0
+    global_mean = pd.Series([global_mean_val] * len(out), index=idx, dtype=float)
+    cluster_size = cluster_key.map(cluster_key.value_counts()).astype(float)
+    trainer_size = trainer_key.map(trainer_key.value_counts()).astype(float)
+    cluster_baseline = cluster_mean.where(cluster_size >= 2.0, trainer_mean.where(trainer_size >= 2.0, global_mean))
+    cluster_delta = (model_score - cluster_baseline).clip(lower=-30.0, upper=30.0)
+    out['ClusterMeanDiffScore'] = (50.0 + 1.35 * cluster_delta).clip(lower=0.0, upper=100.0).astype(float)
+
+    explain_inputs = np.column_stack([
+        _num_series(out, 'AbilityBaseScore', 50.0, index=idx).values,
+        _num_series(out, 'RecentFormScore', 50.0, index=idx).values,
+        _num_series(out, 'RaceConditionScore', 50.0, index=idx).values,
+        _num_series(out, 'TrainingAdjustmentScore', 50.0, index=idx).values,
+        _num_series(out, 'HorseConditionScore', 50.0, index=idx).values,
+        _num_series(out, 'HumanNetworkScore', 50.0, index=idx).values,
+        _num_series(out, 'HumanConnectionScore', 50.0, index=idx).values,
+        _num_series(out, 'DistanceSuitScore', 50.0, index=idx).values,
+        _num_series(out, 'PaceFit', 50.0, index=idx).values,
+        _num_series(out, 'ConditionFit', 50.0, index=idx).values,
+        _num_series(out, 'OwnerRacePlacementScore', 50.0, index=idx).values,
+        _num_series(out, 'BreederSerialStrategyScore', 50.0, index=idx).values,
+    ])
+    positive = np.clip(explain_inputs - 50.0, 0.0, 50.0)
+    topn = min(3, positive.shape[1])
+    top_vals = np.sort(positive, axis=1)[:, -topn:]
+    explain_topn = top_vals.mean(axis=1)
+    explain_spread = top_vals[:, -1] - top_vals[:, 0] if topn > 1 else top_vals[:, 0]
+    out['ExplainableAITopNScore'] = pd.Series((50.0 + 1.10 * explain_topn).clip(0.0, 100.0), index=idx, dtype=float)
+    out['ExplainableAISpreadScore'] = pd.Series((50.0 + 1.00 * explain_spread).clip(0.0, 100.0), index=idx, dtype=float)
+
+    ensemble_inputs = np.column_stack([
+        win.values,
+        place.values,
+        _num_series(out, 'WPS', 50.0, index=idx).values,
+        _num_series(out, 'HumanConnectionScore', 50.0, index=idx).values,
+        _num_series(out, 'TrainingAdjustmentScore', 50.0, index=idx).values,
+    ])
+    support = np.clip((ensemble_inputs - 35.0) / 30.0, 0.0, 1.0)
+    mean_support = np.clip(support.mean(axis=1), 1e-6, 1.0 - 1e-6)
+    entropy = -(mean_support * np.log(mean_support) + (1.0 - mean_support) * np.log(1.0 - mean_support)) / np.log(2.0)
+    spread = np.std(support, axis=1) / 0.5
+    diversity = 100.0 * np.clip(0.70 * entropy + 0.30 * spread, 0.0, 1.0)
+    consensus = 100.0 - diversity
+    out['EnsembleDiversityScore'] = pd.Series(diversity.clip(0.0, 100.0), index=idx, dtype=float)
+    out['EnsembleConsensusScore'] = pd.Series(consensus.clip(0.0, 100.0), index=idx, dtype=float)
+
+    meta_confidence = (
+        0.38 * out['ClusterMeanDiffScore']
+        + 0.34 * out['ExplainableAITopNScore']
+        + 0.28 * out['EnsembleConsensusScore']
+    ).clip(lower=0.0, upper=100.0)
+    uncertainty_penalty = np.clip((out['EnsembleDiversityScore'] - 62.0) / 6.0, 0.0, 8.0)
+    out['MetaCognitionScore'] = meta_confidence.astype(float)
+    out['WinCandidateScore'] = (0.94 * win + 0.06 * meta_confidence - uncertainty_penalty).clip(lower=0.0, upper=100.0).astype(float)
+    out['PlaceAxisScore'] = (
+        0.95 * place
+        + 0.05 * (0.60 * out['ClusterMeanDiffScore'] + 0.40 * out['EnsembleConsensusScore'])
+        - 0.75 * uncertainty_penalty
+    ).clip(lower=0.0, upper=100.0).astype(float)
+    if 'AnchorScore' in out.columns:
+        anchor_base = _num_series(out, 'AnchorScore', np.nan, index=idx)
+        anchor_base = anchor_base.where(np.isfinite(anchor_base), place)
+        out['AnchorScore'] = (0.95 * anchor_base + 0.05 * meta_confidence - 0.50 * uncertainty_penalty).clip(lower=0.0, upper=100.0).astype(float)
+    if 'WinThroughScore' in out.columns:
+        out['WinThroughScore'] = (0.95 * _num_series(out, 'WinThroughScore', 50.0, index=idx) + 0.05 * meta_confidence).clip(lower=0.0, upper=100.0).astype(float)
     return out
 
 
@@ -19961,6 +20148,8 @@ def auto_select_place_feature_cols(df: pd.DataFrame, y_col: str = 'show_flag', g
         'HumanConnectionScore','ConnectionRecentFormScore','JockeyTrainerComboROIScore',
         'JockeyRecentFormScore','TrainerRecentFormScore','BreederSerialStrategyScore',
         'OwnerRacePlacementScore','OwnerPrizeExpectationScore','OwnerConditionSwitchScore',
+        'RestLoadCompensationScore','ShoeingCommentScore','HorseConditionScore',
+        'ClusterMeanDiffScore','ExplainableAITopNScore','EnsembleDiversityScore','MetaCognitionScore',
         'WinShape','Upside','WPS',
         # optional context
         'AI_REAR_CONFIRMED','zone_3c','zone_4c',
@@ -21561,6 +21750,28 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "前走間隔週": "weeks_since_last",
         "中間隔週数": "weeks_since_last",
         "休養週": "weeks_since_last",
+        "中間追い切り本数": "mid_work_count",
+        "中間追切本数": "mid_work_count",
+        "中間本数": "mid_work_count",
+        "追い切り本数": "mid_work_count",
+        "追切本数": "mid_work_count",
+        "中間調教本数": "mid_work_count",
+        "仕上げ本数": "finish_work_count",
+        "最終追い切り本数": "finish_work_count",
+        "最終追切本数": "finish_work_count",
+        "1週前追い本数": "finish_work_count",
+        "一週前追い本数": "finish_work_count",
+        "CW指数": "cw_index",
+        "CW指標": "cw_index",
+        "ウッド指数": "cw_index",
+        "1週前追い指数": "cw_index",
+        "一週前追い指数": "cw_index",
+        "追い切り負荷指数": "cw_index",
+        "蹄鉄変更": "shoe_change_comment",
+        "蹄鉄コメント": "shoe_change_comment",
+        "装蹄コメント": "shoe_change_comment",
+        "装蹄": "shoe_change_comment",
+        "蹄鉄": "shoe_change_comment",
         "days_since_last": "days_since_last",
         "days_since_prev": "days_since_last",
         "days_since_run": "days_since_last",
@@ -24420,6 +24631,7 @@ def _main_score_and_anchor(args, entries: "pd.DataFrame", meta: dict, params: di
             except Exception:
                 pass
 
+    scored = add_meta_derived_features(scored, meta, params)
     anchor = select_anchor(scored, params=params)
     anchor_num = str(anchor.get('num', '')).strip()
 
