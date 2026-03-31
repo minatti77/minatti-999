@@ -98,6 +98,19 @@ DEFAULT_PARAMS = {
 
     # --- ABSOLUTE: 市場市場（単勝/複勝/ワイド等）は予想ロジックに使わない（表示のみ可） ---
     'market_features_enabled': False,
+    # --- optional win expected value layer (display / betting-strategy only) ---
+    # p_win_field(勝率推定) × 単勝オッズ から gross EV を計算し、
+    # gross>=1.0 かつ net>=0.0 の馬を value 候補としてマークする。
+    # 予想スコア自体（AnchorScore/SAS）には反映しない。
+    'win_value_rules': {
+        'enabled': True,
+        'min_expected_return': 1.00,
+        'min_expected_value': 0.00,
+        'min_p_win': 0.03,
+        'min_win_odds': 1.0,
+        'max_win_odds': 999.9,
+        'report_top_n': 5,
+    },
 
     # --- anchor score mode ---
     # - 'add': 加点式（従来SAS）
@@ -1268,6 +1281,7 @@ def _r39_scored_df_to_records(scored_df: pd.DataFrame) -> list:
         'TimeFit', 'Consist', 'GateRecoveryBonus',
         'CommentFit', 'TrainingScore',
         'p_place_est', 'p_place_est_pct',
+        'p_win_field', 'win_odds', 'win_expected_return', 'win_expected_value', 'win_value_flag',
         'PaceFit', 'WinCandidateScore', 'PlaceAxisScore', 'CourseProfileFit',
     ]
     records = []
@@ -10117,6 +10131,122 @@ def _num_scalar(obj: Any, default: float = float('nan'), *, dtype: type = float)
         return int(float(default)) if dtype is int else dtype(default)
 
 
+def _coerce_win_odds_series(series_like, index=None) -> pd.Series:
+    """単勝オッズ列を頑健に float 化して返す。"""
+    if isinstance(series_like, pd.Series):
+        ser = series_like.copy()
+    else:
+        if index is None:
+            try:
+                index = getattr(series_like, 'index', None)
+            except Exception:
+                index = None
+        ser = pd.Series(series_like, index=index)
+    if index is None:
+        index = getattr(ser, 'index', pd.RangeIndex(0))
+    ser = ser.reindex(index)
+    out = pd.to_numeric(ser, errors='coerce')
+    miss = out.isna()
+    if miss.any():
+        def _parse_odds_token(x):
+            if pd.isna(x):
+                return np.nan
+            s = str(x).strip()
+            if not s:
+                return np.nan
+            try:
+                v = _parse_float_token_loose(s, lo=0.0, hi=9999.9)
+                return float(v) if v is not None and np.isfinite(float(v)) else np.nan
+            except Exception:
+                return np.nan
+        parsed = ser.loc[miss].map(_parse_odds_token)
+        out.loc[miss] = parsed
+    return pd.Series(out, index=index, dtype=float).replace([np.inf, -np.inf], np.nan)
+
+
+def _apply_win_expected_value(
+    df: pd.DataFrame,
+    params: Optional[dict] = None,
+    meta: Optional[Dict[str, str]] = None,
+) -> pd.DataFrame:
+    """予測勝率×単勝オッズから単勝期待値列を追加する。"""
+    d = df.copy()
+    idx = getattr(d, 'index', pd.RangeIndex(0))
+    params = params or {}
+    meta = meta or {}
+    vr = (params.get('win_value_rules', {}) or {}) if isinstance(params, dict) else {}
+    try:
+        enabled = bool(vr.get('enabled', True))
+    except Exception:
+        enabled = True
+
+    p_win = _num_series(d.get('p_win_field', np.nan), index=idx).clip(lower=0.0, upper=100.0)
+    d['p_win_field'] = p_win.astype(float)
+
+    odds_aliases = ['win_odds', '単勝オッズ', '単勝', '単オッズ', 'WinOdds', 'odds', 'オッズ']
+    odds_src = None
+    for c in odds_aliases:
+        if c in d.columns:
+            odds_src = d[c]
+            break
+    win_odds = _coerce_win_odds_series(odds_src if odds_src is not None else pd.Series(np.nan, index=idx), index=idx)
+    try:
+        min_win_odds = float(vr.get('min_win_odds', 1.0) or 1.0)
+    except Exception:
+        min_win_odds = 1.0
+    try:
+        max_win_odds = float(vr.get('max_win_odds', 999.9) or 999.9)
+    except Exception:
+        max_win_odds = 999.9
+    win_odds = win_odds.where(win_odds.between(min_win_odds, max_win_odds), np.nan)
+    d['win_odds'] = win_odds.astype(float)
+
+    d['win_expected_return'] = ((p_win / 100.0) * d['win_odds']).astype(float)
+    d['win_expected_value'] = (d['win_expected_return'] - 1.0).astype(float)
+
+    try:
+        min_ret = float(vr.get('min_expected_return', 1.00) or 1.00)
+    except Exception:
+        min_ret = 1.00
+    try:
+        min_ev = float(vr.get('min_expected_value', 0.00) or 0.00)
+    except Exception:
+        min_ev = 0.00
+    try:
+        min_p_win = float(vr.get('min_p_win', 0.03) or 0.03)
+    except Exception:
+        min_p_win = 0.03
+
+    value_flag = (
+        enabled
+        & d['win_odds'].notna()
+        & d['win_expected_return'].notna()
+        & d['win_expected_value'].notna()
+        & ((p_win / 100.0) >= min_p_win)
+        & (d['win_expected_return'] >= min_ret)
+        & (d['win_expected_value'] >= min_ev)
+    )
+    d['win_value_flag'] = value_flag.astype(int)
+
+    try:
+        topn = int(vr.get('report_top_n', 5) or 5)
+    except Exception:
+        topn = 5
+    try:
+        vdf = d.loc[d['win_value_flag'] > 0, ['num', 'win_expected_return']].copy()
+        if len(vdf):
+            vdf['num'] = vdf['num'].astype(str)
+            vdf = vdf.sort_values(['win_expected_return', 'num'], ascending=[False, True])
+            meta['win_value_candidate_nums'] = ','.join(vdf['num'].head(max(1, topn)).tolist())
+            meta['win_value_candidate_count'] = str(int(len(vdf)))
+        else:
+            meta['win_value_candidate_nums'] = ''
+            meta['win_value_candidate_count'] = '0'
+    except Exception:
+        pass
+    return d
+
+
 def _meta_float(meta: Optional[Dict[str, str]], keys: Union[str, List[str], Tuple[str, ...]], default: float = float('nan')) -> float:
     """meta dict から keys を順に探して最初に変換できた float を返す。失敗時は default。"""
     meta = meta or {}
@@ -16815,6 +16945,7 @@ def _csp_compute_win_place_probs(
     win_raw = pd.Series(win_raw).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     win_denom = float(win_raw.sum())
     df["p_win_field"] = (win_raw / win_denom * 100.0).astype(float) if win_denom > 0 else 0.0
+    df = _apply_win_expected_value(df, params=params, meta=meta)
 
     # --- Tight race detection ---
     try:
@@ -19886,9 +20017,11 @@ def select_wide_opponents_rulemode(
 
 
 
-def md_table(df: pd.DataFrame, cols: List[str], float_cols: Optional[List[str]] = None) -> str:
-    """指定列を Markdown テーブル文字列に変換して返す。"""
+def md_table(df: pd.DataFrame, cols: Optional[List[str]] = None, float_cols: Optional[List[str]] = None) -> str:
+    """指定列を Markdown テーブル文字列に変換して返す。cols 省略時は全列を使う。"""
     d = df.copy()
+    if cols is None:
+        cols = list(d.columns)
     float_cols = float_cols or []
     for c in float_cols:
         if c in d.columns:
@@ -19902,8 +20035,8 @@ def md_table(df: pd.DataFrame, cols: List[str], float_cols: Optional[List[str]] 
 # =========================
 
 def load_entries_from_csv(path: str) -> pd.DataFrame:
-    """出走馬 CSV を DataFrame として読み込む。"""
-    return pd.read_csv(path)
+    """出走馬 CSV を DataFrame として読み込み、列名を標準化して返す。"""
+    return canonicalize_columns(pd.read_csv(path))
 
 
 def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -19981,7 +20114,16 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "騎手厩舎コンビ直近調子": "jockey_trainer_combo_recent_form",
         "コンビ出走数": "jockey_trainer_combo_sample_n",
         "騎手厩舎コンビ出走数": "jockey_trainer_combo_sample_n",
-        # market (optional)
+        # market / expected-value (optional)
+        "単勝オッズ": "win_odds",
+        "単勝": "win_odds",
+        "単オッズ": "win_odds",
+        "単勝Odds": "win_odds",
+        "単勝odds": "win_odds",
+        "win_odds": "win_odds",
+        "WinOdds": "win_odds",
+        "odds": "win_odds",
+        "オッズ": "win_odds",
         # R24: 昇級点列（IMP-5 ClassUpBonus 用）
         '昇級点':    'class_up_point',
         'class_up': 'class_up_point',
@@ -21214,6 +21356,33 @@ def _bsa_score_table(d0, meta: dict, params: dict) -> str:
         out += md_table(sdf.head(16)) + '\n'
     except Exception:
         out += '- スコア表: 算出失敗\n\n'
+
+    try:
+        if {'p_win_field', 'win_odds', 'win_expected_return', 'win_expected_value'}.issubset(set(d0.columns)):
+            topn = int(((params or {}).get('win_value_rules', {}) or {}).get('report_top_n', 5) or 5)
+            ev_cols = ['num', 'name', 'p_win_field', 'win_odds', 'win_expected_return', 'win_expected_value', 'win_value_flag']
+            evdf = d0.copy()
+            for c in ev_cols:
+                if c not in evdf.columns:
+                    evdf[c] = np.nan
+            for c in ['p_win_field', 'win_odds', 'win_expected_return', 'win_expected_value', 'win_value_flag']:
+                evdf[c] = _num_series(evdf.get(c, np.nan), index=evdf.index)
+            evdf = evdf[evdf['win_odds'].notna()].copy()
+            out += '## 単勝期待値候補\n'
+            if len(evdf):
+                evdf = evdf.sort_values(
+                    ['win_value_flag', 'win_expected_return', 'p_win_field', 'num'],
+                    ascending=[False, False, False, True],
+                )
+                out += md_table(
+                    evdf.head(max(1, topn)),
+                    cols=ev_cols,
+                    float_cols=['p_win_field', 'win_odds', 'win_expected_return', 'win_expected_value', 'win_value_flag'],
+                ) + '\n'
+            else:
+                out += '- 単勝オッズ列が未入力のため算出なし\n\n'
+    except Exception:
+        out += '## 単勝期待値候補\n- 算出失敗\n\n'
 
     out += '## 危険人気チェック\n'
     try:
@@ -22514,6 +22683,11 @@ def _mbe_map_and_validate(
     - zone_3c / zone_4c が空なら 'MIDDLE' に置換
     - validate_and_sanitize_entries を実行し _vmeta を meta に反映
     """
+    try:
+        entries = canonicalize_columns(entries)
+    except Exception:
+        pass
+
     if 'rating' not in entries.columns:
         entries['rating'] = np.nan
     if 'speed_max' not in entries.columns:
