@@ -10347,6 +10347,196 @@ def parse_speed_hist(s: str) -> List[float]:
     return vals
 
 
+
+def parse_pace_hist_values(s: str) -> List[float]:
+    """PCI/RPCI 系の履歴文字列をパースして妥当レンジの float リストを返す。"""
+    if s is None:
+        return []
+    s = str(s).strip()
+    if s == "" or s.lower() == "nan":
+        return []
+    vals: List[float] = []
+    for tok in re.findall(r"-?\d+(?:\.\d+)?", s):
+        try:
+            v = float(tok)
+        except Exception:
+            continue
+        if 20.0 <= v <= 80.0:
+            vals.append(v)
+    return vals
+
+
+def _clock_to_seconds(s: object) -> float:
+    """時計文字列を秒へ変換する。失敗時は nan。"""
+    if s is None:
+        return float('nan')
+    t = str(s).strip()
+    if not t or t.lower() == 'nan':
+        return float('nan')
+    m = re.match(r"^(\d+):(\d{2})\.(\d)$", t)
+    if m:
+        return float(int(m.group(1)) * 60 + int(m.group(2)) + int(m.group(3)) / 10.0)
+    try:
+        return float(t)
+    except Exception:
+        return float('nan')
+
+
+def _pace_mode_target_rpci(meta: Optional[Dict[str, str]]) -> float:
+    """pace / pace_eval_mode から期待RPCIの代表値を返す。"""
+    meta = meta or {}
+    pace_eval_mode = str(meta.get('pace_eval_mode', '') or '').strip().lower()
+    if pace_eval_mode == 'high':
+        return 44.0
+    if pace_eval_mode == 'high-mid':
+        return 47.0
+    if pace_eval_mode == 'slow':
+        return 56.0
+    if pace_eval_mode == 'long-maiden-mix':
+        return 52.0
+    if pace_eval_mode == 'mid':
+        return 50.0
+    pace = str(meta.get('pace', '') or '').strip().upper()[:1]
+    if pace == 'H':
+        return 45.0
+    if pace == 'S':
+        return 56.0
+    return 50.0
+
+
+def _resolve_expected_rpci(meta: Optional[Dict[str, str]]) -> float:
+    """meta から今回想定のRPCI相当値を解決する。"""
+    meta = meta or {}
+    direct = _meta_float(meta, ['expected_rpci', 'race_rpci', 'avg_rpci', 'rpci', 'RPCI'], default=float('nan'))
+    if np.isfinite(direct):
+        return float(np.clip(direct, 20.0, 80.0))
+
+    dist, _surface = _meta_distance_surface(meta)
+    est_last3f = _meta_float(meta, ['est_last3f', 'pred_last3f', 'last3f_est'], default=float('nan'))
+    est_time = _clock_to_seconds(meta.get('est_time', ''))
+    if np.isfinite(dist) and dist > 600.0 and np.isfinite(est_time) and np.isfinite(est_last3f) and est_last3f > 0.0:
+        pace_part = est_time - est_last3f
+        seg = (float(dist) - 600.0) / 600.0
+        if seg > 0.0 and pace_part > 0.0:
+            pace_part_3f = pace_part / seg
+            return float(np.clip((pace_part_3f / est_last3f) * 100.0 - 50.0, 20.0, 80.0))
+
+    lap_meta = _lap_shape_meta_features(meta)
+    laps = lap_meta.get('laps', []) if isinstance(lap_meta, dict) else []
+    if isinstance(laps, list) and len(laps) >= 4:
+        try:
+            last3 = float(np.sum([float(x) for x in laps[-3:]]))
+            pre3 = float(np.sum([float(x) for x in laps[:-3]]))
+            seg = max((len(laps) - 3) / 3.0, 1e-6)
+            pace_part_3f = pre3 / seg
+            if last3 > 0.0:
+                return float(np.clip((pace_part_3f / last3) * 100.0 - 50.0, 20.0, 80.0))
+        except Exception:
+            pass
+
+    return float(_pace_mode_target_rpci(meta))
+
+
+def add_pace_profile_features_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> pd.DataFrame:
+    """展開（ペース）適性の補助特徴量を追加し、PaceFit を想定RPCI整合へ寄せる。"""
+    if df is None or len(df) == 0:
+        return df
+    params = params or {}
+    wp = ((params or {}).get('win_pattern_rules', {}) or {})
+    blend_w = float(wp.get('pace_profile_blend_weight', 0.28) or 0.28)
+    blend_w = float(np.clip(blend_w, 0.0, 0.60))
+
+    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    pf = _num_series(df, 'pred_first3f', np.nan, index=df.index)
+    pl = _num_series(df, 'pred_last3f', np.nan, index=df.index)
+
+    if pf.notna().sum() > 1 and float(pf.max()) != float(pf.min()):
+        early_fast01 = ((float(pf.max()) - pf) / (float(pf.max()) - float(pf.min()))).clip(lower=0.0, upper=1.0)
+    else:
+        early_fast01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
+
+    if pl.notna().sum() > 1 and float(pl.max()) != float(pl.min()):
+        late_fast01 = ((float(pl.max()) - pl) / (float(pl.max()) - float(pl.min()))).clip(lower=0.0, upper=1.0)
+    else:
+        late_fast01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
+
+    zone_bias = pd.Series(0.0, index=df.index, dtype=float)
+    zone_bias.loc[z == 'FRONT'] = -5.0
+    zone_bias.loc[z == 'REAR'] = 5.0
+
+    inferred_pci = (50.0 + (late_fast01 - early_fast01) * 18.0 + zone_bias).clip(lower=32.0, upper=68.0)
+
+    def _hist_mean(col_name: str) -> pd.Series:
+        if col_name not in df.columns:
+            return pd.Series([np.nan] * len(df), index=df.index, dtype=float)
+        return df[col_name].astype(str).apply(
+            lambda x: float(np.mean(v)) if (v := parse_pace_hist_values(x)) else np.nan
+        ).astype(float)
+
+    horse_pci = _num_series(df.get('avg_pci', df.get('pci', np.nan)), np.nan, index=df.index)
+    horse_pci = horse_pci.where(horse_pci.notna(), _hist_mean('pci_hist'))
+    horse_pci = horse_pci.where(horse_pci.notna(), inferred_pci)
+    horse_pci = horse_pci.clip(lower=32.0, upper=68.0)
+
+    horse_rpci = _num_series(df.get('avg_rpci', df.get('rpci', np.nan)), np.nan, index=df.index)
+    horse_rpci = horse_rpci.where(horse_rpci.notna(), _hist_mean('rpci_hist'))
+    horse_rpci = horse_rpci.where(horse_rpci.notna(), horse_pci)
+    horse_rpci = horse_rpci.clip(lower=32.0, upper=68.0)
+
+    expected_rpci = float(_resolve_expected_rpci(meta))
+    expected_s = pd.Series([expected_rpci] * len(df), index=df.index, dtype=float)
+    mismatch = (horse_pci - expected_s).abs().clip(lower=0.0, upper=24.0)
+    rpci_gap = (horse_rpci - expected_s).abs().clip(lower=0.0, upper=24.0)
+    match_score = (100.0 - mismatch * 4.0).clip(lower=0.0, upper=100.0)
+    race_env_score = (100.0 - rpci_gap * 3.6).clip(lower=0.0, upper=100.0)
+
+    if expected_rpci >= 53.0:
+        style_support = (
+            0.56 * (late_fast01 * 100.0)
+            + 0.24 * (100.0 - early_fast01 * 100.0)
+            + 0.20 * (z == 'REAR').astype(float) * 100.0
+        )
+    elif expected_rpci <= 47.0:
+        style_support = (
+            0.48 * (early_fast01 * 100.0)
+            + 0.22 * ((z != 'REAR').astype(float) * 100.0)
+            + 0.15 * (100.0 - _num_series(df, 'FrontCollapseRisk', 0.0, index=df.index) / 12.0 * 100.0)
+            + 0.15 * (100.0 - late_fast01 * 100.0)
+        )
+    else:
+        balance01 = (1.0 - (early_fast01 - late_fast01).abs()).clip(lower=0.0, upper=1.0)
+        style_support = (
+            0.52 * (balance01 * 100.0)
+            + 0.24 * (z == 'MIDDLE').astype(float) * 100.0
+            + 0.24 * ((early_fast01 + late_fast01) / 2.0 * 100.0)
+        )
+    style_support = style_support.clip(lower=0.0, upper=100.0)
+
+    profile_adv = (0.50 * match_score + 0.22 * race_env_score + 0.28 * style_support).clip(lower=0.0, upper=100.0)
+    base_pacefit = _num_series(df.get('PaceFit', 50.0), 50.0, index=df.index)
+    df['ExpectedRPCI'] = expected_s.astype(float)
+    df['HorseAvgPCI'] = horse_pci.astype(float)
+    df['HorseAvgRPCI'] = horse_rpci.astype(float)
+    df['PaceMatchDelta'] = mismatch.astype(float)
+    df['PaceMatchScore'] = match_score.astype(float)
+    df['PaceRaceEnvScore'] = race_env_score.astype(float)
+    df['PaceStyleSupport'] = style_support.astype(float)
+    df['PaceProfileAdvantage'] = profile_adv.astype(float)
+    df['PaceFit'] = ((1.0 - blend_w) * base_pacefit + blend_w * profile_adv).clip(lower=0.0, upper=100.0).astype(float)
+
+    try:
+        meta['expected_rpci'] = f"{expected_rpci:.1f}"
+        if expected_rpci >= 53.0:
+            meta['pace_profile_band'] = 'slow-closing'
+        elif expected_rpci <= 47.0:
+            meta['pace_profile_band'] = 'high-stamina'
+        else:
+            meta['pace_profile_band'] = 'mid-balanced'
+    except Exception:
+        pass
+    return df
+
+
 def factor_mark_to_points(mark: str) -> float:
     """印文字列（◎○▲△×）をポイント数値に変換する。"""
     mark = "" if mark is None else str(mark).strip()
@@ -11009,6 +11199,21 @@ def ocr_ai_time_summary_v10(image_path: str, lang: str = 'jpn+eng') -> Dict[str,
         v = _find_loose_float([r"(?:推定)?後半\s*3F", r"(?:推定)?後半"], lo=10.0, hi=60.0)
         if v is not None:
             out['est_last3f'] = v
+    v = _find_loose_float([r"(?:平均)?RPCI", r"想定RPCI", r"レースRPCI"], lo=20.0, hi=80.0)
+    if v is not None:
+        out['expected_rpci'] = v
+    v = _find_loose_float([r"(?:平均)?PCI", r"想定PCI"], lo=20.0, hi=80.0)
+    if v is not None:
+        out['expected_pci'] = v
+    v = _find_loose_float([r"平均\s*(?:秒|ラップ)", r"平均.*?1F", r"avg"], lo=9.0, hi=16.0)
+    if v is not None:
+        out['avg_sec_per_furlong'] = v
+    v = _find_loose_float([r"前半\s*(?:半?タイム|ハーフ)", r"前半"], lo=20.0, hi=90.0)
+    if v is not None:
+        out['first_half_time'] = v
+    v = _find_loose_float([r"後半\s*(?:半?タイム|ハーフ)", r"上がり\s*3F", r"後半"], lo=20.0, hi=90.0)
+    if v is not None:
+        out['last_half_time'] = v
     # course line
     m = re.search(r"コース情報\s*([^\n]+)", s)
     if m:
@@ -15129,6 +15334,7 @@ def _csv_compute_base_features(
         df[_c] = _num_series(df, _c, 50.0)
 
     df['PaceFit'] = compute_pacefit_v1_1(df, meta, params)
+    df = add_pace_profile_features_v1_1(df, meta, params)
     df['GateFit'] = compute_gatefit_v1_1(df, meta)
     df['ConditionFit'] = compute_conditionfit_v1_1(df, meta)
 
@@ -15662,12 +15868,121 @@ def _csv_compute_wps_win_scores(
 
 
 
+def _first_existing_series(df: pd.DataFrame, candidates, default=np.nan) -> pd.Series:
+    """候補列のうち最初に見つかった列を返し、無ければ default を並べた Series を返す。"""
+    for c in list(candidates or []):
+        if c in df.columns:
+            return df[c]
+    return pd.Series([default] * len(df), index=df.index)
+
+
+def _normalize_rate_score(series_like, index) -> pd.Series:
+    """勝率・複勝率・直近率などを 0-100 スコアへ正規化して返す。"""
+    s = _num_series(series_like, np.nan, index=index)
+    s = pd.to_numeric(s, errors='coerce')
+    finite = s[np.isfinite(s)]
+    if len(finite) == 0:
+        return pd.Series([50.0] * len(index), index=index, dtype=float)
+    if float(finite.abs().max()) <= 1.5:
+        s = s * 100.0
+    return s.clip(lower=0.0, upper=100.0).fillna(50.0).astype(float)
+
+
+def _normalize_roi_score(series_like, index) -> pd.Series:
+    """ROI / 回収率を 0-100 スコアへ正規化して返す。1.0 または 100 を損益分岐点とみなす。"""
+    s = _num_series(series_like, np.nan, index=index)
+    s = pd.to_numeric(s, errors='coerce')
+    finite = s[np.isfinite(s)]
+    if len(finite) == 0:
+        return pd.Series([50.0] * len(index), index=index, dtype=float)
+    if float(finite.abs().max()) > 10.0:
+        s = s / 100.0
+    s = s.clip(lower=0.0, upper=3.0)
+    return (50.0 + (s - 1.0) * 45.0).clip(lower=0.0, upper=100.0).fillna(50.0).astype(float)
+
+
+def _shrink_score_by_sample(score: pd.Series, sample_n, *, neutral: float = 50.0, max_n: float = 40.0) -> pd.Series:
+    """サンプル数が少ない統計を中立値へ縮小して過学習を抑える。"""
+    n = _num_series(sample_n, 0.0, index=score.index, lower=0.0)
+    reliability = (n / float(max_n)).clip(lower=0.0, upper=1.0)
+    return (float(neutral) + (score - float(neutral)) * reliability).clip(lower=0.0, upper=100.0).astype(float)
+
+
+def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = None) -> pd.DataFrame:
+    """騎手・厩舎・コンビの集約特徴量を追加し、生のID依存よりも安定した数値特徴へ変換する。"""
+    if df is None or len(df) == 0:
+        return df
+    out = df.copy()
+    idx = out.index
+
+    jockey_rate = _normalize_rate_score(_first_existing_series(out, [
+        'jockey_place_rate', 'jockey_win_rate', '騎手複勝率', '騎手勝率', 'ジョッキー複勝率', 'ジョッキー勝率'
+    ]), idx)
+    jockey_roi = _normalize_roi_score(_first_existing_series(out, [
+        'jockey_place_roi', 'jockey_win_roi', '騎手複回', '騎手単回', '騎手回収率', '騎手ROI', 'ジョッキーROI'
+    ]), idx)
+    trainer_rate = _normalize_rate_score(_first_existing_series(out, [
+        'trainer_place_rate', 'trainer_win_rate', '厩舎複勝率', '厩舎勝率', '調教師複勝率', '調教師勝率'
+    ]), idx)
+    trainer_roi = _normalize_roi_score(_first_existing_series(out, [
+        'trainer_place_roi', 'trainer_win_roi', '厩舎複回', '厩舎単回', '厩舎回収率', '厩舎ROI', '調教師ROI'
+    ]), idx)
+    combo_rate = _normalize_rate_score(_first_existing_series(out, [
+        'jockey_trainer_combo_place_rate', 'jockey_trainer_combo_win_rate',
+        'コンビ複勝率', 'コンビ勝率', '騎手厩舎コンビ複勝率', '騎手厩舎コンビ勝率'
+    ]), idx)
+    combo_roi = _normalize_roi_score(_first_existing_series(out, [
+        'jockey_trainer_combo_roi', 'combo_roi', 'コンビROI', 'コンビ回収率',
+        '騎手厩舎コンビROI', '騎手調教師コンビROI'
+    ]), idx)
+
+    jockey_recent = _normalize_rate_score(_first_existing_series(out, [
+        'jockey_recent_form', '騎手直近調子', '騎手近況', '騎手近10走複勝率', '騎手近5走複勝率'
+    ]), idx)
+    trainer_recent = _normalize_rate_score(_first_existing_series(out, [
+        'trainer_recent_form', '厩舎直近調子', '調教師直近調子', '厩舎近況', '厩舎近10走複勝率'
+    ]), idx)
+    combo_recent = _normalize_rate_score(_first_existing_series(out, [
+        'jockey_trainer_combo_recent_form', 'コンビ直近調子', '騎手厩舎コンビ直近調子', 'コンビ近況'
+    ]), idx)
+
+    jockey_n = _first_existing_series(out, ['jockey_sample_n', '騎手出走数', 'jockey_runs'], default=0.0)
+    trainer_n = _first_existing_series(out, ['trainer_sample_n', '厩舎出走数', '調教師出走数', 'trainer_runs'], default=0.0)
+    combo_n = _first_existing_series(out, ['jockey_trainer_combo_sample_n', 'コンビ出走数', '騎手厩舎コンビ出走数', 'combo_runs'], default=0.0)
+
+    out['JockeyRecentFormScore'] = _shrink_score_by_sample(jockey_recent, jockey_n, max_n=36.0)
+    out['TrainerRecentFormScore'] = _shrink_score_by_sample(trainer_recent, trainer_n, max_n=36.0)
+    out['JockeyTrainerComboROIScore'] = _shrink_score_by_sample(0.50 * combo_rate + 0.50 * combo_roi, combo_n, max_n=24.0)
+    out['JockeyTrainerComboFormScore'] = _shrink_score_by_sample(combo_recent, combo_n, max_n=24.0)
+    out['JockeyConnectionScore'] = _shrink_score_by_sample(0.60 * jockey_rate + 0.25 * jockey_roi + 0.15 * jockey_recent, jockey_n, max_n=36.0)
+    out['TrainerConnectionScore'] = _shrink_score_by_sample(0.60 * trainer_rate + 0.25 * trainer_roi + 0.15 * trainer_recent, trainer_n, max_n=36.0)
+    out['ConnectionRecentFormScore'] = (
+        0.34 * out['JockeyRecentFormScore']
+        + 0.28 * out['TrainerRecentFormScore']
+        + 0.38 * out['JockeyTrainerComboFormScore']
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    jockey_rel = (_num_series(jockey_n, 0.0, index=idx, lower=0.0).clip(0.0, 36.0) / 36.0)
+    trainer_rel = (_num_series(trainer_n, 0.0, index=idx, lower=0.0).clip(0.0, 36.0) / 36.0)
+    combo_rel = (_num_series(combo_n, 0.0, index=idx, lower=0.0).clip(0.0, 24.0) / 24.0)
+    out['HumanConnectionReliability'] = (100.0 * (jockey_rel + trainer_rel + combo_rel) / 3.0).clip(lower=0.0, upper=100.0).astype(float)
+
+    out['HumanConnectionScore'] = (
+        0.33 * out['JockeyConnectionScore']
+        + 0.27 * out['TrainerConnectionScore']
+        + 0.24 * out['JockeyTrainerComboROIScore']
+        + 0.16 * out['ConnectionRecentFormScore']
+    ).clip(lower=0.0, upper=100.0).astype(float)
+    return out
+
+
 def _comp_position_accel(
     df: "pd.DataFrame",
     meta: "Dict[str, str]",
     params: dict,
 ) -> "pd.DataFrame":
     """GoodPositionScore・ReAccelScore・PositionReAccelScore・JockeyDistanceEvidenceScoreをdfに書き込む。"""
+    df = add_connection_aggregate_features(df, params)
     # ── local vars needed for position scores
     z4 = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
     pf3 = _num_series(df, 'pred_first3f', np.nan, index=df.index)
@@ -15703,6 +16018,9 @@ def _comp_position_accel(
     training_num = _num_series(df, 'TrainingScore', 50.0)
     distance_num = _num_series(df, 'DistanceSuitScore', 50.0)
     recent_num = _num_series(df, 'RecentFormScore', 50.0)
+    conn_num = _num_series(df, 'HumanConnectionScore', 50.0)
+    conn_recent_num = _num_series(df, 'ConnectionRecentFormScore', 50.0)
+    combo_roi_num = _num_series(df, 'JockeyTrainerComboROIScore', 50.0)
     df['GoodPositionScore'] = (
         0.38 * posfit
         + 0.18 * gatefit
@@ -15750,8 +16068,11 @@ def _comp_position_accel(
         jockey_rank_score = pd.Series([50.0] * len(df), index=df.index, dtype=float)
 
     df['JockeyDistanceEvidenceScore'] = (
-        0.52 * jockey_rank_score
-        + 0.48 * dist_rank_score
+        0.36 * jockey_rank_score
+        + 0.34 * dist_rank_score
+        + 0.18 * conn_num
+        + 0.07 * combo_roi_num
+        + 0.05 * conn_recent_num
     ).clip(lower=0.0, upper=100.0).astype(float)
 
     return df
@@ -15782,6 +16103,9 @@ def _comp_pace_lap_scores(
     condfit   = _num_series(df, 'ConditionFit',      50.0)
     stability = _num_series(df, ['StabilityComposite', 'SAS'], 50.0)
     pacefit   = _num_series(df, 'PaceFit',           50.0)
+    pace_match = _num_series(df, 'PaceMatchScore',     50.0)
+    pace_prof  = _num_series(df, 'PaceProfileAdvantage', 50.0)
+    pace_gap   = _num_series(df, 'PaceMatchDelta',      0.0)
     if pl3.notna().sum() > 1 and float(pl3.max()) != float(pl3.min()):
         last3f_fast01 = ((float(pl3.max()) - pl3) / (float(pl3.max()) - float(pl3.min()))).clip(lower=0.0, upper=1.0)
     else:
@@ -15800,20 +16124,27 @@ def _comp_pace_lap_scores(
     recent_num       = _num_series(df, 'RecentFormScore',     50.0)
     comment_trend_num = _num_series(df, 'CommentTrend',       50.0)
     training_num     = _num_series(df, 'TrainingScore',       50.0)
+    conn_num         = _num_series(df, 'HumanConnectionScore', 50.0)
+    conn_recent_num  = _num_series(df, 'ConnectionRecentFormScore', 50.0)
     favorite_num     = _num_series(df, 'FavoriteScore',       50.0)
     anchor_base_num  = _num_series(df, ['AnchorScore', 'SAS'], 50.0)
     win_num          = _num_series(df, 'WinCandidateScore',   50.0)
 
     df['PaceScenarioAdvantage'] = (
-        0.28 * pacefit
-        + 0.18 * posfit
-        + 0.12 * gatefit
-        + 0.10 * condfit
-        + 0.10 * stability
-        + 0.14 * df['PositionReAccelScore']
-        + 0.08 * (last3f_fast01 * 100.0)
+        0.20 * pacefit
+        + 0.15 * pace_match
+        + 0.10 * pace_prof
+        + 0.13 * posfit
+        + 0.10 * gatefit
+        + 0.08 * condfit
+        + 0.08 * stability
+        + 0.10 * df['PositionReAccelScore']
+        + 0.05 * (last3f_fast01 * 100.0)
+        + 0.06 * conn_num
+        + 0.05 * conn_recent_num
         + front_bias
         - 0.35 * _num_series(df, 'FrontCollapseRisk', 0.0)
+        - 0.24 * pace_gap
     ).clip(lower=0.0, upper=100.0).astype(float)
 
     pop_proxy = pd.Series(np.nan, index=df.index, dtype=float)
@@ -15833,10 +16164,12 @@ def _comp_pace_lap_scores(
     lap_closing_bias = float(lap_meta.get('closing_bias', 0.0) or 0.0)
     lap_goodpos_bias = float(lap_meta.get('goodpos_bias', 0.0) or 0.0)
     df['LapSuitScore'] = (
-        0.34 * df['PaceScenarioAdvantage']
-        + 0.24 * df['PositionReAccelScore']
-        + 0.16 * (last3f_fast01 * 100.0)
-        + 0.12 * distance_num
+        0.30 * df['PaceScenarioAdvantage']
+        + 0.18 * df['PositionReAccelScore']
+        + 0.12 * pace_match
+        + 0.08 * pace_prof
+        + 0.14 * (last3f_fast01 * 100.0)
+        + 0.10 * distance_num
         + 0.08 * recent_num
         + good_pos_mask.astype(float) * max(0.0, lap_goodpos_bias) * 0.80
         + (~good_pos_mask).astype(float) * max(0.0, lap_closing_bias) * 0.70
@@ -15855,22 +16188,24 @@ def _comp_pace_lap_scores(
         + ((df['PositionReAccelScore'] >= 60.0).astype(float) * 2.4)
     )
     df['GoodPositionSecondColumnScore'] = (
-        0.34 * df['PositionReAccelScore']
-        + 0.24 * df['PopularityPositionLapScore']
-        + 0.20 * df['JockeyDistanceEvidenceScore']
-        + 0.10 * training_num
+        0.32 * df['PositionReAccelScore']
+        + 0.22 * df['PopularityPositionLapScore']
+        + 0.18 * df['JockeyDistanceEvidenceScore']
+        + 0.08 * conn_num
+        + 0.08 * training_num
         + 0.06 * comment_trend_num
         + 0.06 * anchor_base_num
         + second_col_signal
     ).clip(lower=0.0, upper=100.0).astype(float)
 
     df['CloseScenarioScore'] = (
-        0.18 * (last3f_fast01 * 100.0)
+        0.16 * (last3f_fast01 * 100.0)
         + 0.20 * df['PaceScenarioAdvantage']
-        + 0.18 * win_num
+        + 0.16 * win_num
         + 0.12 * distance_num
         + 0.08 * recent_num
-        + 0.24 * _num_series(df, 'PositionReAccelScore', 50.0)
+        + 0.20 * _num_series(df, 'PositionReAccelScore', 50.0)
+        + 0.08 * conn_recent_num
         + max(0.0, lap_closing_bias) * (~good_pos_mask).astype(float) * 0.70
     ).clip(lower=0.0, upper=100.0).astype(float)
 
@@ -15903,6 +16238,8 @@ def _comp_axis_final(
     ability_num       = _num_series(df, 'Ability',            50.0)
     comment_trend_num = _num_series(df, 'CommentTrend',       50.0)
     recent_num        = _num_series(df, 'RecentFormScore',    50.0)
+    conn_num          = _num_series(df, 'HumanConnectionScore', 50.0)
+    conn_recent_num   = _num_series(df, 'ConnectionRecentFormScore', 50.0)
     pace_mode         = str((meta or {}).get('pace_eval_mode', '') or '')
     course_fit_delta = _num_series(df, 'CourseProfileFit', 50.0) - 50.0
     course_straight_delta = _num_series(df, 'CourseStraightFit', 50.0) - 50.0
@@ -15916,6 +16253,8 @@ def _comp_axis_final(
         + 0.10 * stability
         + 0.08 * gatefit
         + 0.08 * df['JockeyDistanceEvidenceScore']
+        + 0.06 * conn_num
+        + 0.04 * conn_recent_num
         + 0.10 * course_fit_delta
         + 0.05 * course_corner_delta
         - 0.70 * _num_series(df, 'DevelopmentWaitRisk', 0.0)
@@ -15929,6 +16268,8 @@ def _comp_axis_final(
         + 0.12 * df['PaceScenarioAdvantage']
         + 0.08 * posfit
         + 0.08 * df['JockeyDistanceEvidenceScore']
+        + 0.06 * conn_num
+        + 0.04 * conn_recent_num
         + 0.08 * course_fit_delta
         + 0.06 * course_straight_delta
         - 0.65 * _num_series(df, 'DevelopmentWaitRisk', 0.0)
@@ -15943,6 +16284,8 @@ def _comp_axis_final(
         + 0.10 * posfit
         + 0.08 * distance_num
         + 0.08 * df['JockeyDistanceEvidenceScore']
+        + 0.06 * conn_num
+        + 0.04 * conn_recent_num
         + 0.10 * course_fit_delta
         + 0.06 * course_stamina_delta
         - 0.45 * _num_series(df, 'DevelopmentWaitRisk', 0.0)
@@ -18029,6 +18372,26 @@ def choose_threshold_from_metrics(best: Dict[str, Dict[str, float]], strategy: s
     return float(max(ty, tf))
 
 
+def _sanitize_ml_feature_cols(feature_cols: List[str]) -> List[str]:
+    """過学習・リーケージを招きやすい raw ID / target encoding 系の列を除外する。"""
+    out: List[str] = []
+    seen = set()
+    for c in list(feature_cols or []):
+        s = str(c).strip()
+        low = s.lower()
+        if not s:
+            continue
+        if low.endswith('id') or 'id_' in low or '_id' in low:
+            continue
+        if 'target_encode' in low or 'targetencoding' in low:
+            continue
+        if s in seen:
+            continue
+        out.append(s)
+        seen.add(s)
+    return out
+
+
 def auto_select_place_feature_cols(df: pd.DataFrame, y_col: str = 'show_flag', group_col: str = 'race_id') -> List[str]:
     """ユーザが特徴量を指定しない場合の自動選定（安全寄り）。
 
@@ -18048,6 +18411,8 @@ def auto_select_place_feature_cols(df: pd.DataFrame, y_col: str = 'show_flag', g
         'AnchorScore','SAS','rating','speed_max',
         'Ability','PosFit','Consist','MapFit','TimeFit','FactorFit',
         'MarketWinFit','MarketPlaceFit',
+        'HumanConnectionScore','ConnectionRecentFormScore','JockeyTrainerComboROIScore',
+        'JockeyRecentFormScore','TrainerRecentFormScore',
         'WinShape','Upside','WPS',
         # optional context
         'AI_REAR_CONFIRMED','zone_3c','zone_4c',
@@ -18107,6 +18472,10 @@ def train_place_model_bundle(
     """
     assert y_col in df.columns, f'missing y_col={y_col}'
     assert group_col in df.columns, f'missing group_col={group_col}'
+
+    feature_cols = _sanitize_ml_feature_cols(feature_cols)
+    if not feature_cols:
+        feature_cols = auto_select_place_feature_cols(df, y_col=y_col, group_col=group_col)
 
     X = df[feature_cols].copy()
     y = _num_series(df[y_col], 0, index=df.index, dtype=int).values
@@ -18310,7 +18679,9 @@ def train_pair_model_bundle(
     CSV または DataFrame から特徴量を構築し、交差検証付きで LightGBM を学習する。
     """
     _require_pair_ml_deps()
-
+    feature_cols = _sanitize_ml_feature_cols(feature_cols)
+    if not feature_cols:
+        feature_cols = auto_select_place_feature_cols(horse_df, y_col=show_flag_col, group_col=race_id_col)
     pair_df = build_pair_training_table_from_horse_table(
         horse_df,
         feature_cols=feature_cols,
@@ -19377,6 +19748,20 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "レーティング": "rating",
         "最高速": "speed_max",
         "指数履歴": "speed_hist",
+        "PCI": "pci",
+        "ＰＣＩ": "pci",
+        "平均PCI": "avg_pci",
+        "平均ＰＣＩ": "avg_pci",
+        "PCI平均": "avg_pci",
+        "PCI履歴": "pci_hist",
+        "ＲＰＣＩ": "rpci",
+        "RPCI": "rpci",
+        "平均RPCI": "avg_rpci",
+        "平均ＲＰＣＩ": "avg_rpci",
+        "RPCI平均": "avg_rpci",
+        "RPCI履歴": "rpci_hist",
+        "展開": "pace_hist",
+        "ペース": "pace_hist",
         # ファクター印（媒体によって列名がブレる）
         "道悪": "michiaku",
         "馬場": "michiaku",
@@ -19386,6 +19771,40 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "前走": "last",
         "調教": "training",
         "実績": "record",
+        "騎手ID": "jockey_id",
+        "ジョッキーID": "jockey_id",
+        "調教師ID": "trainer_id",
+        "厩舎ID": "trainer_id",
+        "騎手勝率": "jockey_win_rate",
+        "騎手複勝率": "jockey_place_rate",
+        "騎手単回": "jockey_win_roi",
+        "騎手複回": "jockey_place_roi",
+        "騎手ROI": "jockey_place_roi",
+        "騎手直近調子": "jockey_recent_form",
+        "騎手出走数": "jockey_sample_n",
+        "調教師勝率": "trainer_win_rate",
+        "厩舎勝率": "trainer_win_rate",
+        "調教師複勝率": "trainer_place_rate",
+        "厩舎複勝率": "trainer_place_rate",
+        "調教師単回": "trainer_win_roi",
+        "厩舎単回": "trainer_win_roi",
+        "調教師複回": "trainer_place_roi",
+        "厩舎複回": "trainer_place_roi",
+        "厩舎ROI": "trainer_place_roi",
+        "厩舎直近調子": "trainer_recent_form",
+        "調教師直近調子": "trainer_recent_form",
+        "厩舎出走数": "trainer_sample_n",
+        "調教師出走数": "trainer_sample_n",
+        "コンビ勝率": "jockey_trainer_combo_win_rate",
+        "コンビ複勝率": "jockey_trainer_combo_place_rate",
+        "コンビROI": "jockey_trainer_combo_roi",
+        "コンビ回収率": "jockey_trainer_combo_roi",
+        "騎手厩舎コンビROI": "jockey_trainer_combo_roi",
+        "騎手調教師コンビROI": "jockey_trainer_combo_roi",
+        "コンビ直近調子": "jockey_trainer_combo_recent_form",
+        "騎手厩舎コンビ直近調子": "jockey_trainer_combo_recent_form",
+        "コンビ出走数": "jockey_trainer_combo_sample_n",
+        "騎手厩舎コンビ出走数": "jockey_trainer_combo_sample_n",
         # market (optional)
         # R24: 昇級点列（IMP-5 ClassUpBonus 用）
         '昇級点':    'class_up_point',
