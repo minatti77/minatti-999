@@ -14049,6 +14049,7 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     class_id = _infer_race_class_id(meta)
     class_ref = TOKYO_TURF_1400_CLASS_PACE.get(class_id, {}) if is_tokyo1400 else {}
     month = _infer_race_month(meta)
+    bucket = _course_profile_distance_bucket(dist)
 
     if 'RunningStyleLabel' in d.columns:
         style_col = d['RunningStyleLabel'].astype(str).apply(normalize_zone_token)
@@ -14113,6 +14114,7 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     rail_bias_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     class_pace_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     tokyo1400_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+    course_special_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     distance_style_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     distance_draw_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     distance_specific_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
@@ -14167,6 +14169,64 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
                 confidence_scale = min(confidence_scale, 0.88)
             distance_specific_fit = (50.0 + (distance_specific_fit - 50.0) * confidence_scale).clip(lower=0.0, upper=100.0)
 
+    rail_bias_fit = (
+        0.42 * distance_draw_fit
+        + 0.24 * gatefit
+        + 0.20 * style_fit
+        + 0.14 * agility_fit
+    ).clip(lower=0.0, upper=100.0)
+    if surface == 'turf':
+        straight_corner_gap = float(profile.get('straight', 0.5) or 0.5) - float(profile.get('corner', 0.5) or 0.5)
+        if rail_setting == 'B':
+            rail_bias_fit = (
+                rail_bias_fit
+                + draw_zone.map(lambda z: 3.0 if z == 'outer' else (-2.0 if z == 'inner' else 0.8)).astype(float)
+                + style_col.map(
+                    lambda z: 2.5 if (straight_corner_gap >= -0.02 and z == 'REAR') else (1.0 if z == 'MIDDLE' else -1.2)
+                ).astype(float)
+            ).clip(lower=0.0, upper=100.0)
+        elif rail_setting == 'C':
+            rail_bias_fit = (
+                rail_bias_fit
+                + draw_zone.map(lambda z: 3.0 if z == 'inner' else (-2.0 if z == 'outer' else 0.8)).astype(float)
+                + style_col.map(
+                    lambda z: 2.5 if (straight_corner_gap < 0.02 and z == 'FRONT') else (1.2 if z == 'MIDDLE' else -0.8)
+                ).astype(float)
+            ).clip(lower=0.0, upper=100.0)
+        elif rail_setting == 'A':
+            rail_bias_fit = (rail_bias_fit + draw_zone.map(lambda z: 1.0 if z == 'middle' else 0.0).astype(float)).clip(lower=0.0, upper=100.0)
+
+    if surface == 'dirt':
+        if np.isfinite(dist) and dist <= 1400:
+            cp_early_w, cp_late_w, cp_stamina_w, cp_power_w, cp_style_w = 0.38, 0.12, 0.10, 0.18, 0.22
+        elif np.isfinite(dist) and dist <= 1800:
+            cp_early_w, cp_late_w, cp_stamina_w, cp_power_w, cp_style_w = 0.30, 0.16, 0.16, 0.18, 0.20
+        else:
+            cp_early_w, cp_late_w, cp_stamina_w, cp_power_w, cp_style_w = 0.22, 0.20, 0.24, 0.18, 0.16
+    else:
+        if np.isfinite(dist) and dist <= 1400:
+            cp_early_w, cp_late_w, cp_stamina_w, cp_power_w, cp_style_w = 0.32, 0.22, 0.12, 0.10, 0.24
+        elif np.isfinite(dist) and dist <= 1800:
+            cp_early_w, cp_late_w, cp_stamina_w, cp_power_w, cp_style_w = 0.26, 0.26, 0.18, 0.10, 0.20
+        elif np.isfinite(dist) and dist <= 2400:
+            cp_early_w, cp_late_w, cp_stamina_w, cp_power_w, cp_style_w = 0.20, 0.28, 0.24, 0.12, 0.16
+        else:
+            cp_early_w, cp_late_w, cp_stamina_w, cp_power_w, cp_style_w = 0.16, 0.28, 0.30, 0.14, 0.12
+
+    class_pace_fit = (
+        cp_early_w * early_speed
+        + cp_late_w * late_speed
+        + cp_stamina_w * stamina_fit
+        + cp_power_w * power_fit
+        + cp_style_w * style_fit
+    ).clip(lower=0.0, upper=100.0)
+    if class_id >= 4:
+        class_pace_fit = (class_pace_fit + 0.10 * (late_speed - 50.0) + 0.06 * (stamina_fit - 50.0)).clip(lower=0.0, upper=100.0)
+    elif class_id >= 2:
+        class_pace_fit = (class_pace_fit + 0.05 * (late_speed - 50.0) + 0.03 * (style_fit - 50.0)).clip(lower=0.0, upper=100.0)
+    elif class_id in {0, 1}:
+        class_pace_fit = (class_pace_fit + 0.10 * (early_speed - 50.0) + 0.04 * (gatefit - 50.0)).clip(lower=0.0, upper=100.0)
+
     if is_tokyo1400:
         rail_bias = TOKYO_TURF_1400_RAIL_BIAS.get(rail_setting or 'A', TOKYO_TURF_1400_RAIL_BIAS.get('A', {}))
         rail_bias_fit = rail_bias_fit + draw_zone.map(
@@ -14213,6 +14273,25 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
         if _is_wet_track(meta):
             tokyo1400_fit = (tokyo1400_fit + 0.14 * (power_fit - 50.0) + 0.06 * (michfit - 50.0)).clip(lower=0.0, upper=100.0)
 
+    course_special_fit = (
+        0.20 * rail_bias_fit
+        + 0.24 * class_pace_fit
+        + 0.24 * distance_specific_fit
+        + 0.10 * straight_fit
+        + 0.08 * corner_fit
+        + 0.08 * power_fit
+        + 0.06 * gatefit
+    ).clip(lower=0.0, upper=100.0)
+    if surface == 'dirt' and np.isfinite(dist) and dist <= 1400:
+        course_special_fit = (course_special_fit + 0.06 * (speed_fit - 50.0) + 0.04 * (early_speed - 50.0)).clip(lower=0.0, upper=100.0)
+    elif bucket == 'long':
+        course_special_fit = (course_special_fit + 0.06 * (stamina_fit - 50.0) + 0.04 * (late_speed - 50.0)).clip(lower=0.0, upper=100.0)
+    if distance_source in {'blend', 'nearest'} and distance_key:
+        special_scale = 0.74 + 0.26 * distance_confidence
+        course_special_fit = (50.0 + (course_special_fit - 50.0) * special_scale).clip(lower=0.0, upper=100.0)
+    if is_tokyo1400:
+        course_special_fit = (0.72 * course_special_fit + 0.28 * tokyo1400_fit).clip(lower=0.0, upper=100.0)
+
     style_w = 0.22
     straight_w = 0.12 + 0.10 * float(profile.get('straight', 0.5) or 0.5)
     corner_w = 0.10 + 0.10 * float(profile.get('corner', 0.5) or 0.5)
@@ -14222,12 +14301,13 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     gate_w = 0.05 + 0.05 * float(profile.get('gate', 0.5) or 0.5)
     agility_w = 0.07 + 0.08 * float(profile.get('agility', 0.5) or 0.5)
     distance_w = (0.07 + 0.04 * distance_confidence) if distance_key else 0.0
+    special_w = (0.06 + 0.04 * max(distance_confidence, 0.45)) if distance_key else 0.06
     pedigree_w = 0.07
     pedigree_tokyo_w = 0.03 if is_tokyo1400 else 0.0
     rail_w = 0.05 if is_tokyo1400 else 0.0
     classpace_w = 0.06 if is_tokyo1400 else 0.0
     tokyo_w = 0.08 if is_tokyo1400 else 0.0
-    total_w = style_w + straight_w + corner_w + stamina_w + power_w + speed_w + gate_w + agility_w + distance_w + pedigree_w + pedigree_tokyo_w + rail_w + classpace_w + tokyo_w
+    total_w = style_w + straight_w + corner_w + stamina_w + power_w + speed_w + gate_w + agility_w + distance_w + special_w + pedigree_w + pedigree_tokyo_w + rail_w + classpace_w + tokyo_w
 
     d['CourseStyleFit'] = _num_series(style_fit, 50.0, index=d.index)
     d['CourseStraightFit'] = _num_series(straight_fit, 50.0, index=d.index)
@@ -14239,6 +14319,7 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     d['CourseDistanceStyleFit'] = _num_series(distance_style_fit, 50.0, index=d.index)
     d['CourseDistanceDrawFit'] = _num_series(distance_draw_fit, 50.0, index=d.index)
     d['CourseDistanceSpecificFit'] = _num_series(distance_specific_fit, 50.0, index=d.index)
+    d['CourseSpecialFit'] = _num_series(course_special_fit, 50.0, index=d.index)
     d['CoursePedigreeFineFit'] = _num_series(pedigree_fine_fit, 50.0, index=d.index)
     d['CoursePedigreeTokyo1400Fit'] = _num_series(pedigree_tokyo1400_fit, 50.0, index=d.index)
     d['CourseRailBiasFit'] = _num_series(rail_bias_fit, 50.0, index=d.index)
@@ -14254,6 +14335,7 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
         + gate_w * gatefit
         + agility_w * d['CourseAgilityFit']
         + distance_w * d['CourseDistanceSpecificFit']
+        + special_w * d['CourseSpecialFit']
         + pedigree_w * d['CoursePedigreeFineFit']
         + pedigree_tokyo_w * d['CoursePedigreeTokyo1400Fit']
         + rail_w * d['CourseRailBiasFit']
@@ -15808,6 +15890,7 @@ def _csv_neutral_return(
         df['CoursePowerFit'] = 50.0
         df['CourseSpeedFit'] = 50.0
         df['CourseAgilityFit'] = 50.0
+        df['CourseSpecialFit'] = 50.0
         df['CourseProfileFit'] = 50.0
         df['CourseBiasDelta'] = 0.0
         df['FrontCollapseRisk'] = 0.0
@@ -17206,6 +17289,7 @@ def _csp_compute_win_place_probs(
     course_fit_delta = _num_series(df.get('CourseProfileFit', 50.0), 50.0, index=df.index) - 50.0
     course_stamina_delta = _num_series(df.get('CourseStaminaFit', 50.0), 50.0, index=df.index) - 50.0
     course_distance_specific_delta = _num_series(df.get('CourseDistanceSpecificFit', 50.0), 50.0, index=df.index) - 50.0
+    course_special_delta = _num_series(df.get('CourseSpecialFit', 50.0), 50.0, index=df.index) - 50.0
     course_rail_delta = _num_series(df.get('CourseRailBiasFit', 50.0), 50.0, index=df.index) - 50.0
     course_class_pace_delta = _num_series(df.get('CourseClassPaceFit', 50.0), 50.0, index=df.index) - 50.0
     course_tokyo1400_delta = _num_series(df.get('CourseTokyo1400Fit', 50.0), 50.0, index=df.index) - 50.0
@@ -17217,9 +17301,10 @@ def _csp_compute_win_place_probs(
         + 0.10 * course_fit_delta
         + 0.04 * course_stamina_delta
         + 0.06 * course_distance_specific_delta
-        + 0.06 * course_class_pace_delta
-        + 0.04 * course_rail_delta
-        + 0.05 * course_tokyo1400_delta
+        + 0.06 * course_special_delta
+        + 0.04 * course_class_pace_delta
+        + 0.03 * course_rail_delta
+        + 0.03 * course_tokyo1400_delta
     ).clip(lower=0.0, upper=100.0).astype(float)
 
     # R26: ペースH時の先行馬 AnchorScore ペナルティ
@@ -17241,12 +17326,14 @@ def _csp_compute_win_place_probs(
     pace_class_place_weight = float(pr.get('pace_class_place_weight', 0.10) or 0.10)
     rail_bias_place_weight = float(pr.get('rail_bias_place_weight', 0.06) or 0.06)
     distance_specific_place_weight = float(pr.get('distance_specific_place_weight', 0.10) or 0.10)
+    course_special_place_weight = float(pr.get('course_special_place_weight', 0.08) or 0.08)
     tokyo1400_place_weight = float(pr.get('tokyo1400_place_weight', 0.08) or 0.08)
     place_adj = (
         course_place_weight * course_fit_delta
         + pace_class_place_weight * course_class_pace_delta
         + rail_bias_place_weight * course_rail_delta
         + distance_specific_place_weight * course_distance_specific_delta
+        + course_special_place_weight * course_special_delta
         + tokyo1400_place_weight * course_tokyo1400_delta
     ) / 100.0
     df["p_place_model"] = (df["p_place_model"] + place_adj).clip(lower=0.05, upper=0.72)
@@ -18288,6 +18375,7 @@ def build_trio_formation_from_wide(anchor_num: str, wide_opp_nums: list[str], df
 
     d['_trio_style_bonus'] = d['_style_family'].apply(_trio_style_bonus_for_family).astype(float)
     course_distance_specific_delta = _num_series(d.get('CourseDistanceSpecificFit', 50.0), 50.0, index=d.index) - 50.0
+    course_special_delta = _num_series(d.get('CourseSpecialFit', 50.0), 50.0, index=d.index) - 50.0
     course_rail_delta = _num_series(d.get('CourseRailBiasFit', 50.0), 50.0, index=d.index) - 50.0
     course_tokyo_delta = _num_series(d.get('CourseTokyo1400Fit', 50.0), 50.0, index=d.index) - 50.0
     d['_support_signal'] = (
@@ -18304,8 +18392,9 @@ def build_trio_formation_from_wide(anchor_num: str, wide_opp_nums: list[str], df
         + 28.0 * d['_wide_style_bonus']
         + d['_trio_style_bonus']
         + 0.04 * course_distance_specific_delta
-        + 0.04 * course_rail_delta
-        + 0.03 * course_tokyo_delta
+        + 0.03 * course_special_delta
+        + 0.03 * course_rail_delta
+        + 0.02 * course_tokyo_delta
         - 0.05 * d['trap_score']
     ).astype(float)
     d['_closing_main'] = (
@@ -18319,8 +18408,9 @@ def build_trio_formation_from_wide(anchor_num: str, wide_opp_nums: list[str], df
         + 22.0 * d['_wide_style_bonus']
         + 0.90 * d['_trio_style_bonus']
         + 0.04 * course_distance_specific_delta
-        + 0.03 * course_rail_delta
-        + 0.04 * course_tokyo_delta
+        + 0.04 * course_special_delta
+        + 0.02 * course_rail_delta
+        + 0.03 * course_tokyo_delta
         - 0.05 * d['trap_score']
     ).astype(float)
 
