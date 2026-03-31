@@ -15520,20 +15520,173 @@ def compute_ability_base_score_v1_1(df: pd.DataFrame, params: Optional[dict] = N
 def compute_recent_form_score_v1_1(df: pd.DataFrame, params: Optional[dict] = None) -> pd.Series:
     """近走フォームスコア (0–100) を計算する。"""
     wp = ((params or {}).get('win_pattern_rules', {}) or {})
-    wt = float(wp.get('recent_training_weight', 0.58) or 0.58)
-    wr = float(wp.get('recent_trend_weight', 0.27) or 0.27)
-    wd = float(wp.get('recent_delta_weight', 0.15) or 0.15)
-    s = wt + wr + wd
+    wt = float(wp.get('recent_training_weight', 0.46) or 0.46)
+    wr = float(wp.get('recent_trend_weight', 0.22) or 0.22)
+    wd = float(wp.get('recent_delta_weight', 0.12) or 0.12)
+    wa = float(wp.get('recent_training_adjustment_weight', 0.20) or 0.20)
+    s = wt + wr + wd + wa
     if s <= 0:
-        wt, wr, wd = 0.58, 0.27, 0.15
+        wt, wr, wd, wa = 0.46, 0.22, 0.12, 0.20
         s = 1.0
-    wt, wr, wd = wt / s, wr / s, wd / s
+    wt, wr, wd, wa = wt / s, wr / s, wd / s, wa / s
     tr = _num_series(df, 'TrainingScore', 50.0)
     ct = _num_series(df, 'CommentTrend', 50.0)
     dt = _num_series(df, 'delta_train', 0.0)
+    ta = _num_series(df, 'TrainingAdjustmentScore', 50.0)
     dt01 = (50.0 + 12.0 * dt).clip(lower=0.0, upper=100.0)
-    out = (wt * tr + wr * ct + wd * dt01).clip(lower=0.0, upper=100.0)
+    out = (wt * tr + wr * ct + wd * dt01 + wa * ta).clip(lower=0.0, upper=100.0)
     return _num_series(out, 50.0, index=df.index)
+
+
+def _training_method_bucket(value) -> str:
+    s = str(value or '').strip()
+    if not s:
+        return ''
+    upper = s.upper()
+    if re.search(r'坂路|坂', s):
+        return 'slope'
+    if re.search(r'ウッド|CW|CWコース|Wコース|南W|美W|栗W|WOOD', upper):
+        return 'wood'
+    if re.search(r'ポリ|ダート|芝|プール', s):
+        return 'other'
+    return ''
+
+
+def _normalize_training_rank_score(series_like, index) -> pd.Series:
+    """調教時計順位・上位率のような値を 0-100 スコアへ正規化して返す。小さいほど高評価。"""
+    s = _num_series(series_like, np.nan, index=index)
+    s = pd.to_numeric(s, errors='coerce')
+    s = s.where((~np.isfinite(s)) | (s < 900.0), np.nan)
+    finite = s[np.isfinite(s)]
+    if len(finite) == 0:
+        return pd.Series([50.0] * len(index), index=index, dtype=float)
+    max_abs = float(finite.abs().max())
+    if max_abs <= 1.2:
+        score = 100.0 * (1.0 - s.clip(lower=0.0, upper=1.0))
+    elif max_abs <= 100.0:
+        score = 100.0 * (1.0 - (s.clip(lower=0.0, upper=100.0) / 100.0))
+    else:
+        score = 100.0 - 18.0 * np.log1p((s.clip(lower=1.0) - 1.0))
+    return score.clip(lower=0.0, upper=100.0).fillna(50.0).astype(float)
+
+
+def _extract_weeks_since_last(df: pd.DataFrame) -> pd.Series:
+    """前走間隔を週単位で推定して返す。直接列、日数列、日付差、コメント表現を順に利用する。"""
+    idx = df.index
+    weeks = _num_series(_first_existing_series(df, [
+        'weeks_since_last', 'weeks_since_prev', 'weeks_since_run', 'interval_weeks',
+        'layoff_weeks', 'rest_weeks', '前走間隔週', '中間隔週数', '休養週'
+    ]), np.nan, index=idx)
+    days = _num_series(_first_existing_series(df, [
+        'days_since_last', 'days_since_prev', 'days_since_run', 'interval_days',
+        'last_interval_days', 'layoff_days', 'rest_days', '前走間隔日数', '休養日数'
+    ]), np.nan, index=idx)
+    weeks = weeks.where(np.isfinite(weeks), days / 7.0)
+
+    if 'race_date' in df.columns:
+        prev_date = _first_existing_series(df, ['prev_date', 'last_race_date', 'latest_race_date', '前走日'], default=np.nan)
+        try:
+            race_date = pd.to_datetime(df['race_date'], errors='coerce')
+            prev_dt = pd.to_datetime(prev_date, errors='coerce')
+            delta_weeks = (race_date - prev_dt).dt.days / 7.0
+            weeks = weeks.where(np.isfinite(weeks), delta_weeks)
+        except Exception:
+            pass
+
+    comments = (
+        df.get('comment_short', pd.Series([''] * len(df), index=idx)).infer_objects(copy=False).fillna('').astype(str)
+        + ' '
+        + df.get('comment_tags', pd.Series([''] * len(df), index=idx)).infer_objects(copy=False).fillna('').astype(str)
+    )
+    week_text = pd.to_numeric(comments.str.extract(r'中\s*([0-9]{1,2})\s*週', expand=False), errors='coerce')
+    weeks = weeks.where(np.isfinite(weeks), week_text)
+    return weeks.astype(float)
+
+
+def add_training_adjustment_features(
+    df: pd.DataFrame,
+    meta: Optional[Dict[str, str]] = None,
+    params: Optional[dict] = None,
+) -> pd.DataFrame:
+    """外厩帰り・調教時計順位・調教方法を数値化して調整系特徴量を追加する。"""
+    _ = meta, params
+    if df is None or len(df) == 0:
+        return df
+
+    out = df.copy()
+    idx = out.index
+    weeks = _extract_weeks_since_last(out)
+    gaikyu_text = _first_existing_series(out, [
+        'gaikyu_name', '外厩先', '放牧先', '外厩', '帰厩先'
+    ], default='').infer_objects(copy=False).fillna('').astype(str)
+    comment_text = (
+        out.get('comment_short', pd.Series([''] * len(out), index=idx)).infer_objects(copy=False).fillna('').astype(str)
+        + ' '
+        + out.get('comment_tags', pd.Series([''] * len(out), index=idx)).infer_objects(copy=False).fillna('').astype(str)
+    )
+    gaikyu_pattern = r'天栄|しがらき|山元|チャンピオンヒルズ|大山ヒルズ|ノーザンファーム|ノーザンF|外厩'
+    has_gaikyu = gaikyu_text.str.contains(gaikyu_pattern, regex=True, na=False) | comment_text.str.contains(gaikyu_pattern, regex=True, na=False)
+
+    gaikyu_raw = _first_existing_series(out, ['is_gaikyu_return', '外厩帰り', '外厩帰りフラグ', 'gaikyu_return_flag'], default=np.nan)
+    gaikyu_num = pd.to_numeric(gaikyu_raw, errors='coerce')
+    gaikyu_text_flag = gaikyu_raw.infer_objects(copy=False).fillna('').astype(str).str.contains(r'1|true|yes|あり|有|帰厩', case=False, regex=True, na=False)
+    gaikyu_return_flag = ((gaikyu_num >= 0.5) | gaikyu_text_flag | (has_gaikyu & (weeks >= 10.0))).astype(int)
+
+    gaikyu_score = pd.Series([50.0] * len(out), index=idx, dtype=float)
+    gaikyu_score.loc[has_gaikyu & (weeks >= 6.0)] = 58.0
+    gaikyu_score.loc[gaikyu_return_flag > 0] = 68.0
+    gaikyu_boost = ((weeks - 10.0).clip(lower=0.0, upper=8.0).fillna(0.0) * 1.25)
+    gaikyu_score.loc[gaikyu_return_flag > 0] = (68.0 + gaikyu_boost.loc[gaikyu_return_flag > 0]).clip(lower=0.0, upper=80.0)
+
+    train_rank_raw = _first_existing_series(out, [
+        'training_time_rank', '調教時計順位', '追い切り時計順位', '追切時計順位',
+        '追い切り順位', '追切順位', '調教順位', '調教時計上位率', '追い切り上位率',
+        '追切上位率', 'TrainingRank'
+    ], default=np.nan)
+    training_rank_score = _normalize_training_rank_score(train_rank_raw, idx)
+    training_rank_score = (0.65 * training_rank_score + 0.35 * _num_series(out, 'TrainingScore', 50.0)).clip(lower=0.0, upper=100.0)
+
+    method_text = _first_existing_series(out, [
+        'training_method', '調教方法', '追い切り方法', '追切方法', '追い切りコース',
+        '追切コース', '調教コース', 'course_latest'
+    ], default='').infer_objects(copy=False).fillna('').astype(str)
+    trainer_pref_text = _first_existing_series(out, [
+        'trainer_training_method_pattern', 'trainer_preferred_training_method',
+        '調教師調教パターン', '厩舎調教パターン', 'trainer_course_pattern'
+    ], default='').infer_objects(copy=False).fillna('').astype(str)
+    method_bucket = method_text.apply(_training_method_bucket)
+    pref_bucket = trainer_pref_text.apply(_training_method_bucket)
+
+    training_method_score = pd.Series([50.0] * len(out), index=idx, dtype=float)
+    training_method_score.loc[method_bucket == 'slope'] = 58.0
+    training_method_score.loc[method_bucket == 'wood'] = 56.0
+    training_method_score.loc[method_bucket == 'other'] = 52.0
+    training_method_score.loc[(method_bucket != '') & (pref_bucket != '') & (method_bucket == pref_bucket)] = 72.0
+    training_method_score.loc[(method_bucket != '') & (pref_bucket != '') & (method_bucket != pref_bucket)] = 38.0
+
+    method_present = ((method_text.str.strip() != '') | (trainer_pref_text.str.strip() != '')).astype(float)
+    rank_present = _first_existing_series(out, [
+        'training_time_rank', '調教時計順位', '追い切り時計順位', '追切時計順位',
+        '追い切り順位', '追切順位', '調教順位', '調教時計上位率', '追い切り上位率',
+        '追切上位率', 'TrainingRank'
+    ], default=np.nan).notna().astype(float)
+    gaikyu_present = ((gaikyu_text.str.strip() != '') | gaikyu_text_flag | np.isfinite(weeks)).astype(float)
+
+    out['weeks_since_last'] = weeks.astype(float)
+    out['is_gaikyu_return'] = gaikyu_return_flag.astype(int)
+    out['GaikyuReturnScore'] = gaikyu_score.clip(lower=0.0, upper=100.0).astype(float)
+    out['TrainingTimeRankScore'] = training_rank_score.astype(float)
+    out['TrainingMethodScore'] = training_method_score.astype(float)
+    out['TrainingAdjustmentReliability'] = (100.0 * (gaikyu_present + rank_present + method_present) / 3.0).clip(lower=0.0, upper=100.0).astype(float)
+    out['TrainingAdjustmentScore'] = (
+        0.22 * out['GaikyuReturnScore']
+        + 0.43 * out['TrainingTimeRankScore']
+        + 0.15 * out['TrainingMethodScore']
+        + 0.20 * _num_series(out, 'TrainingScore', 50.0)
+    ).clip(lower=0.0, upper=100.0).astype(float)
+    return out
+
+
 
 
 def compute_race_condition_score_v1_1(df: pd.DataFrame, params: Optional[dict] = None) -> pd.Series:
@@ -16706,6 +16859,7 @@ def _wps_compute_risk_signals(
         _srip = _num_series(df.get('StartRiskInterviewPenalty', 0.0), 0.0, index=df.index)
         df['StartRiskShort'] = (df['StartRiskShort'] + _srip).clip(lower=0.0, upper=15.0)
     df['TemperamentRisk'] = compute_temperament_risk_v1_1(df, params)
+    df = add_training_adjustment_features(df, meta, params)
     df['AbilityBaseScore'] = compute_ability_base_score_v1_1(df, params)
     df['RecentFormScore'] = compute_recent_form_score_v1_1(df, params)
     df['RaceConditionScore'] = compute_race_condition_score_v1_1(df, params)
@@ -21021,6 +21175,52 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "tokyo1400_slope_lap_rank_emb2": "tokyo1400_slope_lap_rank_emb2",
         "tokyo1400_slope_lap_rank_emb3": "tokyo1400_slope_lap_rank_emb3",
         "tokyo1400_slope_lap_rank_emb4": "tokyo1400_slope_lap_rank_emb4",
+        "is_gaikyu_return": "is_gaikyu_return",
+        "gaikyu_return": "is_gaikyu_return",
+        "gaikyu_return_flag": "is_gaikyu_return",
+        "外厩帰り": "is_gaikyu_return",
+        "外厩帰りフラグ": "is_gaikyu_return",
+        "gaikyu_name": "gaikyu_name",
+        "外厩先": "gaikyu_name",
+        "放牧先": "gaikyu_name",
+        "帰厩先": "gaikyu_name",
+        "training_time_rank": "training_time_rank",
+        "調教時計順位": "training_time_rank",
+        "追い切り時計順位": "training_time_rank",
+        "追切時計順位": "training_time_rank",
+        "追い切り順位": "training_time_rank",
+        "追切順位": "training_time_rank",
+        "調教順位": "training_time_rank",
+        "調教時計上位率": "training_time_rank",
+        "追い切り上位率": "training_time_rank",
+        "追切上位率": "training_time_rank",
+        "training_method": "training_method",
+        "調教方法": "training_method",
+        "追い切り方法": "training_method",
+        "追切方法": "training_method",
+        "追い切りコース": "training_method",
+        "追切コース": "training_method",
+        "調教コース": "training_method",
+        "trainer_training_method_pattern": "trainer_training_method_pattern",
+        "trainer_preferred_training_method": "trainer_training_method_pattern",
+        "調教師調教パターン": "trainer_training_method_pattern",
+        "厩舎調教パターン": "trainer_training_method_pattern",
+        "weeks_since_last": "weeks_since_last",
+        "weeks_since_prev": "weeks_since_last",
+        "weeks_since_run": "weeks_since_last",
+        "interval_weeks": "weeks_since_last",
+        "layoff_weeks": "weeks_since_last",
+        "前走間隔週": "weeks_since_last",
+        "中間隔週数": "weeks_since_last",
+        "休養週": "weeks_since_last",
+        "days_since_last": "days_since_last",
+        "days_since_prev": "days_since_last",
+        "days_since_run": "days_since_last",
+        "interval_days": "days_since_last",
+        "last_interval_days": "days_since_last",
+        "layoff_days": "days_since_last",
+        "前走間隔日数": "days_since_last",
+        "休養日数": "days_since_last",
         # R24: 昇級点列（IMP-5 ClassUpBonus 用）
         '昇級点':    'class_up_point',
         'class_up': 'class_up_point',
