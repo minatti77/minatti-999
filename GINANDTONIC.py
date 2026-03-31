@@ -10204,6 +10204,82 @@ def _apply_win_expected_value(
     d['win_expected_return'] = ((p_win / 100.0) * d['win_odds']).astype(float)
     d['win_expected_value'] = (d['win_expected_return'] - 1.0).astype(float)
 
+    owner_prize_score = _num_series(d.get('OwnerPrizeExpectationScore', np.nan), np.nan, index=idx)
+    owner_condition_score = _num_series(d.get('OwnerConditionSwitchScore', np.nan), np.nan, index=idx)
+    owner_class_score = _num_series(d.get('OwnerClassPriorityScore', d.get('owner_class_priority', np.nan)), np.nan, index=idx)
+    owner_name_text = _first_existing_series(d, ['owner_name', '馬主', '馬主名'], default='').infer_objects(copy=False).fillna('').astype(str)
+    comment_text = _first_existing_series(d, ['comment_tags', 'comment_text', 'prev_interview', 'comment_raw'], default='').infer_objects(copy=False).fillna('').astype(str)
+    prev_surface_text = _first_existing_series(d, ['prev_surface', 'last_surface', '前走馬場', '前走コース種別'], default='').infer_objects(copy=False).fillna('').astype(str)
+    prev_distance_num = _num_series(_first_existing_series(d, ['prev_distance', 'last_distance', '前走距離'], default=np.nan), np.nan, index=idx)
+    class_id = _infer_race_class_id(meta or {})
+    racecourse = infer_racecourse_from_meta(meta or {}) or ''
+    current_distance, current_surface = _meta_distance_surface(meta or {})
+    current_distance_value = float(current_distance) if np.isfinite(current_distance) else float('nan')
+    current_surface_text = '芝' if str(current_surface).upper().startswith('T') else ('ダート' if str(current_surface).upper().startswith('D') else str(current_surface))
+
+    club_owner_flag = owner_name_text.str.contains(
+        r'サンデー|シルク|キャロット|社台レースホース|G1レーシング|東京ホース|ラフィアン|ノルマンディー|ロード|DMM|ウイン',
+        case=False, regex=True, na=False,
+    ).astype(float)
+    private_owner_flag = ((owner_name_text.str.strip() != '') & (club_owner_flag < 1.0)).astype(float)
+    strategic_owner_flag = owner_name_text.str.contains(
+        r'サンデー|シルク|キャロット|社台レースホース|G1レーシング|東京ホース|ラフィアン|ノルマンディー|ロード|ダノックス|金子真人|キーファーズ|近藤旬子',
+        case=False, regex=True, na=False,
+    ).astype(float)
+
+    surface_switch_flag = (
+        ((current_surface_text == 'ダート') & prev_surface_text.str.contains('芝', na=False))
+        | ((current_surface_text == '芝') & prev_surface_text.str.contains('ダート', na=False))
+        | comment_text.str.contains(r'芝替わり|ダート替わり', regex=True, na=False)
+    )
+    distance_shorten_flag = (((prev_distance_num - current_distance_value) >= 200.0) | comment_text.str.contains(r'距離短縮', regex=True, na=False))
+    distance_extend_flag = (((current_distance_value - prev_distance_num) >= 200.0) | comment_text.str.contains(r'距離延長', regex=True, na=False))
+    condition_switch_active = (surface_switch_flag | distance_shorten_flag | distance_extend_flag).astype(float)
+
+    owner_class_context = pd.Series([50.0] * len(d), index=idx, dtype=float)
+    if class_id >= 4:
+        owner_class_context = owner_class_context + 12.0 * private_owner_flag + 8.0 * strategic_owner_flag
+    elif class_id <= 1:
+        owner_class_context = owner_class_context + 12.0 * club_owner_flag + 6.0 * strategic_owner_flag
+    elif class_id == 2:
+        owner_class_context = owner_class_context + 7.0 * club_owner_flag + 4.0 * private_owner_flag
+    else:
+        owner_class_context = owner_class_context + 4.0 * strategic_owner_flag
+    if racecourse in {'東京', '中山'}:
+        owner_class_context = owner_class_context + 6.0 * private_owner_flag + 4.0 * strategic_owner_flag
+    owner_class_context = owner_class_context.clip(lower=0.0, upper=100.0)
+
+    owner_condition_context = (
+        50.0
+        + 12.0 * condition_switch_active
+        + 6.0 * distance_shorten_flag.astype(float)
+        + 4.0 * surface_switch_flag.astype(float)
+        + 6.0 * strategic_owner_flag
+    )
+    owner_condition_context = owner_condition_context.clip(lower=0.0, upper=100.0)
+
+    owner_prize_score = owner_prize_score.where(owner_prize_score.notna(), 0.60 * owner_class_score.fillna(50.0) + 0.40 * owner_class_context)
+    owner_prize_score = (
+        0.52 * owner_prize_score.fillna(50.0)
+        + 0.28 * owner_class_context
+        + 0.20 * owner_class_score.fillna(50.0)
+    ).clip(lower=0.0, upper=100.0)
+    owner_condition_score = owner_condition_score.where(owner_condition_score.notna(), owner_condition_context)
+    owner_condition_score = (
+        0.62 * owner_condition_score.fillna(50.0)
+        + 0.38 * owner_condition_context
+    ).clip(lower=0.0, upper=100.0)
+
+    d['OwnerPrizeExpectationScore'] = owner_prize_score.astype(float)
+    d['OwnerConditionSwitchScore'] = owner_condition_score.astype(float)
+    d['OwnerExpectedValueBoost'] = (
+        1.0
+        + ((d['OwnerPrizeExpectationScore'] - 50.0) / 50.0) * 0.10
+        + condition_switch_active * ((d['OwnerConditionSwitchScore'] - 50.0) / 50.0) * 0.06
+    ).clip(lower=0.88, upper=1.18).astype(float)
+    d['win_expected_return'] = (d['win_expected_return'] * d['OwnerExpectedValueBoost']).astype(float)
+    d['win_expected_value'] = (d['win_expected_return'] - 1.0).astype(float)
+
     try:
         min_ret = float(vr.get('min_expected_return', 1.00) or 1.00)
     except Exception:
@@ -17173,6 +17249,152 @@ def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = No
         'owner_class_priority', '馬主クラス優先度', 'owner_class_bias'
     ]), idx)
 
+    breeder_name_raw = _first_existing_series(out, ['breeder_name', '生産者', '生産牧場'], default='')
+    jockey_name_raw = _first_existing_series(out, ['jockey_name', '騎手名', '騎手', 'ジョッキー'], default='')
+    trainer_name_raw = _first_existing_series(out, ['trainer_name', '調教師', '厩舎', '厩舎名'], default='')
+    owner_name_raw = _first_existing_series(out, ['owner_name', '馬主', '馬主名'], default='')
+    gaikyu_name_raw = _first_existing_series(out, ['gaikyu_name', '外厩先', '放牧先', '帰厩先'], default='')
+
+    breeder_jockey_network_raw = _first_existing_series(out, [
+        'breeder_jockey_agent_share', 'breeder_jockey_network',
+        '生産者騎手エージェント比率', '生産牧場騎手エージェント比率',
+        '生産者騎手ネットワーク', '生産牧場騎手ネットワーク'
+    ], default=np.nan)
+    breeder_trainer_network_raw = _first_existing_series(out, [
+        'breeder_trainer_network', 'breeder_trainer_share',
+        '生産者調教師ネットワーク', '生産牧場調教師ネットワーク',
+        '生産者調教師連携率', '生産牧場調教師連携率'
+    ], default=np.nan)
+    breeder_gaikyu_trainer_raw = _first_existing_series(out, [
+        'breeder_gaikyu_trainer_score', '外厩連携スコア', '生産者外厩連携',
+        '生産牧場外厩連携', '生産者調教師外厩連携', '牧場外厩連携'
+    ], default=np.nan)
+    owner_prize_expectation_raw = _first_existing_series(out, [
+        'owner_prize_expectation', 'owner_expected_value', 'owner_course_expectation', 'owner_course_bias',
+        'owner_course_roi', '馬主賞金期待値', '馬主期待値', '馬主コース期待値', '馬主期待回収'
+    ], default=np.nan)
+    owner_condition_switch_raw = _first_existing_series(out, [
+        'owner_condition_switch_success', 'owner_switch_success',
+        '条件転換成功率', '条件替わり成功率', '馬主条件転換成功率'
+    ], default=np.nan)
+    owner_surface_switch_raw = _first_existing_series(out, [
+        'owner_surface_switch_success', 'surface_switch_success_by_owner',
+        '芝ダート替わり成功率', '馬主芝ダート替わり成功率'
+    ], default=np.nan)
+    owner_distance_switch_raw = _first_existing_series(out, [
+        'owner_distance_switch_success', 'distance_switch_success_by_owner',
+        '距離短縮成功率', '距離延長成功率', '馬主距離替わり成功率'
+    ], default=np.nan)
+
+    breeder_jockey_network = _normalize_rate_score(breeder_jockey_network_raw, idx)
+    breeder_trainer_network = _normalize_rate_score(breeder_trainer_network_raw, idx)
+    breeder_gaikyu_trainer = _normalize_rate_score(breeder_gaikyu_trainer_raw, idx)
+    owner_prize_expectation = _normalize_roi_score(owner_prize_expectation_raw, idx)
+    owner_condition_switch = _normalize_rate_score(owner_condition_switch_raw, idx)
+    owner_surface_switch = _normalize_rate_score(owner_surface_switch_raw, idx)
+    owner_distance_switch = _normalize_rate_score(owner_distance_switch_raw, idx)
+
+    breeder_name_text = breeder_name_raw.infer_objects(copy=False).fillna('').astype(str)
+    jockey_name_text = jockey_name_raw.infer_objects(copy=False).fillna('').astype(str)
+    trainer_name_text = trainer_name_raw.infer_objects(copy=False).fillna('').astype(str)
+    owner_name_text = owner_name_raw.infer_objects(copy=False).fillna('').astype(str)
+    gaikyu_name_text = gaikyu_name_raw.infer_objects(copy=False).fillna('').astype(str)
+
+    major_breeder_flag = breeder_name_text.str.contains(
+        r'ノーザンファーム|ノーザンF|社台ファーム|社台F|白老ファーム|追分ファーム|ノーザンホースパーク',
+        case=False, regex=True, na=False,
+    ).astype(float)
+    agent_jockey_flag = jockey_name_text.str.contains(
+        r'ルメール|川田|武豊|モレイラ|レーン|戸崎|横山武|坂井|デムーロ',
+        case=False, regex=True, na=False,
+    ).astype(float)
+    elite_trainer_flag = trainer_name_text.str.contains(
+        r'中内田|堀|木村|友道|国枝|手塚|須貝|矢作|池江|藤原|斉藤崇|杉山晴',
+        case=False, regex=True, na=False,
+    ).astype(float)
+    owner_strategy_flag = owner_name_text.str.contains(
+        r'サンデー|シルク|キャロット|社台レースホース|G1レーシング|東京ホース|ラフィアン|ノルマンディー|ロード|ダノックス|金子真人|キーファーズ|近藤旬子',
+        case=False, regex=True, na=False,
+    ).astype(float)
+    club_owner_flag = owner_name_text.str.contains(
+        r'サンデー|シルク|キャロット|社台レースホース|G1レーシング|東京ホース|ラフィアン|ノルマンディー|ロード|DMM|ウイン',
+        case=False, regex=True, na=False,
+    ).astype(float)
+    major_gaikyu_flag = gaikyu_name_text.str.contains(
+        r'天栄|しがらき|山元|チャンピオンヒルズ|大山ヒルズ|ノーザン',
+        case=False, regex=True, na=False,
+    ).astype(float)
+    gaikyu_return_flag_num = (_num_series(out, 'is_gaikyu_return', 0.0, index=idx) >= 1.0).astype(float)
+    gaikyu_current_score = _num_series(out, 'GaikyuReturnScore', 50.0, index=idx)
+    training_adjust_score = _num_series(out, 'TrainingAdjustmentScore', 50.0, index=idx)
+
+    breeder_agent_heuristic = (
+        44.0
+        + 12.0 * major_breeder_flag
+        + 12.0 * agent_jockey_flag
+        + 8.0 * (combo_place_rate >= 58.0).astype(float)
+        + 6.0 * (main_jockey_share_score >= 60.0).astype(float)
+        + 6.0 * (jockey_rate >= 58.0).astype(float)
+    ).clip(lower=0.0, upper=100.0)
+    breeder_trainer_heuristic = (
+        44.0
+        + 12.0 * major_breeder_flag
+        + 12.0 * elite_trainer_flag
+        + 8.0 * (trainer_rate >= 58.0).astype(float)
+        + 8.0 * (trainer_recent >= 56.0).astype(float)
+        + 6.0 * (combo_place_rate >= 56.0).astype(float)
+    ).clip(lower=0.0, upper=100.0)
+    breeder_gaikyu_heuristic = (
+        42.0
+        + 10.0 * major_breeder_flag
+        + 10.0 * major_gaikyu_flag
+        + 10.0 * gaikyu_return_flag_num
+        + 8.0 * (gaikyu_current_score >= 60.0).astype(float)
+        + 8.0 * (training_adjust_score >= 58.0).astype(float)
+        + 6.0 * (trainer_rate >= 58.0).astype(float)
+    ).clip(lower=0.0, upper=100.0)
+
+    breeder_agent_network_score = breeder_agent_heuristic.where(
+        breeder_jockey_network_raw.isna(),
+        0.62 * breeder_jockey_network + 0.38 * breeder_agent_heuristic,
+    ).clip(lower=0.0, upper=100.0)
+    breeder_trainer_network_score = breeder_trainer_heuristic.where(
+        breeder_trainer_network_raw.isna(),
+        0.62 * breeder_trainer_network + 0.38 * breeder_trainer_heuristic,
+    ).clip(lower=0.0, upper=100.0)
+    breeder_gaikyu_coordination_score = breeder_gaikyu_heuristic.where(
+        breeder_gaikyu_trainer_raw.isna(),
+        0.60 * breeder_gaikyu_trainer + 0.40 * breeder_gaikyu_heuristic,
+    ).clip(lower=0.0, upper=100.0)
+
+    owner_prize_heuristic = (
+        46.0
+        + 12.0 * owner_strategy_flag
+        + 8.0 * club_owner_flag
+        + 10.0 * (owner_class_priority >= 58.0).astype(float)
+        + 6.0 * (breeder_owner_affinity >= 58.0).astype(float)
+    ).clip(lower=0.0, upper=100.0)
+    owner_condition_heuristic = (
+        46.0
+        + 10.0 * owner_strategy_flag
+        + 8.0 * club_owner_flag
+        + 8.0 * (owner_class_priority >= 55.0).astype(float)
+        + 6.0 * (training_adjust_score >= 58.0).astype(float)
+    ).clip(lower=0.0, upper=100.0)
+    owner_condition_base = (
+        0.50 * owner_condition_switch
+        + 0.25 * owner_surface_switch
+        + 0.25 * owner_distance_switch
+    ).clip(lower=0.0, upper=100.0)
+    owner_prize_score = owner_prize_heuristic.where(
+        owner_prize_expectation_raw.isna(),
+        0.58 * owner_prize_expectation + 0.42 * owner_prize_heuristic,
+    ).clip(lower=0.0, upper=100.0)
+    owner_condition_switch_score = owner_condition_heuristic.where(
+        owner_condition_switch_raw.isna() & owner_surface_switch_raw.isna() & owner_distance_switch_raw.isna(),
+        0.65 * owner_condition_base + 0.35 * owner_condition_heuristic,
+    ).clip(lower=0.0, upper=100.0)
+
     out['JockeyRecentFormScore'] = _shrink_score_by_sample(jockey_recent, jockey_n, max_n=36.0)
     out['TrainerRecentFormScore'] = _shrink_score_by_sample(trainer_recent, trainer_n, max_n=36.0)
     out['TrainerJockeyWinRateScore'] = _shrink_score_by_sample(combo_win_rate, combo_n, max_n=24.0)
@@ -17192,6 +17414,20 @@ def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = No
     out['StableJockeyScore'] = stable_jockey_score
     out['BreederOwnerAffinityScore'] = breeder_owner_affinity.astype(float)
     out['OwnerClassPriorityScore'] = owner_class_priority.astype(float)
+    out['BreederAgentNetworkScore'] = breeder_agent_network_score.astype(float)
+    out['BreederTrainerNetworkScore'] = breeder_trainer_network_score.astype(float)
+    out['BreederGaikyuCoordinationScore'] = breeder_gaikyu_coordination_score.astype(float)
+    out['BreederSerialStrategyScore'] = (
+        0.38 * out['BreederAgentNetworkScore']
+        + 0.34 * out['BreederTrainerNetworkScore']
+        + 0.28 * out['BreederGaikyuCoordinationScore']
+    ).clip(lower=0.0, upper=100.0).astype(float)
+    out['OwnerPrizeExpectationScore'] = owner_prize_score.astype(float)
+    out['OwnerConditionSwitchScore'] = owner_condition_switch_score.astype(float)
+    out['OwnerRacePlacementScore'] = (
+        0.58 * out['OwnerPrizeExpectationScore']
+        + 0.42 * out['OwnerConditionSwitchScore']
+    ).clip(lower=0.0, upper=100.0).astype(float)
     out['JockeyConnectionScore'] = _shrink_score_by_sample(0.60 * jockey_rate + 0.25 * jockey_roi + 0.15 * jockey_recent, jockey_n, max_n=36.0)
     out['TrainerConnectionScore'] = _shrink_score_by_sample(0.60 * trainer_rate + 0.25 * trainer_roi + 0.15 * trainer_recent, trainer_n, max_n=36.0)
     out['ConnectionRecentFormScore'] = (
@@ -17209,28 +17445,49 @@ def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = No
     owner_class_rel = (_first_existing_series(out, ['owner_class_priority', '馬主クラス優先度', 'owner_class_bias'], default=np.nan).notna()).astype(float)
     stable_rel = (_first_existing_series(out, ['is_stable_jockey', '主戦騎手', '厩舎主戦騎手', 'stable_jockey_flag'], default=np.nan).notna()).astype(float)
     share_rel = (_first_existing_series(out, ['main_jockey_share', 'trainer_main_jockey_share', 'stable_main_jockey_share', '主戦騎手比率', '厩舎主戦騎手比率', '主戦割合', '主戦シェア', '厩舎騎手シェア'], default=np.nan).notna()).astype(float)
+    breeder_agent_rel = (breeder_jockey_network_raw.notna() | (major_breeder_flag > 0.0) | (agent_jockey_flag > 0.0)).astype(float)
+    breeder_trainer_rel = (breeder_trainer_network_raw.notna() | (major_breeder_flag > 0.0) | (elite_trainer_flag > 0.0)).astype(float)
+    breeder_gaikyu_rel = (breeder_gaikyu_trainer_raw.notna() | (major_gaikyu_flag > 0.0) | (gaikyu_return_flag_num > 0.0)).astype(float)
+    owner_prize_rel = (owner_prize_expectation_raw.notna() | owner_name_text.str.strip().ne('')).astype(float)
+    owner_cond_rel = (
+        owner_condition_switch_raw.notna()
+        | owner_surface_switch_raw.notna()
+        | owner_distance_switch_raw.notna()
+        | owner_name_text.str.strip().ne('')
+    ).astype(float)
     out['HumanConnectionReliability'] = (
-        100.0 * (jockey_rel + trainer_rel + combo_rel + breeder_owner_rel + owner_class_rel + stable_rel + share_rel) / 7.0
+        100.0 * (
+            jockey_rel + trainer_rel + combo_rel + breeder_owner_rel + owner_class_rel + stable_rel + share_rel
+            + breeder_agent_rel + breeder_trainer_rel + breeder_gaikyu_rel + owner_prize_rel + owner_cond_rel
+        ) / 12.0
     ).clip(lower=0.0, upper=100.0).astype(float)
 
     out['HumanNetworkScore'] = (
-        0.24 * out['TrainerJockeyChemistryScore']
-        + 0.18 * out['JockeyTrainerComboROIScore']
-        + 0.14 * out['TrainerJockeyWinRateScore']
-        + 0.10 * out['TrainerJockeyPlaceRateScore']
-        + 0.10 * out['MainJockeyShareScore']
-        + 0.08 * out['StableJockeyScore']
-        + 0.08 * out['BreederOwnerAffinityScore']
-        + 0.08 * out['OwnerClassPriorityScore']
+        0.12 * out['TrainerJockeyChemistryScore']
+        + 0.09 * out['JockeyTrainerComboROIScore']
+        + 0.06 * out['TrainerJockeyWinRateScore']
+        + 0.04 * out['TrainerJockeyPlaceRateScore']
+        + 0.04 * out['MainJockeyShareScore']
+        + 0.03 * out['StableJockeyScore']
+        + 0.13 * out['BreederAgentNetworkScore']
+        + 0.11 * out['BreederTrainerNetworkScore']
+        + 0.10 * out['BreederGaikyuCoordinationScore']
+        + 0.05 * out['BreederOwnerAffinityScore']
+        + 0.06 * out['OwnerClassPriorityScore']
+        + 0.08 * out['OwnerPrizeExpectationScore']
+        + 0.09 * out['OwnerConditionSwitchScore']
     ).clip(lower=0.0, upper=100.0).astype(float)
 
     out['HumanConnectionScore'] = (
-        0.22 * out['JockeyConnectionScore']
-        + 0.18 * out['TrainerConnectionScore']
-        + 0.16 * out['TrainerJockeyChemistryScore']
-        + 0.12 * out['JockeyTrainerComboROIScore']
-        + 0.10 * out['ConnectionRecentFormScore']
-        + 0.22 * out['HumanNetworkScore']
+        0.18 * out['JockeyConnectionScore']
+        + 0.14 * out['TrainerConnectionScore']
+        + 0.13 * out['TrainerJockeyChemistryScore']
+        + 0.09 * out['JockeyTrainerComboROIScore']
+        + 0.08 * out['ConnectionRecentFormScore']
+        + 0.12 * out['HumanNetworkScore']
+        + 0.10 * out['BreederSerialStrategyScore']
+        + 0.08 * out['OwnerRacePlacementScore']
+        + 0.08 * out['BreederGaikyuCoordinationScore']
     ).clip(lower=0.0, upper=100.0).astype(float)
     return out
 
@@ -19702,7 +19959,8 @@ def auto_select_place_feature_cols(df: pd.DataFrame, y_col: str = 'show_flag', g
         'Ability','PosFit','Consist','MapFit','TimeFit','FactorFit',
         'MarketWinFit','MarketPlaceFit',
         'HumanConnectionScore','ConnectionRecentFormScore','JockeyTrainerComboROIScore',
-        'JockeyRecentFormScore','TrainerRecentFormScore',
+        'JockeyRecentFormScore','TrainerRecentFormScore','BreederSerialStrategyScore',
+        'OwnerRacePlacementScore','OwnerPrizeExpectationScore','OwnerConditionSwitchScore',
         'WinShape','Upside','WPS',
         # optional context
         'AI_REAR_CONFIRMED','zone_3c','zone_4c',
@@ -21135,9 +21393,57 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "breeder_owner_affinity": "breeder_owner_affinity",
         "生産者馬主相性": "breeder_owner_affinity",
         "生産者馬主期待値": "breeder_owner_affinity",
+        "breeder_jockey_agent_share": "breeder_jockey_agent_share",
+        "breeder_jockey_network": "breeder_jockey_agent_share",
+        "生産者騎手エージェント比率": "breeder_jockey_agent_share",
+        "生産牧場騎手エージェント比率": "breeder_jockey_agent_share",
+        "生産者騎手ネットワーク": "breeder_jockey_agent_share",
+        "生産牧場騎手ネットワーク": "breeder_jockey_agent_share",
+        "breeder_trainer_network": "breeder_trainer_network",
+        "breeder_trainer_share": "breeder_trainer_network",
+        "生産者調教師ネットワーク": "breeder_trainer_network",
+        "生産牧場調教師ネットワーク": "breeder_trainer_network",
+        "生産者調教師連携率": "breeder_trainer_network",
+        "生産牧場調教師連携率": "breeder_trainer_network",
+        "breeder_gaikyu_trainer_score": "breeder_gaikyu_trainer_score",
+        "外厩連携スコア": "breeder_gaikyu_trainer_score",
+        "生産者外厩連携": "breeder_gaikyu_trainer_score",
+        "生産牧場外厩連携": "breeder_gaikyu_trainer_score",
+        "生産者調教師外厩連携": "breeder_gaikyu_trainer_score",
+        "牧場外厩連携": "breeder_gaikyu_trainer_score",
         "owner_class_priority": "owner_class_priority",
         "馬主クラス優先度": "owner_class_priority",
         "owner_class_bias": "owner_class_priority",
+        "owner_prize_expectation": "owner_prize_expectation",
+        "owner_expected_value": "owner_prize_expectation",
+        "owner_course_expectation": "owner_prize_expectation",
+        "owner_course_bias": "owner_prize_expectation",
+        "owner_course_roi": "owner_prize_expectation",
+        "馬主賞金期待値": "owner_prize_expectation",
+        "馬主期待値": "owner_prize_expectation",
+        "馬主コース期待値": "owner_prize_expectation",
+        "馬主期待回収": "owner_prize_expectation",
+        "owner_condition_switch_success": "owner_condition_switch_success",
+        "owner_switch_success": "owner_condition_switch_success",
+        "条件転換成功率": "owner_condition_switch_success",
+        "条件替わり成功率": "owner_condition_switch_success",
+        "馬主条件転換成功率": "owner_condition_switch_success",
+        "owner_surface_switch_success": "owner_surface_switch_success",
+        "surface_switch_success_by_owner": "owner_surface_switch_success",
+        "芝ダート替わり成功率": "owner_surface_switch_success",
+        "馬主芝ダート替わり成功率": "owner_surface_switch_success",
+        "owner_distance_switch_success": "owner_distance_switch_success",
+        "distance_switch_success_by_owner": "owner_distance_switch_success",
+        "距離短縮成功率": "owner_distance_switch_success",
+        "距離延長成功率": "owner_distance_switch_success",
+        "馬主距離替わり成功率": "owner_distance_switch_success",
+        "prev_surface": "prev_surface",
+        "last_surface": "prev_surface",
+        "前走馬場": "prev_surface",
+        "前走コース種別": "prev_surface",
+        "prev_distance": "prev_distance",
+        "last_distance": "prev_distance",
+        "前走距離": "prev_distance",
         # lap suitability / previous pace / course shape
         "prev_pci": "prev_pci",
         "前走PCI": "prev_pci",
