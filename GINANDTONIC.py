@@ -10323,6 +10323,16 @@ def _lap_shape_meta_features(meta: Optional[Dict[str, str]]) -> Dict[str, Any]:
         first_half = _meta_float(meta, ['half_time', 'half_front', 'front_half'], default=float('nan'))
     if (not np.isfinite(last_half)):
         last_half = _meta_float(meta, ['half_time_back', 'back_half'], default=float('nan'))
+    start_to_corner_dist = _meta_float(
+        meta,
+        ['start_to_corner_dist', 'start_corner_dist', 'first_corner_dist', 'start_to_first_corner_m', 'runup_m'],
+        default=float('nan'),
+    )
+    straight_len = _meta_float(
+        meta,
+        ['straight_len', 'home_stretch_len', 'last_straight_len', 'straight_length', 'homestretch_m'],
+        default=float('nan'),
+    )
     if laps and ((not np.isfinite(first_half)) or (not np.isfinite(last_half))):
         half = max(1, len(laps) // 2)
         try:
@@ -10349,11 +10359,57 @@ def _lap_shape_meta_features(meta: Optional[Dict[str, str]]) -> Dict[str, Any]:
             sustain_bias += 0.8
         elif avg_sf >= 12.20:
             closing_bias += 1.5
+    try:
+        _, surface_hint, profile_hint = _resolve_course_profile(meta)
+    except Exception:
+        surface_hint, profile_hint = '', {}
+    try:
+        dist_hint, surface_meta = _meta_distance_surface(meta)
+    except Exception:
+        dist_hint, surface_meta = float('nan'), ''
+    surface_hint = surface_meta or surface_hint
+    if not np.isfinite(start_to_corner_dist):
+        base_start = 280.0 if surface_hint == 'dirt' else 300.0
+        if np.isfinite(dist_hint):
+            if dist_hint <= 1400:
+                base_start = 230.0 if surface_hint == 'dirt' else 260.0
+            elif dist_hint <= 1800:
+                base_start = 360.0
+            elif dist_hint <= 2400:
+                base_start = 440.0
+            else:
+                base_start = 520.0
+        corner_pref = float(profile_hint.get('corner', 0.5) or 0.5)
+        gate_pref = float(profile_hint.get('gate', 0.5) or 0.5)
+        start_to_corner_dist = float(np.clip(base_start + (0.55 - corner_pref) * 170.0 + (gate_pref - 0.50) * 70.0, 140.0, 650.0))
+    if not np.isfinite(straight_len):
+        base_straight = 300.0 if surface_hint == 'dirt' else 330.0
+        if np.isfinite(dist_hint):
+            if dist_hint <= 1400:
+                base_straight += 10.0
+            elif dist_hint >= 2400:
+                base_straight += 25.0
+        straight_pref = float(profile_hint.get('straight', 0.5) or 0.5)
+        straight_len = float(np.clip(base_straight + (straight_pref - 0.50) * 240.0, 220.0, 720.0))
+    start_corner_bias = 0.0
+    straight_bias = 0.0
+    if np.isfinite(start_to_corner_dist):
+        start_norm = float(np.clip((start_to_corner_dist - 180.0) / 420.0, 0.0, 1.0))
+        start_corner_bias = float(np.clip((0.45 - start_norm) * 10.0, -8.0, 8.0))
+        goodpos_bias += float(np.clip((0.45 - start_norm) * 3.5, -2.5, 2.5))
+    if np.isfinite(straight_len):
+        straight_norm = float(np.clip((straight_len - 260.0) / 320.0, 0.0, 1.0))
+        straight_bias = float(np.clip((straight_norm - 0.45) * 10.0, -8.0, 8.0))
+        closing_bias += float(np.clip((straight_norm - 0.45) * 3.5, -2.5, 2.5))
     return {
         'laps': laps,
         'avg_sf': avg_sf,
         'first_half': first_half,
         'last_half': last_half,
+        'start_to_corner_dist': float(start_to_corner_dist) if np.isfinite(start_to_corner_dist) else float('nan'),
+        'straight_len': float(straight_len) if np.isfinite(straight_len) else float('nan'),
+        'start_corner_bias': float(np.clip(start_corner_bias, -8.0, 8.0)),
+        'straight_bias': float(np.clip(straight_bias, -8.0, 8.0)),
         'closing_bias': float(np.clip(closing_bias, -8.0, 8.0)),
         'goodpos_bias': float(np.clip(goodpos_bias, -8.0, 8.0)),
         'sustain_bias': float(np.clip(sustain_bias, 0.0, 8.0)),
@@ -10603,13 +10659,18 @@ def add_pace_profile_features_v1_1(df: pd.DataFrame, meta: Dict[str, str], param
             lambda x: float(np.mean(v)) if (v := parse_pace_hist_values(x)) else np.nan
         ).astype(float)
 
+    prev_pci = _num_series(df.get('prev_pci', np.nan), np.nan, index=df.index).clip(lower=32.0, upper=68.0)
+    prev_rpci = _num_series(df.get('prev_rpci', np.nan), np.nan, index=df.index).clip(lower=32.0, upper=68.0)
+
     horse_pci = _num_series(df.get('avg_pci', df.get('pci', np.nan)), np.nan, index=df.index)
     horse_pci = horse_pci.where(horse_pci.notna(), _hist_mean('pci_hist'))
+    horse_pci = horse_pci.where(horse_pci.notna(), prev_pci)
     horse_pci = horse_pci.where(horse_pci.notna(), inferred_pci)
     horse_pci = horse_pci.clip(lower=32.0, upper=68.0)
 
     horse_rpci = _num_series(df.get('avg_rpci', df.get('rpci', np.nan)), np.nan, index=df.index)
     horse_rpci = horse_rpci.where(horse_rpci.notna(), _hist_mean('rpci_hist'))
+    horse_rpci = horse_rpci.where(horse_rpci.notna(), prev_rpci)
     horse_rpci = horse_rpci.where(horse_rpci.notna(), horse_pci)
     horse_rpci = horse_rpci.clip(lower=32.0, upper=68.0)
 
@@ -10619,6 +10680,20 @@ def add_pace_profile_features_v1_1(df: pd.DataFrame, meta: Dict[str, str], param
     rpci_gap = (horse_rpci - expected_s).abs().clip(lower=0.0, upper=24.0)
     match_score = (100.0 - mismatch * 4.0).clip(lower=0.0, upper=100.0)
     race_env_score = (100.0 - rpci_gap * 3.6).clip(lower=0.0, upper=100.0)
+
+    prev_pci_ref = prev_pci.where(prev_pci.notna(), horse_pci)
+    prev_rpci_ref = prev_rpci.where(prev_rpci.notna(), horse_rpci)
+    prev_pci_gap = (prev_pci_ref - expected_s).abs().clip(lower=0.0, upper=24.0)
+    prev_rpci_gap = (prev_rpci_ref - expected_s).abs().clip(lower=0.0, upper=24.0)
+    transition_score = (100.0 - prev_pci_gap * 4.1 - prev_rpci_gap * 1.4).clip(lower=0.0, upper=100.0)
+    rebound_room = (expected_s - prev_pci_ref).clip(lower=0.0, upper=18.0)
+    pace_rebound = (
+        50.0
+        + rebound_room * 2.2
+        + (48.5 - prev_rpci_ref).clip(lower=0.0, upper=10.0) * 1.6
+        + (49.5 - prev_pci_ref).clip(lower=0.0, upper=12.0) * 1.2
+        - (prev_pci_ref - expected_s).clip(lower=0.0, upper=14.0) * 1.0
+    ).clip(lower=0.0, upper=100.0)
 
     if expected_rpci >= 53.0:
         style_support = (
@@ -10642,14 +10717,24 @@ def add_pace_profile_features_v1_1(df: pd.DataFrame, meta: Dict[str, str], param
         )
     style_support = style_support.clip(lower=0.0, upper=100.0)
 
-    profile_adv = (0.50 * match_score + 0.22 * race_env_score + 0.28 * style_support).clip(lower=0.0, upper=100.0)
+    profile_adv = (
+        0.40 * match_score
+        + 0.18 * race_env_score
+        + 0.24 * style_support
+        + 0.18 * transition_score
+    ).clip(lower=0.0, upper=100.0)
+    profile_adv = (0.82 * profile_adv + 0.18 * pace_rebound).clip(lower=0.0, upper=100.0)
     base_pacefit = _num_series(df.get('PaceFit', 50.0), 50.0, index=df.index)
     df['ExpectedRPCI'] = expected_s.astype(float)
+    df['PrevPCI'] = prev_pci_ref.astype(float)
+    df['PrevRPCI'] = prev_rpci_ref.astype(float)
     df['HorseAvgPCI'] = horse_pci.astype(float)
     df['HorseAvgRPCI'] = horse_rpci.astype(float)
     df['PaceMatchDelta'] = mismatch.astype(float)
     df['PaceMatchScore'] = match_score.astype(float)
     df['PaceRaceEnvScore'] = race_env_score.astype(float)
+    df['PaceTransitionScore'] = transition_score.astype(float)
+    df['PaceReboundSignal'] = pace_rebound.astype(float)
     df['PaceStyleSupport'] = style_support.astype(float)
     df['PaceProfileAdvantage'] = profile_adv.astype(float)
     df['PaceFit'] = ((1.0 - blend_w) * base_pacefit + blend_w * profile_adv).clip(lower=0.0, upper=100.0).astype(float)
@@ -14232,6 +14317,39 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     michfit = _num_series(d.get('MichiakuFit', factorfit), 50.0, index=d.index)
     consist = _num_series(d.get('Consist', 50.0), 50.0, index=d.index)
     comment_trend = _num_series(d.get('CommentTrend', 50.0), 50.0, index=d.index)
+    lap_shape_meta = _lap_shape_meta_features(meta)
+    try:
+        start_to_corner_dist = float(lap_shape_meta.get('start_to_corner_dist', float('nan')))
+    except Exception:
+        start_to_corner_dist = float('nan')
+    try:
+        straight_len = float(lap_shape_meta.get('straight_len', float('nan')))
+    except Exception:
+        straight_len = float('nan')
+    if not np.isfinite(start_to_corner_dist):
+        base_start = 280.0 if surface == 'dirt' else 300.0
+        if np.isfinite(dist):
+            if dist <= 1400:
+                base_start = 230.0 if surface == 'dirt' else 260.0
+            elif dist <= 1800:
+                base_start = 360.0
+            elif dist <= 2400:
+                base_start = 440.0
+            else:
+                base_start = 520.0
+        start_to_corner_dist = float(np.clip(base_start + (0.55 - float(profile.get('corner', 0.5) or 0.5)) * 170.0 + (float(profile.get('gate', 0.5) or 0.5) - 0.50) * 70.0, 140.0, 650.0))
+    if not np.isfinite(straight_len):
+        base_straight = 300.0 if surface == 'dirt' else 330.0
+        if np.isfinite(dist):
+            if dist <= 1400:
+                base_straight += 10.0
+            elif dist >= 2400:
+                base_straight += 25.0
+        straight_len = float(np.clip(base_straight + (float(profile.get('straight', 0.5) or 0.5) - 0.50) * 240.0, 220.0, 720.0))
+    start_corner_norm = float(np.clip((start_to_corner_dist - 180.0) / 420.0, 0.0, 1.0)) if np.isfinite(start_to_corner_dist) else 0.5
+    straight_len_norm = float(np.clip((straight_len - 260.0) / 320.0, 0.0, 1.0)) if np.isfinite(straight_len) else 0.5
+    start_short_bias = float(np.clip((0.50 - start_corner_norm) * 2.0, -1.0, 1.0))
+    straight_long_bias = float(np.clip((straight_len_norm - 0.50) * 2.0, -1.0, 1.0))
 
     straight_fit = (0.56 * late_speed + 0.24 * ability + 0.10 * pacefit + 0.10 * comment_trend).clip(lower=0.0, upper=100.0)
     corner_fit = (0.44 * posfit + 0.30 * mapfit + 0.16 * gatefit + 0.10 * pacefit).clip(lower=0.0, upper=100.0)
@@ -14272,6 +14390,9 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     class_pace_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     tokyo1400_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     course_special_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+    course_runup_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+    course_straight_shape_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+    course_shape_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     distance_style_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     distance_draw_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     distance_specific_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
@@ -14281,6 +14402,29 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     pedigree_chef_fit = _num_series(d.get('PedigreeChefRaceFit', 50.0), 50.0, index=d.index)
     pedigree_tokyo1400_fit = _num_series(d.get('PedigreeTokyo1400LapFit', 50.0), 50.0, index=d.index)
     pedigree_fine_fit = _num_series(d.get('PedigreeFineFit', 50.0), 50.0, index=d.index)
+
+    runup_style_bonus = style_col.map(
+        lambda z: (6.0 * start_short_bias if z == 'FRONT' else (1.8 * start_short_bias if z == 'MIDDLE' else -4.8 * start_short_bias))
+    ).astype(float)
+    straight_style_bonus = style_col.map(
+        lambda z: (6.0 * straight_long_bias if z == 'REAR' else (1.8 * straight_long_bias if z == 'MIDDLE' else -4.8 * straight_long_bias))
+    ).astype(float)
+    course_runup_fit = (
+        50.0
+        + (early_speed - 50.0) * (0.28 + max(start_short_bias, 0.0) * 0.30)
+        + (gatefit - 50.0) * (0.20 + max(start_short_bias, 0.0) * 0.20)
+        + (agility_fit - 50.0) * 0.18
+        + (late_speed - 50.0) * max(-start_short_bias, 0.0) * 0.26
+        + runup_style_bonus
+    ).clip(lower=0.0, upper=100.0)
+    course_straight_shape_fit = (
+        50.0
+        + (late_speed - 50.0) * (0.30 + max(straight_long_bias, 0.0) * 0.34)
+        + (straight_fit - 50.0) * 0.24
+        + (early_speed - 50.0) * (0.16 + max(-straight_long_bias, 0.0) * 0.22)
+        + straight_style_bonus
+    ).clip(lower=0.0, upper=100.0)
+    course_shape_fit = (0.52 * course_runup_fit + 0.48 * course_straight_shape_fit).clip(lower=0.0, upper=100.0)
 
     if distance_key:
         if distance_style_bias:
@@ -14432,13 +14576,15 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
             tokyo1400_fit = (tokyo1400_fit + 0.14 * (power_fit - 50.0) + 0.06 * (michfit - 50.0)).clip(lower=0.0, upper=100.0)
 
     course_special_fit = (
-        0.20 * rail_bias_fit
-        + 0.24 * class_pace_fit
-        + 0.24 * distance_specific_fit
+        0.17 * rail_bias_fit
+        + 0.20 * class_pace_fit
+        + 0.18 * distance_specific_fit
         + 0.10 * straight_fit
         + 0.08 * corner_fit
-        + 0.08 * power_fit
-        + 0.06 * gatefit
+        + 0.07 * power_fit
+        + 0.05 * gatefit
+        + 0.08 * course_runup_fit
+        + 0.07 * course_straight_shape_fit
     ).clip(lower=0.0, upper=100.0)
     if surface == 'dirt' and np.isfinite(dist) and dist <= 1400:
         course_special_fit = (course_special_fit + 0.06 * (speed_fit - 50.0) + 0.04 * (early_speed - 50.0)).clip(lower=0.0, upper=100.0)
@@ -14461,6 +14607,7 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     speed_w = 0.08 + 0.08 * float(profile.get('speed', 0.5) or 0.5)
     gate_w = 0.05 + 0.05 * float(profile.get('gate', 0.5) or 0.5)
     agility_w = 0.07 + 0.08 * float(profile.get('agility', 0.5) or 0.5)
+    shape_w = 0.05 + 0.03 * max(abs(start_short_bias), abs(straight_long_bias))
     distance_w = (0.07 + 0.04 * distance_confidence) if distance_key else 0.0
     special_w = (0.06 + 0.04 * max(distance_confidence, 0.45)) if distance_key else 0.06
     pedigree_w = 0.07
@@ -14468,7 +14615,7 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     rail_w = 0.05 if is_tokyo1400 else 0.0
     classpace_w = 0.06 if is_tokyo1400 else 0.0
     tokyo_w = 0.08 if is_tokyo1400 else 0.0
-    total_w = style_w + straight_w + corner_w + stamina_w + power_w + speed_w + gate_w + agility_w + distance_w + special_w + pedigree_w + pedigree_tokyo_w + rail_w + classpace_w + tokyo_w
+    total_w = style_w + straight_w + corner_w + stamina_w + power_w + speed_w + gate_w + agility_w + shape_w + distance_w + special_w + pedigree_w + pedigree_tokyo_w + rail_w + classpace_w + tokyo_w
 
     d['CourseStyleFit'] = _num_series(style_fit, 50.0, index=d.index)
     d['CourseStraightFit'] = _num_series(straight_fit, 50.0, index=d.index)
@@ -14477,6 +14624,11 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     d['CoursePowerFit'] = _num_series(power_fit, 50.0, index=d.index)
     d['CourseSpeedFit'] = _num_series(speed_fit, 50.0, index=d.index)
     d['CourseAgilityFit'] = _num_series(agility_fit, 50.0, index=d.index)
+    d['CourseStartToCornerDist'] = float(start_to_corner_dist) if np.isfinite(start_to_corner_dist) else np.nan
+    d['CourseStraightLen'] = float(straight_len) if np.isfinite(straight_len) else np.nan
+    d['CourseRunupFit'] = _num_series(course_runup_fit, 50.0, index=d.index)
+    d['CourseStraightShapeFit'] = _num_series(course_straight_shape_fit, 50.0, index=d.index)
+    d['CourseShapeFit'] = _num_series(course_shape_fit, 50.0, index=d.index)
     d['CourseDistanceStyleFit'] = _num_series(distance_style_fit, 50.0, index=d.index)
     d['CourseDistanceDrawFit'] = _num_series(distance_draw_fit, 50.0, index=d.index)
     d['CourseDistanceSpecificFit'] = _num_series(distance_specific_fit, 50.0, index=d.index)
@@ -14495,6 +14647,7 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
         + speed_w * d['CourseSpeedFit']
         + gate_w * gatefit
         + agility_w * d['CourseAgilityFit']
+        + shape_w * d['CourseShapeFit']
         + distance_w * d['CourseDistanceSpecificFit']
         + special_w * d['CourseSpecialFit']
         + pedigree_w * d['CoursePedigreeFineFit']
@@ -16051,11 +16204,16 @@ def _csv_neutral_return(
         df['CoursePowerFit'] = 50.0
         df['CourseSpeedFit'] = 50.0
         df['CourseAgilityFit'] = 50.0
+        df['CourseRunupFit'] = 50.0
+        df['CourseStraightShapeFit'] = 50.0
+        df['CourseShapeFit'] = 50.0
         df['CourseSpecialFit'] = 50.0
         df['CourseProfileFit'] = 50.0
         df['CourseBiasDelta'] = 0.0
         df['FrontCollapseRisk'] = 0.0
         df['StartRiskShort'] = 0.0
+        df['PaceTransitionScore'] = 50.0
+        df['PaceReboundSignal'] = 50.0
         df['WinShape'] = 50.0
         df['TimeFit'] = 50.0
         df['Upside'] = 50.0
@@ -17047,6 +17205,9 @@ def _comp_pace_lap_scores(
     conn_recent_num  = _num_series(df, 'ConnectionRecentFormScore', 50.0)
     network_num      = _num_series(df, 'HumanNetworkScore', 50.0)
     breeder_owner_num = _num_series(df, 'BreederOwnerAffinityScore', 50.0)
+    pace_transition_num = _num_series(df, 'PaceTransitionScore', 50.0)
+    pace_rebound_num = _num_series(df, 'PaceReboundSignal', 50.0)
+    course_shape_num = _num_series(df, 'CourseShapeFit', 50.0)
     favorite_num     = _num_series(df, 'FavoriteScore',       50.0)
     anchor_base_num  = _num_series(df, ['AnchorScore', 'SAS'], 50.0)
     win_num          = _num_series(df, 'WinCandidateScore',   50.0)
@@ -17065,6 +17226,9 @@ def _comp_pace_lap_scores(
         + 0.04 * conn_recent_num
         + 0.03 * network_num
         + 0.03 * breeder_owner_num
+        + 0.03 * pace_transition_num
+        + 0.02 * pace_rebound_num
+        + 0.02 * course_shape_num
         + front_bias
         - 0.35 * _num_series(df, 'FrontCollapseRisk', 0.0)
         - 0.24 * pace_gap
@@ -17093,7 +17257,10 @@ def _comp_pace_lap_scores(
         + 0.08 * pace_prof
         + 0.14 * (last3f_fast01 * 100.0)
         + 0.10 * distance_num
-        + 0.08 * recent_num
+        + 0.06 * recent_num
+        + 0.05 * pace_transition_num
+        + 0.04 * pace_rebound_num
+        + 0.04 * course_shape_num
         + good_pos_mask.astype(float) * max(0.0, lap_goodpos_bias) * 0.80
         + (~good_pos_mask).astype(float) * max(0.0, lap_closing_bias) * 0.70
     ).clip(lower=0.0, upper=100.0).astype(float)
@@ -20775,6 +20942,23 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "owner_class_priority": "owner_class_priority",
         "馬主クラス優先度": "owner_class_priority",
         "owner_class_bias": "owner_class_priority",
+        # lap suitability / previous pace / course shape
+        "prev_pci": "prev_pci",
+        "前走PCI": "prev_pci",
+        "前走ＰＣＩ": "prev_pci",
+        "last_pci": "prev_pci",
+        "previous_pci": "prev_pci",
+        "prev_rpci": "prev_rpci",
+        "前走RPCI": "prev_rpci",
+        "前走ＲＰＣＩ": "prev_rpci",
+        "last_rpci": "prev_rpci",
+        "previous_rpci": "prev_rpci",
+        "start_to_corner_dist": "start_to_corner_dist",
+        "最初コーナーまで距離": "start_to_corner_dist",
+        "スタートから最初のコーナーまで": "start_to_corner_dist",
+        "straight_len": "straight_len",
+        "直線長": "straight_len",
+        "ホームストレッチ長": "straight_len",
         # market / expected-value (optional)
         "単勝オッズ": "win_odds",
         "単勝": "win_odds",
