@@ -16790,7 +16790,7 @@ def _shrink_score_by_sample(score: pd.Series, sample_n, *, neutral: float = 50.0
 
 
 def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = None) -> pd.DataFrame:
-    """騎手・厩舎・コンビの集約特徴量を追加し、生のID依存よりも安定した数値特徴へ変換する。"""
+    """騎手・厩舎・コンビ・馬主/生産者の集約特徴量を追加し、生のID依存よりも安定した数値特徴へ変換する。"""
     if df is None or len(df) == 0:
         return df
     out = df.copy()
@@ -16810,11 +16810,13 @@ def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = No
     ]), idx)
     combo_rate = _normalize_rate_score(_first_existing_series(out, [
         'jockey_trainer_combo_place_rate', 'jockey_trainer_combo_win_rate',
-        'コンビ複勝率', 'コンビ勝率', '騎手厩舎コンビ複勝率', '騎手厩舎コンビ勝率'
+        'trainer_jockey_place_rate', 'trainer_jockey_win_rate',
+        'コンビ複勝率', 'コンビ勝率', '騎手厩舎コンビ複勝率', '騎手厩舎コンビ勝率',
+        '調教師騎手複勝率', '調教師騎手勝率'
     ]), idx)
     combo_roi = _normalize_roi_score(_first_existing_series(out, [
-        'jockey_trainer_combo_roi', 'combo_roi', 'コンビROI', 'コンビ回収率',
-        '騎手厩舎コンビROI', '騎手調教師コンビROI'
+        'jockey_trainer_combo_roi', 'trainer_jockey_roi', 'combo_roi', 'コンビROI', 'コンビ回収率',
+        '騎手厩舎コンビROI', '騎手調教師コンビROI', '調教師騎手ROI'
     ]), idx)
 
     jockey_recent = _normalize_rate_score(_first_existing_series(out, [
@@ -16824,35 +16826,67 @@ def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = No
         'trainer_recent_form', '厩舎直近調子', '調教師直近調子', '厩舎近況', '厩舎近10走複勝率'
     ]), idx)
     combo_recent = _normalize_rate_score(_first_existing_series(out, [
-        'jockey_trainer_combo_recent_form', 'コンビ直近調子', '騎手厩舎コンビ直近調子', 'コンビ近況'
+        'jockey_trainer_combo_recent_form', 'trainer_jockey_recent_form', 'コンビ直近調子', '騎手厩舎コンビ直近調子', 'コンビ近況', '調教師騎手直近調子'
     ]), idx)
 
     jockey_n = _first_existing_series(out, ['jockey_sample_n', '騎手出走数', 'jockey_runs'], default=0.0)
     trainer_n = _first_existing_series(out, ['trainer_sample_n', '厩舎出走数', '調教師出走数', 'trainer_runs'], default=0.0)
-    combo_n = _first_existing_series(out, ['jockey_trainer_combo_sample_n', 'コンビ出走数', '騎手厩舎コンビ出走数', 'combo_runs'], default=0.0)
+    combo_n = _first_existing_series(out, ['trainer_jockey_sample_n', 'jockey_trainer_combo_sample_n', 'コンビ出走数', '騎手厩舎コンビ出走数', 'combo_runs', '調教師騎手出走数'], default=0.0)
+
+    stable_jockey_raw = _first_existing_series(out, ['is_stable_jockey', '主戦騎手', '厩舎主戦騎手', 'stable_jockey_flag'], default=np.nan)
+    stable_jockey_score = _num_series(stable_jockey_raw, np.nan, index=idx)
+    stable_jockey_score = stable_jockey_score.where(np.isfinite(stable_jockey_score), _normalize_rate_score(stable_jockey_raw, idx))
+    stable_jockey_score = stable_jockey_score.apply(lambda x: 70.0 if np.isfinite(x) and float(x) >= 0.5 else (35.0 if np.isfinite(x) else np.nan))
+    stable_jockey_score = stable_jockey_score.fillna(50.0).clip(lower=0.0, upper=100.0).astype(float)
+
+    breeder_owner_affinity = _normalize_roi_score(_first_existing_series(out, [
+        'breeder_owner_affinity', '生産者馬主相性', '生産者馬主期待値'
+    ]), idx)
+    owner_class_priority = _normalize_rate_score(_first_existing_series(out, [
+        'owner_class_priority', '馬主クラス優先度', 'owner_class_bias'
+    ]), idx)
 
     out['JockeyRecentFormScore'] = _shrink_score_by_sample(jockey_recent, jockey_n, max_n=36.0)
     out['TrainerRecentFormScore'] = _shrink_score_by_sample(trainer_recent, trainer_n, max_n=36.0)
     out['JockeyTrainerComboROIScore'] = _shrink_score_by_sample(0.50 * combo_rate + 0.50 * combo_roi, combo_n, max_n=24.0)
     out['JockeyTrainerComboFormScore'] = _shrink_score_by_sample(combo_recent, combo_n, max_n=24.0)
+    out['TrainerJockeyWinRateScore'] = _shrink_score_by_sample(combo_rate, combo_n, max_n=24.0)
+    out['StableJockeyScore'] = stable_jockey_score
+    out['BreederOwnerAffinityScore'] = breeder_owner_affinity.astype(float)
+    out['OwnerClassPriorityScore'] = owner_class_priority.astype(float)
     out['JockeyConnectionScore'] = _shrink_score_by_sample(0.60 * jockey_rate + 0.25 * jockey_roi + 0.15 * jockey_recent, jockey_n, max_n=36.0)
     out['TrainerConnectionScore'] = _shrink_score_by_sample(0.60 * trainer_rate + 0.25 * trainer_roi + 0.15 * trainer_recent, trainer_n, max_n=36.0)
     out['ConnectionRecentFormScore'] = (
-        0.34 * out['JockeyRecentFormScore']
-        + 0.28 * out['TrainerRecentFormScore']
-        + 0.38 * out['JockeyTrainerComboFormScore']
+        0.28 * out['JockeyRecentFormScore']
+        + 0.22 * out['TrainerRecentFormScore']
+        + 0.30 * out['JockeyTrainerComboFormScore']
+        + 0.20 * out['StableJockeyScore']
     ).clip(lower=0.0, upper=100.0).astype(float)
 
     jockey_rel = (_num_series(jockey_n, 0.0, index=idx, lower=0.0).clip(0.0, 36.0) / 36.0)
     trainer_rel = (_num_series(trainer_n, 0.0, index=idx, lower=0.0).clip(0.0, 36.0) / 36.0)
     combo_rel = (_num_series(combo_n, 0.0, index=idx, lower=0.0).clip(0.0, 24.0) / 24.0)
-    out['HumanConnectionReliability'] = (100.0 * (jockey_rel + trainer_rel + combo_rel) / 3.0).clip(lower=0.0, upper=100.0).astype(float)
+    breeder_owner_rel = (_first_existing_series(out, ['breeder_owner_affinity', '生産者馬主相性', '生産者馬主期待値'], default=np.nan).notna()).astype(float)
+    owner_class_rel = (_first_existing_series(out, ['owner_class_priority', '馬主クラス優先度', 'owner_class_bias'], default=np.nan).notna()).astype(float)
+    stable_rel = (_first_existing_series(out, ['is_stable_jockey', '主戦騎手', '厩舎主戦騎手', 'stable_jockey_flag'], default=np.nan).notna()).astype(float)
+    out['HumanConnectionReliability'] = (
+        100.0 * (jockey_rel + trainer_rel + combo_rel + breeder_owner_rel + owner_class_rel + stable_rel) / 6.0
+    ).clip(lower=0.0, upper=100.0).astype(float)
+
+    out['HumanNetworkScore'] = (
+        0.34 * out['JockeyTrainerComboROIScore']
+        + 0.20 * out['TrainerJockeyWinRateScore']
+        + 0.16 * out['StableJockeyScore']
+        + 0.16 * out['BreederOwnerAffinityScore']
+        + 0.14 * out['OwnerClassPriorityScore']
+    ).clip(lower=0.0, upper=100.0).astype(float)
 
     out['HumanConnectionScore'] = (
-        0.33 * out['JockeyConnectionScore']
-        + 0.27 * out['TrainerConnectionScore']
-        + 0.24 * out['JockeyTrainerComboROIScore']
-        + 0.16 * out['ConnectionRecentFormScore']
+        0.24 * out['JockeyConnectionScore']
+        + 0.20 * out['TrainerConnectionScore']
+        + 0.18 * out['JockeyTrainerComboROIScore']
+        + 0.12 * out['ConnectionRecentFormScore']
+        + 0.26 * out['HumanNetworkScore']
     ).clip(lower=0.0, upper=100.0).astype(float)
     return out
 
@@ -16902,6 +16936,8 @@ def _comp_position_accel(
     conn_num = _num_series(df, 'HumanConnectionScore', 50.0)
     conn_recent_num = _num_series(df, 'ConnectionRecentFormScore', 50.0)
     combo_roi_num = _num_series(df, 'JockeyTrainerComboROIScore', 50.0)
+    network_num = _num_series(df, 'HumanNetworkScore', 50.0)
+    stable_jockey_num = _num_series(df, 'StableJockeyScore', 50.0)
     df['GoodPositionScore'] = (
         0.38 * posfit
         + 0.18 * gatefit
@@ -16949,11 +16985,13 @@ def _comp_position_accel(
         jockey_rank_score = pd.Series([50.0] * len(df), index=df.index, dtype=float)
 
     df['JockeyDistanceEvidenceScore'] = (
-        0.36 * jockey_rank_score
-        + 0.34 * dist_rank_score
-        + 0.18 * conn_num
-        + 0.07 * combo_roi_num
+        0.34 * jockey_rank_score
+        + 0.30 * dist_rank_score
+        + 0.16 * conn_num
+        + 0.08 * combo_roi_num
         + 0.05 * conn_recent_num
+        + 0.04 * network_num
+        + 0.03 * stable_jockey_num
     ).clip(lower=0.0, upper=100.0).astype(float)
 
     return df
@@ -17007,6 +17045,8 @@ def _comp_pace_lap_scores(
     training_num     = _num_series(df, 'TrainingScore',       50.0)
     conn_num         = _num_series(df, 'HumanConnectionScore', 50.0)
     conn_recent_num  = _num_series(df, 'ConnectionRecentFormScore', 50.0)
+    network_num      = _num_series(df, 'HumanNetworkScore', 50.0)
+    breeder_owner_num = _num_series(df, 'BreederOwnerAffinityScore', 50.0)
     favorite_num     = _num_series(df, 'FavoriteScore',       50.0)
     anchor_base_num  = _num_series(df, ['AnchorScore', 'SAS'], 50.0)
     win_num          = _num_series(df, 'WinCandidateScore',   50.0)
@@ -17021,8 +17061,10 @@ def _comp_pace_lap_scores(
         + 0.08 * stability
         + 0.10 * df['PositionReAccelScore']
         + 0.05 * (last3f_fast01 * 100.0)
-        + 0.06 * conn_num
-        + 0.05 * conn_recent_num
+        + 0.04 * conn_num
+        + 0.04 * conn_recent_num
+        + 0.03 * network_num
+        + 0.03 * breeder_owner_num
         + front_bias
         - 0.35 * _num_series(df, 'FrontCollapseRisk', 0.0)
         - 0.24 * pace_gap
@@ -17121,21 +17163,27 @@ def _comp_axis_final(
     recent_num        = _num_series(df, 'RecentFormScore',    50.0)
     conn_num          = _num_series(df, 'HumanConnectionScore', 50.0)
     conn_recent_num   = _num_series(df, 'ConnectionRecentFormScore', 50.0)
+    network_num       = _num_series(df, 'HumanNetworkScore', 50.0)
+    owner_class_num   = _num_series(df, 'OwnerClassPriorityScore', 50.0)
+    breeder_owner_num = _num_series(df, 'BreederOwnerAffinityScore', 50.0)
     pace_mode         = str((meta or {}).get('pace_eval_mode', '') or '')
     course_fit_delta = _num_series(df, 'CourseProfileFit', 50.0) - 50.0
     course_straight_delta = _num_series(df, 'CourseStraightFit', 50.0) - 50.0
     course_corner_delta = _num_series(df, 'CourseCornerFit', 50.0) - 50.0
     course_stamina_delta = _num_series(df, 'CourseStaminaFit', 50.0) - 50.0
     df['AxisReadinessScore'] = (
-        0.26 * _num_series(df, 'PlaceAxisScore', 50.0)
+        0.24 * _num_series(df, 'PlaceAxisScore', 50.0)
         + 0.18 * df['PaceScenarioAdvantage']
         + 0.18 * df['PositionReAccelScore']
         + 0.12 * posfit
         + 0.10 * stability
         + 0.08 * gatefit
         + 0.08 * df['JockeyDistanceEvidenceScore']
-        + 0.06 * conn_num
-        + 0.04 * conn_recent_num
+        + 0.05 * conn_num
+        + 0.03 * conn_recent_num
+        + 0.05 * network_num
+        + 0.03 * owner_class_num
+        + 0.02 * breeder_owner_num
         + 0.10 * course_fit_delta
         + 0.05 * course_corner_delta
         - 0.70 * _num_series(df, 'DevelopmentWaitRisk', 0.0)
@@ -20696,6 +20744,37 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "騎手厩舎コンビ直近調子": "jockey_trainer_combo_recent_form",
         "コンビ出走数": "jockey_trainer_combo_sample_n",
         "騎手厩舎コンビ出走数": "jockey_trainer_combo_sample_n",
+        # human network / pair affinity
+        "trainer_jockey_win_rate": "trainer_jockey_win_rate",
+        "trainer_jockey_place_rate": "trainer_jockey_place_rate",
+        "trainer_jockey_roi": "trainer_jockey_roi",
+        "trainer_jockey_sample_n": "trainer_jockey_sample_n",
+        "trainer_jockey_recent_form": "trainer_jockey_recent_form",
+        "調教師騎手勝率": "trainer_jockey_win_rate",
+        "調教師騎手複勝率": "trainer_jockey_place_rate",
+        "調教師騎手ROI": "trainer_jockey_roi",
+        "調教師騎手出走数": "trainer_jockey_sample_n",
+        "調教師騎手直近調子": "trainer_jockey_recent_form",
+        "is_stable_jockey": "is_stable_jockey",
+        "主戦騎手": "is_stable_jockey",
+        "厩舎主戦騎手": "is_stable_jockey",
+        "stable_jockey_flag": "is_stable_jockey",
+        "owner_id": "owner_id",
+        "馬主ID": "owner_id",
+        "owner_name": "owner_name",
+        "馬主": "owner_name",
+        "馬主名": "owner_name",
+        "breeder_id": "breeder_id",
+        "生産者ID": "breeder_id",
+        "breeder_name": "breeder_name",
+        "生産者": "breeder_name",
+        "生産牧場": "breeder_name",
+        "breeder_owner_affinity": "breeder_owner_affinity",
+        "生産者馬主相性": "breeder_owner_affinity",
+        "生産者馬主期待値": "breeder_owner_affinity",
+        "owner_class_priority": "owner_class_priority",
+        "馬主クラス優先度": "owner_class_priority",
+        "owner_class_bias": "owner_class_priority",
         # market / expected-value (optional)
         "単勝オッズ": "win_odds",
         "単勝": "win_odds",
