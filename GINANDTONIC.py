@@ -444,6 +444,7 @@ DEFAULT_PARAMS = {
         'course_profile_place_weight': 0.18,
         'pace_class_place_weight': 0.10,
         'rail_bias_place_weight': 0.06,
+        'distance_specific_place_weight': 0.10,
         'tokyo1400_place_weight': 0.08,
     },
 
@@ -11288,6 +11289,183 @@ STYLE_FAMILY_TRIO_PRIORS = {
 }
 
 
+def _course_patch(*, style: Optional[Dict[str, float]] = None, straight: float = 0.0, corner: float = 0.0,
+                  stamina: float = 0.0, power: float = 0.0, speed: float = 0.0, gate: float = 0.0,
+                  agility: float = 0.0, draw: Optional[Dict[str, float]] = None, label: str = '') -> Dict[str, object]:
+    """距離別コース補正パッチを簡潔に組み立てる。"""
+    patch: Dict[str, object] = {}
+    if style:
+        patch['style_bias'] = {str(k): float(v) for k, v in dict(style).items()}
+    for key, value in {
+        'straight': straight, 'corner': corner, 'stamina': stamina, 'power': power,
+        'speed': speed, 'gate': gate, 'agility': agility,
+    }.items():
+        try:
+            fv = float(value)
+            if abs(fv) > 1e-9:
+                patch[key] = fv
+        except Exception:
+            pass
+    if draw:
+        dd = {str(k): float(v) for k, v in dict(draw).items() if abs(float(v)) > 1e-9}
+        if dd:
+            patch['draw_bias'] = dd
+    if label:
+        patch['label'] = str(label)
+    return patch
+
+
+JRA_COURSE_DISTANCE_PROFILE_DATA = {
+    '東京': {
+        'turf': {
+            1600: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.04, 'REAR': 0.10}, straight=0.08, stamina=0.04, speed=0.02, draw={'outer': 0.02}, label='東京芝1600m'),
+            1800: _course_patch(style={'FRONT': -0.05, 'MIDDLE': 0.03, 'REAR': 0.10}, straight=0.08, stamina=0.06, power=0.02, label='東京芝1800m'),
+            2000: _course_patch(style={'FRONT': -0.06, 'MIDDLE': 0.04, 'REAR': 0.08}, straight=0.08, stamina=0.08, power=0.04, label='東京芝2000m'),
+            2400: _course_patch(style={'FRONT': -0.08, 'MIDDLE': 0.04, 'REAR': 0.10}, straight=0.08, stamina=0.10, power=0.06, label='東京芝2400m'),
+            3400: _course_patch(style={'FRONT': -0.10, 'MIDDLE': 0.06, 'REAR': 0.10}, straight=0.06, stamina=0.14, power=0.06, label='東京芝3400m'),
+        },
+        'dirt': {
+            1300: _course_patch(style={'FRONT': 0.10, 'MIDDLE': 0.04, 'REAR': -0.08}, speed=0.10, gate=0.06, agility=0.02, label='東京ダ1300m'),
+            1400: _course_patch(style={'FRONT': 0.08, 'MIDDLE': 0.04, 'REAR': -0.06}, speed=0.08, gate=0.06, power=0.02, label='東京ダ1400m'),
+            1600: _course_patch(style={'FRONT': 0.04, 'MIDDLE': 0.06, 'REAR': -0.02}, speed=0.08, gate=0.08, agility=0.04, draw={'outer': 0.04}, label='東京ダ1600m'),
+            2100: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.06, 'REAR': 0.06}, corner=0.04, stamina=0.12, power=0.10, label='東京ダ2100m'),
+        },
+    },
+    '中山': {
+        'turf': {
+            1200: _course_patch(style={'FRONT': 0.12, 'MIDDLE': 0.05, 'REAR': -0.10}, corner=0.08, speed=0.08, gate=0.06, agility=0.08, label='中山芝1200m'),
+            1600: _course_patch(style={'FRONT': -0.02, 'MIDDLE': 0.08, 'REAR': 0.02}, corner=0.10, stamina=0.06, gate=0.04, agility=0.10, label='中山芝1600m'),
+            1800: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.06, 'REAR': 0.04}, corner=0.08, stamina=0.10, power=0.04, agility=0.08, label='中山芝1800m'),
+            2000: _course_patch(style={'FRONT': -0.05, 'MIDDLE': 0.06, 'REAR': 0.04}, corner=0.08, stamina=0.12, power=0.06, agility=0.06, label='中山芝2000m'),
+            2500: _course_patch(style={'FRONT': -0.06, 'MIDDLE': 0.08, 'REAR': 0.04}, corner=0.06, stamina=0.14, power=0.08, label='中山芝2500m'),
+            3600: _course_patch(style={'FRONT': -0.08, 'MIDDLE': 0.08, 'REAR': 0.06}, corner=0.06, stamina=0.16, power=0.08, label='中山芝3600m'),
+        },
+        'dirt': {
+            1200: _course_patch(style={'FRONT': 0.14, 'MIDDLE': 0.04, 'REAR': -0.12}, corner=0.06, speed=0.10, gate=0.08, power=0.04, label='中山ダ1200m'),
+            1800: _course_patch(style={'FRONT': 0.06, 'MIDDLE': 0.08, 'REAR': -0.04}, corner=0.08, stamina=0.08, power=0.08, agility=0.04, label='中山ダ1800m'),
+            2400: _course_patch(style={'FRONT': -0.02, 'MIDDLE': 0.08, 'REAR': 0.04}, corner=0.06, stamina=0.14, power=0.10, label='中山ダ2400m'),
+        },
+    },
+    '阪神': {
+        'turf': {
+            1200: _course_patch(style={'FRONT': 0.08, 'MIDDLE': 0.04, 'REAR': -0.04}, corner=0.06, speed=0.08, gate=0.04, agility=0.04, label='阪神芝1200m'),
+            1400: _course_patch(style={'FRONT': 0.04, 'MIDDLE': 0.04, 'REAR': 0.02}, corner=0.06, straight=0.04, speed=0.06, agility=0.04, label='阪神芝1400m'),
+            1600: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.04, 'REAR': 0.08}, straight=0.08, stamina=0.04, power=0.04, label='阪神芝1600m'),
+            1800: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.04, 'REAR': 0.08}, straight=0.08, stamina=0.06, power=0.06, label='阪神芝1800m'),
+            2000: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.06, 'REAR': 0.06}, straight=0.06, stamina=0.10, power=0.08, label='阪神芝2000m'),
+            2200: _course_patch(style={'FRONT': -0.06, 'MIDDLE': 0.06, 'REAR': 0.08}, straight=0.06, stamina=0.12, power=0.08, label='阪神芝2200m'),
+            2400: _course_patch(style={'FRONT': -0.08, 'MIDDLE': 0.04, 'REAR': 0.10}, straight=0.08, stamina=0.12, power=0.08, label='阪神芝2400m'),
+            3000: _course_patch(style={'FRONT': -0.10, 'MIDDLE': 0.06, 'REAR': 0.10}, straight=0.06, stamina=0.16, power=0.10, label='阪神芝3000m'),
+        },
+        'dirt': {
+            1200: _course_patch(style={'FRONT': 0.10, 'MIDDLE': 0.04, 'REAR': -0.08}, speed=0.08, power=0.06, gate=0.04, label='阪神ダ1200m'),
+            1400: _course_patch(style={'FRONT': 0.08, 'MIDDLE': 0.04, 'REAR': -0.06}, speed=0.08, power=0.08, gate=0.04, label='阪神ダ1400m'),
+            1800: _course_patch(style={'FRONT': 0.02, 'MIDDLE': 0.08, 'REAR': 0.00}, corner=0.04, stamina=0.08, power=0.10, agility=0.04, label='阪神ダ1800m'),
+            2000: _course_patch(style={'FRONT': -0.02, 'MIDDLE': 0.08, 'REAR': 0.04}, corner=0.04, stamina=0.12, power=0.10, label='阪神ダ2000m'),
+        },
+    },
+    '中京': {
+        'turf': {
+            1200: _course_patch(style={'FRONT': 0.00, 'MIDDLE': 0.04, 'REAR': 0.06}, straight=0.04, power=0.06, speed=0.06, label='中京芝1200m'),
+            1400: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.04, 'REAR': 0.08}, straight=0.08, stamina=0.04, power=0.08, label='中京芝1400m'),
+            1600: _course_patch(style={'FRONT': -0.06, 'MIDDLE': 0.04, 'REAR': 0.10}, straight=0.08, stamina=0.06, power=0.08, label='中京芝1600m'),
+            2000: _course_patch(style={'FRONT': -0.06, 'MIDDLE': 0.06, 'REAR': 0.08}, straight=0.06, stamina=0.12, power=0.10, label='中京芝2000m'),
+            2200: _course_patch(style={'FRONT': -0.08, 'MIDDLE': 0.06, 'REAR': 0.10}, straight=0.06, stamina=0.14, power=0.10, label='中京芝2200m'),
+        },
+        'dirt': {
+            1200: _course_patch(style={'FRONT': 0.10, 'MIDDLE': 0.04, 'REAR': -0.08}, speed=0.08, power=0.06, gate=0.04, label='中京ダ1200m'),
+            1400: _course_patch(style={'FRONT': 0.04, 'MIDDLE': 0.08, 'REAR': 0.00}, straight=0.04, speed=0.06, power=0.08, label='中京ダ1400m'),
+            1800: _course_patch(style={'FRONT': 0.00, 'MIDDLE': 0.08, 'REAR': 0.04}, stamina=0.08, power=0.10, agility=0.04, label='中京ダ1800m'),
+            1900: _course_patch(style={'FRONT': -0.02, 'MIDDLE': 0.08, 'REAR': 0.06}, stamina=0.12, power=0.10, label='中京ダ1900m'),
+        },
+    },
+    '京都': {
+        'turf': {
+            1200: _course_patch(style={'FRONT': 0.12, 'MIDDLE': 0.04, 'REAR': -0.08}, corner=0.06, speed=0.10, gate=0.06, agility=0.08, label='京都芝1200m'),
+            1400: _course_patch(style={'FRONT': 0.08, 'MIDDLE': 0.04, 'REAR': -0.02}, corner=0.08, speed=0.08, agility=0.08, label='京都芝1400m'),
+            1600: _course_patch(style={'FRONT': -0.02, 'MIDDLE': 0.04, 'REAR': 0.06}, straight=0.06, speed=0.06, agility=0.08, label='京都芝1600m'),
+            1800: _course_patch(style={'FRONT': -0.02, 'MIDDLE': 0.04, 'REAR': 0.06}, straight=0.06, speed=0.04, agility=0.08, label='京都芝1800m'),
+            2000: _course_patch(style={'FRONT': 0.04, 'MIDDLE': 0.06, 'REAR': 0.00}, corner=0.06, stamina=0.06, agility=0.06, label='京都芝2000m'),
+            2200: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.06, 'REAR': 0.08}, straight=0.06, stamina=0.10, power=0.04, label='京都芝2200m'),
+            2400: _course_patch(style={'FRONT': -0.06, 'MIDDLE': 0.04, 'REAR': 0.10}, straight=0.08, stamina=0.12, power=0.04, label='京都芝2400m'),
+            3200: _course_patch(style={'FRONT': -0.08, 'MIDDLE': 0.06, 'REAR': 0.10}, straight=0.06, stamina=0.16, power=0.06, label='京都芝3200m'),
+        },
+        'dirt': {
+            1200: _course_patch(style={'FRONT': 0.12, 'MIDDLE': 0.04, 'REAR': -0.10}, speed=0.10, gate=0.06, label='京都ダ1200m'),
+            1400: _course_patch(style={'FRONT': 0.08, 'MIDDLE': 0.04, 'REAR': -0.06}, speed=0.08, agility=0.06, gate=0.04, label='京都ダ1400m'),
+            1800: _course_patch(style={'FRONT': 0.06, 'MIDDLE': 0.06, 'REAR': -0.02}, speed=0.06, agility=0.06, gate=0.04, label='京都ダ1800m'),
+            1900: _course_patch(style={'FRONT': 0.00, 'MIDDLE': 0.08, 'REAR': 0.02}, stamina=0.06, speed=0.04, agility=0.06, label='京都ダ1900m'),
+        },
+    },
+    '新潟': {
+        'turf': {
+            1000: _course_patch(style={'FRONT': 0.10, 'MIDDLE': 0.06, 'REAR': -0.08}, straight=0.04, speed=0.12, gate=0.04, draw={'outer': 0.08}, label='新潟芝1000m'),
+            1200: _course_patch(style={'FRONT': 0.04, 'MIDDLE': 0.04, 'REAR': 0.02}, straight=0.06, speed=0.08, gate=0.04, label='新潟芝1200m'),
+            1400: _course_patch(style={'FRONT': -0.02, 'MIDDLE': 0.04, 'REAR': 0.08}, straight=0.10, speed=0.08, draw={'outer': 0.03}, label='新潟芝1400m'),
+            1600: _course_patch(style={'FRONT': -0.06, 'MIDDLE': 0.02, 'REAR': 0.12}, straight=0.12, stamina=0.04, label='新潟芝1600m'),
+            1800: _course_patch(style={'FRONT': -0.06, 'MIDDLE': 0.02, 'REAR': 0.12}, straight=0.12, stamina=0.06, label='新潟芝1800m'),
+            2000: _course_patch(style={'FRONT': -0.08, 'MIDDLE': 0.02, 'REAR': 0.12}, straight=0.12, stamina=0.08, label='新潟芝2000m'),
+            2200: _course_patch(style={'FRONT': -0.08, 'MIDDLE': 0.04, 'REAR': 0.12}, straight=0.10, stamina=0.12, label='新潟芝2200m'),
+            2400: _course_patch(style={'FRONT': -0.08, 'MIDDLE': 0.04, 'REAR': 0.12}, straight=0.10, stamina=0.14, label='新潟芝2400m'),
+        },
+        'dirt': {
+            1200: _course_patch(style={'FRONT': 0.12, 'MIDDLE': 0.04, 'REAR': -0.10}, speed=0.10, gate=0.06, label='新潟ダ1200m'),
+            1800: _course_patch(style={'FRONT': 0.06, 'MIDDLE': 0.08, 'REAR': -0.02}, straight=0.04, speed=0.06, stamina=0.06, label='新潟ダ1800m'),
+        },
+    },
+    '福島': {
+        'turf': {
+            1200: _course_patch(style={'FRONT': 0.08, 'MIDDLE': 0.06, 'REAR': -0.04}, corner=0.08, speed=0.08, agility=0.08, label='福島芝1200m'),
+            1800: _course_patch(style={'FRONT': 0.02, 'MIDDLE': 0.08, 'REAR': 0.00}, corner=0.10, speed=0.04, agility=0.10, label='福島芝1800m'),
+            2000: _course_patch(style={'FRONT': 0.00, 'MIDDLE': 0.08, 'REAR': 0.02}, corner=0.08, stamina=0.08, agility=0.08, label='福島芝2000m'),
+            2600: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.08, 'REAR': 0.06}, corner=0.06, stamina=0.14, power=0.06, label='福島芝2600m'),
+        },
+        'dirt': {
+            1150: _course_patch(style={'FRONT': 0.14, 'MIDDLE': 0.04, 'REAR': -0.12}, corner=0.04, speed=0.10, gate=0.06, label='福島ダ1150m'),
+            1700: _course_patch(style={'FRONT': 0.08, 'MIDDLE': 0.06, 'REAR': -0.04}, corner=0.08, speed=0.06, agility=0.06, label='福島ダ1700m'),
+        },
+    },
+    '札幌': {
+        'turf': {
+            1200: _course_patch(style={'FRONT': 0.08, 'MIDDLE': 0.08, 'REAR': -0.06}, corner=0.08, power=0.08, speed=0.08, agility=0.08, label='札幌芝1200m'),
+            1500: _course_patch(style={'FRONT': 0.04, 'MIDDLE': 0.10, 'REAR': -0.04}, corner=0.10, power=0.08, agility=0.10, label='札幌芝1500m'),
+            1800: _course_patch(style={'FRONT': 0.02, 'MIDDLE': 0.10, 'REAR': -0.02}, corner=0.10, stamina=0.06, power=0.08, agility=0.10, label='札幌芝1800m'),
+            2000: _course_patch(style={'FRONT': 0.00, 'MIDDLE': 0.10, 'REAR': 0.00}, corner=0.08, stamina=0.08, power=0.10, agility=0.08, label='札幌芝2000m'),
+            2600: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.10, 'REAR': 0.04}, corner=0.06, stamina=0.14, power=0.12, label='札幌芝2600m'),
+        },
+        'dirt': {
+            1000: _course_patch(style={'FRONT': 0.14, 'MIDDLE': 0.04, 'REAR': -0.12}, speed=0.10, gate=0.08, label='札幌ダ1000m'),
+            1700: _course_patch(style={'FRONT': 0.08, 'MIDDLE': 0.08, 'REAR': -0.04}, corner=0.08, power=0.08, agility=0.06, label='札幌ダ1700m'),
+        },
+    },
+    '函館': {
+        'turf': {
+            1000: _course_patch(style={'FRONT': 0.14, 'MIDDLE': 0.04, 'REAR': -0.12}, speed=0.10, gate=0.08, power=0.08, label='函館芝1000m'),
+            1200: _course_patch(style={'FRONT': 0.12, 'MIDDLE': 0.06, 'REAR': -0.10}, corner=0.06, speed=0.08, power=0.10, agility=0.06, label='函館芝1200m'),
+            1800: _course_patch(style={'FRONT': 0.04, 'MIDDLE': 0.08, 'REAR': -0.02}, corner=0.10, power=0.12, agility=0.10, label='函館芝1800m'),
+            2000: _course_patch(style={'FRONT': 0.02, 'MIDDLE': 0.08, 'REAR': 0.00}, corner=0.08, stamina=0.08, power=0.12, label='函館芝2000m'),
+            2600: _course_patch(style={'FRONT': -0.02, 'MIDDLE': 0.10, 'REAR': 0.02}, corner=0.06, stamina=0.14, power=0.14, label='函館芝2600m'),
+        },
+        'dirt': {
+            1000: _course_patch(style={'FRONT': 0.14, 'MIDDLE': 0.04, 'REAR': -0.12}, speed=0.10, gate=0.08, power=0.08, label='函館ダ1000m'),
+            1700: _course_patch(style={'FRONT': 0.08, 'MIDDLE': 0.08, 'REAR': -0.04}, corner=0.08, power=0.10, agility=0.06, label='函館ダ1700m'),
+        },
+    },
+    '小倉': {
+        'turf': {
+            1200: _course_patch(style={'FRONT': 0.12, 'MIDDLE': 0.06, 'REAR': -0.10}, corner=0.08, speed=0.10, gate=0.06, agility=0.06, label='小倉芝1200m'),
+            1800: _course_patch(style={'FRONT': 0.04, 'MIDDLE': 0.08, 'REAR': -0.02}, corner=0.10, speed=0.06, agility=0.10, label='小倉芝1800m'),
+            2000: _course_patch(style={'FRONT': 0.02, 'MIDDLE': 0.08, 'REAR': 0.00}, corner=0.08, stamina=0.08, agility=0.08, label='小倉芝2000m'),
+            2600: _course_patch(style={'FRONT': -0.02, 'MIDDLE': 0.10, 'REAR': 0.04}, corner=0.08, stamina=0.14, power=0.06, agility=0.08, label='小倉芝2600m'),
+        },
+        'dirt': {
+            1000: _course_patch(style={'FRONT': 0.14, 'MIDDLE': 0.04, 'REAR': -0.12}, speed=0.10, gate=0.08, label='小倉ダ1000m'),
+            1700: _course_patch(style={'FRONT': 0.08, 'MIDDLE': 0.08, 'REAR': -0.04}, corner=0.08, speed=0.06, agility=0.08, label='小倉ダ1700m'),
+        },
+    },
+}
+
+
 def _normalize_racecourse_name(name: Optional[str]) -> str:
     """競馬場名をJRA10場の標準名へ正規化する。"""
     s = str(name or '').strip().replace('競馬場', '')
@@ -11329,6 +11507,56 @@ def _course_style_adjust(profile: Dict[str, object], label: str, delta: float) -
         profile['style_bias'] = sb
     except Exception:
         pass
+
+
+
+def _resolve_course_distance_patch(venue: str, surface: str, dist: float) -> tuple[str, dict]:
+    """競馬場・馬場・距離から最も近い距離別コース補正パッチを返す。"""
+    if (not venue) or (not surface) or (not np.isfinite(dist)):
+        return '', {}
+    raw = (((JRA_COURSE_DISTANCE_PROFILE_DATA.get(venue, {}) or {}).get(surface, {}) or {}))
+    if not raw:
+        return '', {}
+    keys: list[int] = []
+    for k in raw.keys():
+        try:
+            keys.append(int(float(k)))
+        except Exception:
+            pass
+    if not keys:
+        return '', {}
+    nearest = min(keys, key=lambda x: abs(float(x) - float(dist)))
+    tolerance = 220.0 if surface == 'turf' else 180.0
+    if abs(float(nearest) - float(dist)) > tolerance:
+        return '', {}
+    patch = dict(raw.get(nearest, raw.get(str(nearest), {})) or {})
+    return str(int(nearest)), patch
+
+
+
+def _course_profile_apply_patch(profile: Dict[str, object], patch: Dict[str, object]) -> None:
+    """距離別の補正パッチを既存コースプロファイルへ重ねる。"""
+    patch = dict(patch or {})
+    if not patch:
+        return
+    if 'style_bias' in patch:
+        sb = dict(profile.get('style_bias', {}) or {})
+        for k, v in dict(patch.get('style_bias', {}) or {}).items():
+            try:
+                sb[str(k)] = clamp(float(sb.get(k, 0.0) or 0.0) + float(v), -1.0, 1.0)
+            except Exception:
+                continue
+        profile['style_bias'] = sb
+    if 'draw_bias' in patch:
+        profile['draw_bias'] = dict(patch.get('draw_bias', {}) or {})
+    if patch.get('label'):
+        profile['distance_label'] = str(patch.get('label', '') or '')
+    for key in ['straight', 'corner', 'stamina', 'power', 'speed', 'gate', 'agility']:
+        if key in patch:
+            try:
+                _course_profile_adjust(profile, key, float(patch.get(key, 0.0) or 0.0))
+            except Exception:
+                pass
 
 
 
@@ -11460,6 +11688,17 @@ def _resolve_course_profile(meta: Dict[str, str]) -> tuple[str, str, dict]:
         _course_profile_adjust(profile, 'corner', 0.04)
         _course_style_adjust(profile, 'MIDDLE', 0.04)
 
+    distance_key, distance_patch = _resolve_course_distance_patch(venue, surface, dist)
+    if distance_patch:
+        _course_profile_apply_patch(profile, distance_patch)
+        profile['distance_patch'] = dict(distance_patch)
+        profile['distance_key'] = distance_key
+        profile['course_key'] = f'{venue}_{surface}_{distance_key}' if venue and surface and distance_key else ''
+        if distance_patch.get('draw_bias'):
+            profile['draw_bias'] = dict(distance_patch.get('draw_bias', {}) or {})
+        if distance_patch.get('label'):
+            profile['distance_label'] = str(distance_patch.get('label', '') or '')
+
     if _is_tokyo_turf_1400(meta):
         rail = _infer_rail_setting(meta) or 'A'
         month = _infer_race_month(meta)
@@ -11526,6 +11765,15 @@ def enrich_meta_with_course_profile(meta: Dict[str, str]) -> Dict[str, str]:
         meta['course_profile_surface'] = surface
     if venue and surface:
         meta['course_profile_key'] = f'{venue}_{surface}'
+    distance_key = str(profile.get('distance_key', '') or '')
+    course_key = str(profile.get('course_key', '') or '')
+    distance_label = str(profile.get('distance_label', '') or '')
+    if distance_key:
+        meta['course_profile_distance_key'] = distance_key
+    if course_key:
+        meta['course_profile_course_key'] = course_key
+    if distance_label:
+        meta['course_profile_distance_label'] = distance_label
     if _is_tokyo_turf_1400(meta):
         rail = str(profile.get('rail_setting', '') or _infer_rail_setting(meta))
         class_id = _infer_race_class_id(meta)
@@ -12841,6 +13089,10 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     venue, surface, profile = _resolve_course_profile(meta)
     dist, _ = _meta_distance_surface(meta)
     style_bias = dict(profile.get('style_bias', {}) or {})
+    distance_key = str(profile.get('distance_key', '') or '')
+    distance_patch = dict(profile.get('distance_patch', {}) or {})
+    distance_style_bias = dict(distance_patch.get('style_bias', {}) or {})
+    distance_draw_bias = dict(distance_patch.get('draw_bias', {}) or {})
     is_tokyo1400 = _is_tokyo_turf_1400(meta)
     rail_setting = str(profile.get('rail_setting', '') or _infer_rail_setting(meta) or '')
     class_id = _infer_race_class_id(meta)
@@ -12910,6 +13162,46 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     rail_bias_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     class_pace_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     tokyo1400_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+    distance_style_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+    distance_draw_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+    distance_specific_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+
+    if distance_key:
+        if distance_style_bias:
+            distance_style_fit = style_col.map(
+                lambda z: clamp(50.0 + 30.0 * float(distance_style_bias.get(z, 0.0) or 0.0), 0.0, 100.0)
+            ).astype(float)
+        if distance_draw_bias:
+            distance_draw_fit = (distance_draw_fit + draw_zone.map(
+                lambda z: 100.0 * float(distance_draw_bias.get(z, 0.0) or 0.0)
+            ).astype(float)).clip(lower=0.0, upper=100.0)
+        dsw_style = 0.18 + (0.10 * max([abs(float(v)) for v in distance_style_bias.values()] or [0.0]))
+        dsw_straight = 0.10 + 0.40 * max(float(distance_patch.get('straight', 0.0) or 0.0), 0.0)
+        dsw_corner = 0.10 + 0.40 * max(float(distance_patch.get('corner', 0.0) or 0.0), 0.0)
+        dsw_stamina = 0.10 + 0.40 * max(float(distance_patch.get('stamina', 0.0) or 0.0), 0.0)
+        dsw_power = 0.08 + 0.40 * max(float(distance_patch.get('power', 0.0) or 0.0), 0.0)
+        dsw_speed = 0.08 + 0.40 * max(float(distance_patch.get('speed', 0.0) or 0.0), 0.0)
+        dsw_gate = 0.06 + 0.40 * max(float(distance_patch.get('gate', 0.0) or 0.0), 0.0)
+        dsw_agility = 0.08 + 0.40 * max(float(distance_patch.get('agility', 0.0) or 0.0), 0.0)
+        dsw_draw = 0.08 if distance_draw_bias else 0.0
+        dsw_total = dsw_style + dsw_straight + dsw_corner + dsw_stamina + dsw_power + dsw_speed + dsw_gate + dsw_agility + dsw_draw
+        distance_specific_fit = (
+            dsw_style * distance_style_fit
+            + dsw_straight * straight_fit
+            + dsw_corner * corner_fit
+            + dsw_stamina * stamina_fit
+            + dsw_power * power_fit
+            + dsw_speed * speed_fit
+            + dsw_gate * gatefit
+            + dsw_agility * agility_fit
+            + dsw_draw * distance_draw_fit
+        ) / max(1e-9, float(dsw_total))
+        if _is_wet_track(meta) and float(distance_patch.get('power', 0.0) or 0.0) > 0.0:
+            distance_specific_fit = (
+                distance_specific_fit
+                + (0.08 + 0.20 * float(distance_patch.get('power', 0.0) or 0.0)) * (power_fit - 50.0)
+                + 0.03 * (michfit - 50.0)
+            ).clip(lower=0.0, upper=100.0)
 
     if is_tokyo1400:
         rail_bias = TOKYO_TURF_1400_RAIL_BIAS.get(rail_setting or 'A', TOKYO_TURF_1400_RAIL_BIAS.get('A', {}))
@@ -12962,10 +13254,11 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     speed_w = 0.08 + 0.08 * float(profile.get('speed', 0.5) or 0.5)
     gate_w = 0.05 + 0.05 * float(profile.get('gate', 0.5) or 0.5)
     agility_w = 0.07 + 0.08 * float(profile.get('agility', 0.5) or 0.5)
+    distance_w = 0.10 if distance_key else 0.0
     rail_w = 0.05 if is_tokyo1400 else 0.0
     classpace_w = 0.06 if is_tokyo1400 else 0.0
     tokyo_w = 0.08 if is_tokyo1400 else 0.0
-    total_w = style_w + straight_w + corner_w + stamina_w + power_w + speed_w + gate_w + agility_w + rail_w + classpace_w + tokyo_w
+    total_w = style_w + straight_w + corner_w + stamina_w + power_w + speed_w + gate_w + agility_w + distance_w + rail_w + classpace_w + tokyo_w
 
     d['CourseStyleFit'] = _num_series(style_fit, 50.0, index=d.index)
     d['CourseStraightFit'] = _num_series(straight_fit, 50.0, index=d.index)
@@ -12974,6 +13267,9 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     d['CoursePowerFit'] = _num_series(power_fit, 50.0, index=d.index)
     d['CourseSpeedFit'] = _num_series(speed_fit, 50.0, index=d.index)
     d['CourseAgilityFit'] = _num_series(agility_fit, 50.0, index=d.index)
+    d['CourseDistanceStyleFit'] = _num_series(distance_style_fit, 50.0, index=d.index)
+    d['CourseDistanceDrawFit'] = _num_series(distance_draw_fit, 50.0, index=d.index)
+    d['CourseDistanceSpecificFit'] = _num_series(distance_specific_fit, 50.0, index=d.index)
     d['CourseRailBiasFit'] = _num_series(rail_bias_fit, 50.0, index=d.index)
     d['CourseClassPaceFit'] = _num_series(class_pace_fit, 50.0, index=d.index)
     d['CourseTokyo1400Fit'] = _num_series(tokyo1400_fit, 50.0, index=d.index)
@@ -12986,6 +13282,7 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
         + speed_w * d['CourseSpeedFit']
         + gate_w * gatefit
         + agility_w * d['CourseAgilityFit']
+        + distance_w * d['CourseDistanceSpecificFit']
         + rail_w * d['CourseRailBiasFit']
         + classpace_w * d['CourseClassPaceFit']
         + tokyo_w * d['CourseTokyo1400Fit']
@@ -12994,6 +13291,7 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     d['CourseBiasDelta'] = (d['CourseProfileFit'] - 50.0).clip(lower=-20.0, upper=20.0).astype(float)
     d['CourseProfileVenue'] = venue if venue else ''
     d['CourseProfileSurface'] = surface if surface else ''
+    d['CourseDistanceKey'] = distance_key if distance_key else ''
     return d
 
 
@@ -15793,6 +16091,7 @@ def _csp_compute_win_place_probs(
     df['PlaceAxisScore'] = _num_series(df, 'PlaceAxisScore', 50.0).clip(lower=0.0, upper=100.0).astype(float)
     course_fit_delta = _num_series(df.get('CourseProfileFit', 50.0), 50.0, index=df.index) - 50.0
     course_stamina_delta = _num_series(df.get('CourseStaminaFit', 50.0), 50.0, index=df.index) - 50.0
+    course_distance_specific_delta = _num_series(df.get('CourseDistanceSpecificFit', 50.0), 50.0, index=df.index) - 50.0
     course_rail_delta = _num_series(df.get('CourseRailBiasFit', 50.0), 50.0, index=df.index) - 50.0
     course_class_pace_delta = _num_series(df.get('CourseClassPaceFit', 50.0), 50.0, index=df.index) - 50.0
     course_tokyo1400_delta = _num_series(df.get('CourseTokyo1400Fit', 50.0), 50.0, index=df.index) - 50.0
@@ -15803,6 +16102,7 @@ def _csp_compute_win_place_probs(
         + 0.08 * _num_series(df.get('StabilityComposite', df.get('SAS', 50.0)), 50.0, index=df.index)
         + 0.10 * course_fit_delta
         + 0.04 * course_stamina_delta
+        + 0.06 * course_distance_specific_delta
         + 0.06 * course_class_pace_delta
         + 0.04 * course_rail_delta
         + 0.05 * course_tokyo1400_delta
@@ -15826,11 +16126,13 @@ def _csp_compute_win_place_probs(
     course_place_weight = float(pr.get('course_profile_place_weight', 0.18) or 0.18)
     pace_class_place_weight = float(pr.get('pace_class_place_weight', 0.10) or 0.10)
     rail_bias_place_weight = float(pr.get('rail_bias_place_weight', 0.06) or 0.06)
+    distance_specific_place_weight = float(pr.get('distance_specific_place_weight', 0.10) or 0.10)
     tokyo1400_place_weight = float(pr.get('tokyo1400_place_weight', 0.08) or 0.08)
     place_adj = (
         course_place_weight * course_fit_delta
         + pace_class_place_weight * course_class_pace_delta
         + rail_bias_place_weight * course_rail_delta
+        + distance_specific_place_weight * course_distance_specific_delta
         + tokyo1400_place_weight * course_tokyo1400_delta
     ) / 100.0
     df["p_place_model"] = (df["p_place_model"] + place_adj).clip(lower=0.05, upper=0.72)
@@ -16870,6 +17172,7 @@ def build_trio_formation_from_wide(anchor_num: str, wide_opp_nums: list[str], df
         return max(vals or [0.0])
 
     d['_trio_style_bonus'] = d['_style_family'].apply(_trio_style_bonus_for_family).astype(float)
+    course_distance_specific_delta = _num_series(d.get('CourseDistanceSpecificFit', 50.0), 50.0, index=d.index) - 50.0
     course_rail_delta = _num_series(d.get('CourseRailBiasFit', 50.0), 50.0, index=d.index) - 50.0
     course_tokyo_delta = _num_series(d.get('CourseTokyo1400Fit', 50.0), 50.0, index=d.index) - 50.0
     d['_support_signal'] = (
@@ -16885,6 +17188,7 @@ def build_trio_formation_from_wide(anchor_num: str, wide_opp_nums: list[str], df
         + d['_support_signal'] * 2.4
         + 28.0 * d['_wide_style_bonus']
         + d['_trio_style_bonus']
+        + 0.04 * course_distance_specific_delta
         + 0.04 * course_rail_delta
         + 0.03 * course_tokyo_delta
         - 0.05 * d['trap_score']
@@ -16899,6 +17203,7 @@ def build_trio_formation_from_wide(anchor_num: str, wide_opp_nums: list[str], df
         + 0.04 * d['CourseStaminaFit']
         + 22.0 * d['_wide_style_bonus']
         + 0.90 * d['_trio_style_bonus']
+        + 0.04 * course_distance_specific_delta
         + 0.03 * course_rail_delta
         + 0.04 * course_tokyo_delta
         - 0.05 * d['trap_score']
