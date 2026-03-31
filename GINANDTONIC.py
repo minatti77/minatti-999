@@ -11315,12 +11315,67 @@ def _course_patch(*, style: Optional[Dict[str, float]] = None, straight: float =
     return patch
 
 
+
+def _blend_patch_scalar(left: object, right: object, ratio: float, default: float = 0.0) -> float:
+    """距離別パッチ補間用のスカラー線形補間。"""
+    try:
+        lv = float(left)
+    except Exception:
+        lv = float(default)
+    try:
+        rv = float(right)
+    except Exception:
+        rv = float(default)
+    r = clamp(float(ratio), 0.0, 1.0)
+    return float((1.0 - r) * lv + r * rv)
+
+
+
+def _blend_patch_bias(left: Optional[Dict[str, float]], right: Optional[Dict[str, float]], ratio: float) -> Dict[str, float]:
+    """style_bias / draw_bias を安全に補間する。"""
+    out: Dict[str, float] = {}
+    lk = dict(left or {})
+    rk = dict(right or {})
+    for key in sorted(set(lk.keys()) | set(rk.keys())):
+        try:
+            v = _blend_patch_scalar(lk.get(key, 0.0), rk.get(key, 0.0), ratio, default=0.0)
+            if abs(v) > 1e-9:
+                out[str(key)] = float(v)
+        except Exception:
+            continue
+    return out
+
+
+
+def _blend_course_patch(left_patch: Dict[str, object], right_patch: Dict[str, object], ratio: float, label: str = '') -> Dict[str, object]:
+    """2つの距離別コース補正パッチを線形補間して返す。"""
+    lp = dict(left_patch or {})
+    rp = dict(right_patch or {})
+    r = clamp(float(ratio), 0.0, 1.0)
+    patch: Dict[str, object] = {}
+    style_bias = _blend_patch_bias(lp.get('style_bias', {}), rp.get('style_bias', {}), r)
+    if style_bias:
+        patch['style_bias'] = style_bias
+    draw_bias = _blend_patch_bias(lp.get('draw_bias', {}), rp.get('draw_bias', {}), r)
+    if draw_bias:
+        patch['draw_bias'] = draw_bias
+    for key in ['straight', 'corner', 'stamina', 'power', 'speed', 'gate', 'agility']:
+        v = _blend_patch_scalar(lp.get(key, 0.0), rp.get(key, 0.0), r, default=0.0)
+        if abs(v) > 1e-9:
+            patch[key] = float(v)
+    if label:
+        patch['label'] = str(label)
+    return patch
+
+
 JRA_COURSE_DISTANCE_PROFILE_DATA = {
     '東京': {
         'turf': {
+            1400: _course_patch(style={'FRONT': -0.02, 'MIDDLE': 0.04, 'REAR': 0.14}, straight=0.10, stamina=0.02, speed=0.04, gate=0.02, draw={'outer': 0.05}, label='東京芝1400m'),
             1600: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.04, 'REAR': 0.10}, straight=0.08, stamina=0.04, speed=0.02, draw={'outer': 0.02}, label='東京芝1600m'),
             1800: _course_patch(style={'FRONT': -0.05, 'MIDDLE': 0.03, 'REAR': 0.10}, straight=0.08, stamina=0.06, power=0.02, label='東京芝1800m'),
             2000: _course_patch(style={'FRONT': -0.06, 'MIDDLE': 0.04, 'REAR': 0.08}, straight=0.08, stamina=0.08, power=0.04, label='東京芝2000m'),
+            2300: _course_patch(style={'FRONT': -0.08, 'MIDDLE': 0.04, 'REAR': 0.10}, straight=0.08, stamina=0.10, power=0.06, label='東京芝2300m'),
             2400: _course_patch(style={'FRONT': -0.08, 'MIDDLE': 0.04, 'REAR': 0.10}, straight=0.08, stamina=0.10, power=0.06, label='東京芝2400m'),
             3400: _course_patch(style={'FRONT': -0.10, 'MIDDLE': 0.06, 'REAR': 0.10}, straight=0.06, stamina=0.14, power=0.06, label='東京芝3400m'),
         },
@@ -11329,6 +11384,7 @@ JRA_COURSE_DISTANCE_PROFILE_DATA = {
             1400: _course_patch(style={'FRONT': 0.08, 'MIDDLE': 0.04, 'REAR': -0.06}, speed=0.08, gate=0.06, power=0.02, label='東京ダ1400m'),
             1600: _course_patch(style={'FRONT': 0.04, 'MIDDLE': 0.06, 'REAR': -0.02}, speed=0.08, gate=0.08, agility=0.04, draw={'outer': 0.04}, label='東京ダ1600m'),
             2100: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.06, 'REAR': 0.06}, corner=0.04, stamina=0.12, power=0.10, label='東京ダ2100m'),
+            2400: _course_patch(style={'FRONT': -0.06, 'MIDDLE': 0.06, 'REAR': 0.08}, corner=0.06, stamina=0.14, power=0.12, label='東京ダ2400m'),
         },
     },
     '中山': {
@@ -11337,6 +11393,7 @@ JRA_COURSE_DISTANCE_PROFILE_DATA = {
             1600: _course_patch(style={'FRONT': -0.02, 'MIDDLE': 0.08, 'REAR': 0.02}, corner=0.10, stamina=0.06, gate=0.04, agility=0.10, label='中山芝1600m'),
             1800: _course_patch(style={'FRONT': -0.04, 'MIDDLE': 0.06, 'REAR': 0.04}, corner=0.08, stamina=0.10, power=0.04, agility=0.08, label='中山芝1800m'),
             2000: _course_patch(style={'FRONT': -0.05, 'MIDDLE': 0.06, 'REAR': 0.04}, corner=0.08, stamina=0.12, power=0.06, agility=0.06, label='中山芝2000m'),
+            2200: _course_patch(style={'FRONT': -0.06, 'MIDDLE': 0.08, 'REAR': 0.04}, corner=0.08, stamina=0.12, power=0.06, agility=0.06, label='中山芝2200m'),
             2500: _course_patch(style={'FRONT': -0.06, 'MIDDLE': 0.08, 'REAR': 0.04}, corner=0.06, stamina=0.14, power=0.08, label='中山芝2500m'),
             3600: _course_patch(style={'FRONT': -0.08, 'MIDDLE': 0.08, 'REAR': 0.06}, corner=0.06, stamina=0.16, power=0.08, label='中山芝3600m'),
         },
@@ -11511,25 +11568,65 @@ def _course_style_adjust(profile: Dict[str, object], label: str, delta: float) -
 
 
 def _resolve_course_distance_patch(venue: str, surface: str, dist: float) -> tuple[str, dict]:
-    """競馬場・馬場・距離から最も近い距離別コース補正パッチを返す。"""
+    """競馬場・馬場・距離から距離別コース補正パッチを返す。
+
+    優先順:
+    1. 完全一致
+    2. 前後の登録距離から線形補間
+    3. 許容差内の最近傍距離
+    """
     if (not venue) or (not surface) or (not np.isfinite(dist)):
         return '', {}
     raw = (((JRA_COURSE_DISTANCE_PROFILE_DATA.get(venue, {}) or {}).get(surface, {}) or {}))
     if not raw:
         return '', {}
-    keys: list[int] = []
-    for k in raw.keys():
+
+    parsed: Dict[int, Dict[str, object]] = {}
+    for k, v in raw.items():
         try:
-            keys.append(int(float(k)))
+            parsed[int(float(k))] = dict(v or {})
         except Exception:
-            pass
-    if not keys:
+            continue
+    if not parsed:
         return '', {}
-    nearest = min(keys, key=lambda x: abs(float(x) - float(dist)))
+
+    keys = sorted(parsed.keys())
+    target = float(dist)
     tolerance = 220.0 if surface == 'turf' else 180.0
-    if abs(float(nearest) - float(dist)) > tolerance:
+    nearest = min(keys, key=lambda x: abs(float(x) - target))
+    nearest_gap = abs(float(nearest) - target)
+    if nearest_gap > tolerance:
         return '', {}
-    patch = dict(raw.get(nearest, raw.get(str(nearest), {})) or {})
+
+    if nearest_gap < 1e-6:
+        patch = dict(parsed.get(nearest, {}) or {})
+        patch['_distance_source'] = 'exact'
+        patch['_distance_confidence'] = 1.0
+        patch['_distance_anchor'] = str(int(nearest))
+        return str(int(nearest)), patch
+
+    lower_keys = [k for k in keys if float(k) <= target]
+    upper_keys = [k for k in keys if float(k) >= target]
+    lower = max(lower_keys) if lower_keys else None
+    upper = min(upper_keys) if upper_keys else None
+    blend_gap_limit = 500.0 if surface == 'turf' else 400.0
+
+    if lower is not None and upper is not None and lower != upper:
+        span = float(upper - lower)
+        if span > 0.0 and span <= blend_gap_limit:
+            ratio = (target - float(lower)) / span
+            label = f'{venue}{"芝" if surface == "turf" else "ダ"}{int(round(target))}m'
+            patch = _blend_course_patch(parsed.get(lower, {}), parsed.get(upper, {}), ratio, label=label)
+            patch['_distance_source'] = 'blend'
+            patch['_distance_confidence'] = float(clamp(0.92 - 0.20 * min(abs(ratio - 0.5) * 2.0, 1.0), 0.70, 0.94))
+            patch['_distance_anchor'] = f'{int(lower)}-{int(upper)}'
+            patch['_distance_blend_ratio'] = float(clamp(ratio, 0.0, 1.0))
+            return f'{int(lower)}-{int(upper)}', patch
+
+    patch = dict(parsed.get(nearest, {}) or {})
+    patch['_distance_source'] = 'nearest'
+    patch['_distance_confidence'] = float(clamp(1.0 - nearest_gap / max(tolerance, 1.0), 0.55, 0.90))
+    patch['_distance_anchor'] = str(int(nearest))
     return str(int(nearest)), patch
 
 
@@ -11694,6 +11791,17 @@ def _resolve_course_profile(meta: Dict[str, str]) -> tuple[str, str, dict]:
         profile['distance_patch'] = dict(distance_patch)
         profile['distance_key'] = distance_key
         profile['course_key'] = f'{venue}_{surface}_{distance_key}' if venue and surface and distance_key else ''
+        profile['distance_source'] = str(distance_patch.get('_distance_source', 'exact') or 'exact')
+        try:
+            profile['distance_confidence'] = clamp(float(distance_patch.get('_distance_confidence', 1.0) or 1.0), 0.35, 1.0)
+        except Exception:
+            profile['distance_confidence'] = 1.0
+        profile['distance_anchor'] = str(distance_patch.get('_distance_anchor', distance_key) or distance_key)
+        if '_distance_blend_ratio' in distance_patch:
+            try:
+                profile['distance_blend_ratio'] = clamp(float(distance_patch.get('_distance_blend_ratio', 0.5) or 0.5), 0.0, 1.0)
+            except Exception:
+                pass
         if distance_patch.get('draw_bias'):
             profile['draw_bias'] = dict(distance_patch.get('draw_bias', {}) or {})
         if distance_patch.get('label'):
@@ -11774,6 +11882,18 @@ def enrich_meta_with_course_profile(meta: Dict[str, str]) -> Dict[str, str]:
         meta['course_profile_course_key'] = course_key
     if distance_label:
         meta['course_profile_distance_label'] = distance_label
+    distance_source = str(profile.get('distance_source', '') or '')
+    if distance_source:
+        meta['course_profile_distance_source'] = distance_source
+    try:
+        distance_confidence = float(profile.get('distance_confidence', np.nan))
+        if np.isfinite(distance_confidence):
+            meta['course_profile_distance_confidence'] = f"{distance_confidence:.2f}"
+    except Exception:
+        pass
+    distance_anchor = str(profile.get('distance_anchor', '') or '')
+    if distance_anchor:
+        meta['course_profile_distance_anchor'] = distance_anchor
     if _is_tokyo_turf_1400(meta):
         rail = str(profile.get('rail_setting', '') or _infer_rail_setting(meta))
         class_id = _infer_race_class_id(meta)
@@ -13093,6 +13213,11 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     distance_patch = dict(profile.get('distance_patch', {}) or {})
     distance_style_bias = dict(distance_patch.get('style_bias', {}) or {})
     distance_draw_bias = dict(distance_patch.get('draw_bias', {}) or {})
+    distance_source = str(profile.get('distance_source', '') or '') if distance_key else ''
+    try:
+        distance_confidence = clamp(float(profile.get('distance_confidence', 1.0) or 1.0), 0.35, 1.0) if distance_key else 0.0
+    except Exception:
+        distance_confidence = 1.0 if distance_key else 0.0
     is_tokyo1400 = _is_tokyo_turf_1400(meta)
     rail_setting = str(profile.get('rail_setting', '') or _infer_rail_setting(meta) or '')
     class_id = _infer_race_class_id(meta)
@@ -13183,7 +13308,7 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
         dsw_speed = 0.08 + 0.40 * max(float(distance_patch.get('speed', 0.0) or 0.0), 0.0)
         dsw_gate = 0.06 + 0.40 * max(float(distance_patch.get('gate', 0.0) or 0.0), 0.0)
         dsw_agility = 0.08 + 0.40 * max(float(distance_patch.get('agility', 0.0) or 0.0), 0.0)
-        dsw_draw = 0.08 if distance_draw_bias else 0.0
+        dsw_draw = ((0.08 + 0.04 * max([abs(float(v)) for v in distance_draw_bias.values()] or [0.0])) * distance_confidence) if distance_draw_bias else 0.0
         dsw_total = dsw_style + dsw_straight + dsw_corner + dsw_stamina + dsw_power + dsw_speed + dsw_gate + dsw_agility + dsw_draw
         distance_specific_fit = (
             dsw_style * distance_style_fit
@@ -13202,6 +13327,13 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
                 + (0.08 + 0.20 * float(distance_patch.get('power', 0.0) or 0.0)) * (power_fit - 50.0)
                 + 0.03 * (michfit - 50.0)
             ).clip(lower=0.0, upper=100.0)
+        if distance_source in {'blend', 'nearest'}:
+            confidence_scale = 0.68 + 0.32 * distance_confidence
+            if distance_source == 'blend':
+                confidence_scale = min(confidence_scale, 0.94)
+            else:
+                confidence_scale = min(confidence_scale, 0.88)
+            distance_specific_fit = (50.0 + (distance_specific_fit - 50.0) * confidence_scale).clip(lower=0.0, upper=100.0)
 
     if is_tokyo1400:
         rail_bias = TOKYO_TURF_1400_RAIL_BIAS.get(rail_setting or 'A', TOKYO_TURF_1400_RAIL_BIAS.get('A', {}))
@@ -13254,7 +13386,7 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     speed_w = 0.08 + 0.08 * float(profile.get('speed', 0.5) or 0.5)
     gate_w = 0.05 + 0.05 * float(profile.get('gate', 0.5) or 0.5)
     agility_w = 0.07 + 0.08 * float(profile.get('agility', 0.5) or 0.5)
-    distance_w = 0.10 if distance_key else 0.0
+    distance_w = (0.07 + 0.04 * distance_confidence) if distance_key else 0.0
     rail_w = 0.05 if is_tokyo1400 else 0.0
     classpace_w = 0.06 if is_tokyo1400 else 0.0
     tokyo_w = 0.08 if is_tokyo1400 else 0.0
@@ -13292,6 +13424,8 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     d['CourseProfileVenue'] = venue if venue else ''
     d['CourseProfileSurface'] = surface if surface else ''
     d['CourseDistanceKey'] = distance_key if distance_key else ''
+    d['CourseDistanceConfidence'] = float(distance_confidence) if distance_key else 0.0
+    d['CourseDistanceSource'] = distance_source if distance_key else ''
     return d
 
 
