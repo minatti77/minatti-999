@@ -13160,6 +13160,176 @@ def _track_context(meta: Dict[str, str]) -> Dict[str, float]:
     }
 
 
+def _track_draw_zone(df: pd.DataFrame) -> pd.Series:
+    """枠/馬番系の列から内中外の簡易ゾーンを返す。"""
+    draw_raw = pd.Series([np.nan] * len(df), index=df.index, dtype=float)
+    for c in ['frame', 'waku', 'draw', 'draw_num', 'post_position']:
+        if c in df.columns:
+            cand = pd.to_numeric(df[c], errors='coerce')
+            if cand.notna().sum() > 0:
+                draw_raw = cand
+                break
+    draw_zone = pd.Series(['middle'] * len(df), index=df.index, dtype=object)
+    if draw_raw.notna().sum() > 0:
+        if float(draw_raw.max(skipna=True)) <= 8.5:
+            draw_zone = draw_raw.apply(lambda x: 'inner' if np.isfinite(x) and x <= 4.0 else ('outer' if np.isfinite(x) and x >= 5.0 else 'middle'))
+        else:
+            draw_zone = draw_raw.apply(lambda x: 'inner' if np.isfinite(x) and x <= 6.0 else ('outer' if np.isfinite(x) and x >= 13.0 else 'middle'))
+    return draw_zone.astype(str)
+
+
+def _resolve_dynamic_track_variant(meta: Dict[str, str]) -> float:
+    """当日の高速/低速馬場を表す補正値（-20〜+20）を解決する。"""
+    meta = meta or {}
+    score = _meta_float(meta, ['today_track_speed_score', 'track_speed_score', 'surface_speed_score'], default=float('nan'))
+    if np.isfinite(score):
+        return float(np.clip(score - 50.0, -25.0, 25.0))
+
+    diff = _meta_float(meta, ['day_track_variant', 'track_variant', 'baba_diff', 'baba_delta', 'clock_bias', 'track_speed_bias', 'speed_bias'], default=float('nan'))
+    if np.isfinite(diff):
+        return float(np.clip(-diff * 10.0, -25.0, 25.0))
+
+    dist, surface = _meta_distance_surface(meta)
+    avg_sf = _meta_float(meta, ['today_avg_sec_per_furlong', 'day_avg_sec_per_furlong', 'avg_sec_per_furlong', 'avg_seconds_per_furlong', 'avg_furlong_sec'], default=float('nan'))
+
+    base_sf = 12.10
+    if surface == 'turf':
+        base_sf = 12.05
+    elif surface == 'dirt':
+        base_sf = 12.20
+
+    if np.isfinite(dist):
+        if dist <= 1400:
+            base_sf -= 0.10
+        elif dist >= 2000:
+            base_sf += 0.06
+
+    sec_delta_score = 0.0
+    if np.isfinite(avg_sf):
+        sec_delta_score = float(np.clip((base_sf - avg_sf) * 55.0, -12.0, 12.0))
+
+    cushion_score = _meta_float(meta, ['cushion_score'], default=float('nan'))
+    cushion_delta = ((cushion_score - 50.0) / 50.0) * 6.0 if np.isfinite(cushion_score) else 0.0
+
+    firmness_key = 'turf_firmness_score' if surface == 'turf' else 'dirt_firmness_score'
+    firmness_score = _meta_float(meta, [firmness_key], default=float('nan'))
+    firmness_delta = ((firmness_score - 50.0) / 50.0) * 5.0 if np.isfinite(firmness_score) else 0.0
+
+    wet_keys = ['wetness_score_turf_goal', 'wetness_score_turf_4c'] if surface == 'turf' else ['wetness_score_dirt_goal', 'wetness_score_dirt_4c']
+    wet_vals = []
+    for k in wet_keys:
+        v = _meta_float(meta, [k], default=float('nan'))
+        if np.isfinite(v):
+            wet_vals.append(float(v))
+
+    wet_delta = 0.0
+    if wet_vals:
+        wet_mean = float(np.mean(wet_vals))
+        if surface == 'turf':
+            wet_delta = -float(np.clip((wet_mean - 35.0) / 65.0 * 8.0, -8.0, 8.0))
+        else:
+            wet_delta = -float(np.clip((wet_mean - 30.0) / 70.0 * 4.0, -4.0, 4.0))
+
+    return float(np.clip(sec_delta_score + 0.55 * cushion_delta + 0.35 * firmness_delta + wet_delta, -20.0, 20.0))
+
+
+def _resolve_dynamic_lane_bias(meta: Dict[str, str]) -> float:
+    """当日の内外バイアスを表す補正値（内有利=正、外有利=負）を返す。"""
+    meta = meta or {}
+    combined = ' '.join(str(meta.get(k, '')) for k in ['bias', 'map_summary', 'course_info', 'rail_course'])
+
+    inner = 0.0
+    outer = 0.0
+    if re.search(r'内有利|イン有利|内伸び|最内有利|ロスなく', combined):
+        inner += 1.0
+    if re.search(r'外有利|外伸び|外差し|差し有利|大外', combined):
+        outer += 1.0
+    if re.search(r'フラット|内外同等|内外なし', combined):
+        inner *= 0.25
+        outer *= 0.25
+
+    inside_damage = 1.0 if str(meta.get('inside_damage', '0')) == '1' else 0.0
+    if inside_damage >= 1.0:
+        outer += 0.8
+        inner -= 0.4
+
+    rail_offset = _meta_float(meta, ['rail_offset_m', 'rail_offset_m_text'], default=float('nan'))
+    if np.isfinite(rail_offset) and rail_offset > 0.0 and inside_damage < 1.0:
+        inner += min(0.7, float(rail_offset) / 6.0 * 0.7)
+
+    if _is_wet_track(meta) and inside_damage >= 1.0:
+        outer += 0.3
+
+    return float(np.clip(inner - outer, -1.5, 1.5))
+
+
+def apply_dynamic_track_bias_features_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> pd.DataFrame:
+    """当日の馬場差・内外バイアス・時計の出やすさを馬ごとの適性へ落とし込む。"""
+    if df is None or len(df) == 0:
+        return df
+
+    d = df.copy()
+    z = d.get('zone_4c', pd.Series(['MIDDLE'] * len(d), index=d.index)).astype(str).apply(normalize_zone_token)
+    draw_zone = _track_draw_zone(d)
+    lane_balance = _resolve_dynamic_lane_bias(meta)
+    variant = _resolve_dynamic_track_variant(meta)
+
+    d['DynamicTrackLaneBiasScore'] = float(np.clip(50.0 + lane_balance * 20.0, 0.0, 100.0))
+    d['DynamicTrackSpeedScore'] = float(np.clip(50.0 + variant * 2.0, 0.0, 100.0))
+    d['DynamicTrackVariant'] = float(variant)
+
+    inner_mask = (draw_zone == 'inner')
+    outer_mask = (draw_zone == 'outer')
+    middle_mask = ~(inner_mask | outer_mask)
+
+    lane_bonus = pd.Series([0.0] * len(d), index=d.index, dtype=float)
+    if lane_balance >= 0.0:
+        lane_bonus = lane_bonus + inner_mask.astype(float) * abs(lane_balance) * 12.0
+        lane_bonus = lane_bonus + middle_mask.astype(float) * abs(lane_balance) * 3.5
+        lane_bonus = lane_bonus + (z == 'FRONT').astype(float) * abs(lane_balance) * 2.5
+        lane_bonus = lane_bonus - outer_mask.astype(float) * abs(lane_balance) * 4.0
+    else:
+        lane_bonus = lane_bonus + outer_mask.astype(float) * abs(lane_balance) * 12.0
+        lane_bonus = lane_bonus + middle_mask.astype(float) * abs(lane_balance) * 3.5
+        lane_bonus = lane_bonus + (z == 'REAR').astype(float) * abs(lane_balance) * 2.5
+        lane_bonus = lane_bonus - inner_mask.astype(float) * abs(lane_balance) * 4.0
+    d['DynamicTrackLaneSuit'] = (50.0 + lane_bonus).clip(lower=0.0, upper=100.0)
+
+    ability = _num_series(d.get('Ability', 50.0), 50.0, index=d.index)
+    tf = _num_series(d.get('TimeFit', 50.0), 50.0, index=d.index)
+    ff = _num_series(d.get('FactorFit', 50.0), 50.0, index=d.index)
+    mich = _num_series(d.get('MichiakuFit', ff), 50.0, index=d.index)
+    cons = _num_series(d.get('Consist', 50.0), 50.0, index=d.index)
+    cc = _num_series(d.get('CommentCondition', 50.0), 50.0, index=d.index)
+    pace = _num_series(d.get('PaceFit', 50.0), 50.0, index=d.index)
+    pf = _num_series(d.get('pred_first3f', np.nan), np.nan, index=d.index)
+
+    if pf.notna().sum() > 1 and float(pf.max()) != float(pf.min()):
+        early_fast01 = ((float(pf.max()) - pf) / (float(pf.max()) - float(pf.min()))).clip(lower=0.0, upper=1.0)
+    else:
+        early_fast01 = pd.Series([0.5] * len(d), index=d.index, dtype=float)
+
+    fast_track_fit = (0.42 * ability + 0.26 * tf + 0.18 * (early_fast01 * 100.0) + 0.14 * pace).clip(lower=0.0, upper=100.0)
+    slow_track_fit = (0.32 * ff + 0.28 * mich + 0.22 * cons + 0.18 * cc).clip(lower=0.0, upper=100.0)
+    neutral_track_fit = (0.50 * fast_track_fit + 0.50 * slow_track_fit).clip(lower=0.0, upper=100.0)
+
+    fast_w = float(np.clip(variant / 20.0, 0.0, 1.0))
+    slow_w = float(np.clip(-variant / 20.0, 0.0, 1.0))
+    neutral_w = float(np.clip(1.0 - max(fast_w, slow_w), 0.0, 1.0))
+    d['DynamicTrackSpeedSuit'] = (neutral_w * neutral_track_fit + fast_w * fast_track_fit + slow_w * slow_track_fit).clip(lower=0.0, upper=100.0)
+
+    mapfit = _num_series(d.get('MapFit', 50.0), 50.0, index=d.index)
+    posfit = _num_series(d.get('PosFit', 50.0), 50.0, index=d.index)
+    d['DynamicTrackConditionAdvantage'] = (
+        0.34 * cc
+        + 0.18 * mapfit
+        + 0.16 * posfit
+        + 0.18 * d['DynamicTrackLaneSuit']
+        + 0.14 * d['DynamicTrackSpeedSuit']
+    ).clip(lower=0.0, upper=100.0)
+    return d
+
+
 def compute_position_fit_adjusted(zone_4c: str, meta: Dict[str, str]) -> float:
     """位置取り(PosFit)を天候/馬場で補正。
 
@@ -13392,14 +13562,19 @@ def compute_conditionfit_v1_1(df: pd.DataFrame, meta: Dict[str, str]) -> pd.Seri
     mf = _num_series(df, 'MapFit', 50.0)
     pf = _num_series(df, 'PosFit', 50.0)
     ff = _num_series(df, 'FactorFit', 50.0)
+    dyn_lane = _num_series(df, 'DynamicTrackLaneSuit', 50.0)
+    dyn_speed = _num_series(df, 'DynamicTrackSpeedSuit', 50.0)
+    dyn_adv = _num_series(df, 'DynamicTrackConditionAdvantage', 50.0)
     dist, surface = _meta_distance_surface(meta)
-    base = 0.55 * cc + 0.25 * mf + 0.20 * pf
+
+    base = 0.43 * cc + 0.19 * mf + 0.14 * pf + 0.16 * dyn_adv + 0.08 * dyn_speed
+    base = base + 0.06 * (dyn_lane - 50.0)
     if _is_wet_track(meta):
-        base = base + 0.05 * (ff - 50.0)
+        base = base + 0.05 * (ff - 50.0) + 0.06 * (dyn_adv - 50.0)
     if surface == 'dirt' and np.isfinite(dist) and dist <= 1200:
-        base = base + 0.20 * (cc - 50.0)
+        base = base + 0.16 * (cc - 50.0) + 0.04 * (dyn_speed - 50.0)
     elif surface == 'dirt' and np.isfinite(dist) and dist <= 1400:
-        base = base + 0.10 * (cc - 50.0)
+        base = base + 0.08 * (cc - 50.0) + 0.03 * (dyn_speed - 50.0)
     return _num_series(base, 50.0, index=df.index, lower=0.0, upper=100.0)
 
 
@@ -15336,6 +15511,7 @@ def _csv_compute_base_features(
     df['PaceFit'] = compute_pacefit_v1_1(df, meta, params)
     df = add_pace_profile_features_v1_1(df, meta, params)
     df['GateFit'] = compute_gatefit_v1_1(df, meta)
+    df = apply_dynamic_track_bias_features_v1_1(df, meta, params)
     df['ConditionFit'] = compute_conditionfit_v1_1(df, meta)
 
     # ===== R30 案A: GateRecoveryBonus → GateFit 直接反映 =====
