@@ -13709,13 +13709,329 @@ def compute_conditionfit_v1_1(df: pd.DataFrame, meta: Dict[str, str]) -> pd.Seri
 
 
 
+def _pedigree_pick_series(df: pd.DataFrame, candidates: list[str], default='') -> pd.Series:
+    """候補列から最初に見つかった列を返す。見つからなければ default 値の Series を返す。"""
+    for c in candidates:
+        if c in df.columns:
+            return df[c]
+    return pd.Series([default] * len(df), index=df.index)
+
+
+def _pedigree_parse_num_list(val: object) -> list[float]:
+    """文字列から数値列を抽出して返す。Dosage や 4x4 表記の簡易解析に使う。"""
+    if val is None:
+        return []
+    s = str(val).strip()
+    if not s or s.lower() in {'nan', 'none'}:
+        return []
+    try:
+        return [float(x) for x in re.findall(r'-?\d+(?:\.\d+)?', s)]
+    except Exception:
+        return []
+
+
+def _pedigree_text_key(val: object) -> str:
+    """血統カテゴリ文字列の粗い正規化キーを返す。"""
+    s = '' if val is None else str(val)
+    s = s.upper().replace('　', ' ').replace('_', ' ')
+    s = re.sub(r'[\s,;|]+', ' ', s)
+    return s.strip()
+
+
+def _pedigree_category_counts_from_text(val: object) -> dict:
+    """Brilliant / Intermediate / Classic / Solid / Professional を文字列から抽出する。"""
+    s = _pedigree_text_key(val)
+    out = {'b': 0.0, 'i': 0.0, 'c': 0.0, 's': 0.0, 'p': 0.0}
+    if not s:
+        return out
+    label_patterns = {
+        'b': [r'BRILLIANT', r'(^|[ /&,+-])B([ /&,+-]|$)'],
+        'i': [r'INTERMEDIATE', r'(^|[ /&,+-])I([ /&,+-]|$)'],
+        'c': [r'CLASSIC', r'(^|[ /&,+-])C([ /&,+-]|$)'],
+        's': [r'(^|[ /&,+-])SOLID([ /&,+-]|$)', r'(^|[ /&,+-])S([ /&,+-]|$)'],
+        'p': [r'PROFESSIONAL', r'(^|[ /&,+-])P([ /&,+-]|$)'],
+    }
+    for k, pats in label_patterns.items():
+        if any(re.search(p, s) for p in pats):
+            out[k] = 1.0
+    return out
+
+
+def _pedigree_pct_value(val: object) -> float:
+    """0-1 or 0-100 を 0-100 スケールに揃えて返す。"""
+    try:
+        x = float(val)
+    except Exception:
+        return float('nan')
+    if not np.isfinite(x):
+        return float('nan')
+    if abs(x) <= 1.5:
+        x *= 100.0
+    return float(clamp(x, 0.0, 100.0))
+
+
+def _pedigree_profile_fit_from_points(
+    brilliant: float,
+    intermediate: float,
+    classic: float,
+    solid: float,
+    professional: float,
+    dist: float,
+    surface: str,
+    is_tokyo1400: bool = False,
+) -> float:
+    """Dosage / Chef profile を距離・コース条件に対する適性スコアへ変換する。"""
+    b = max(0.0, float(brilliant or 0.0))
+    i = max(0.0, float(intermediate or 0.0))
+    c = max(0.0, float(classic or 0.0))
+    s = max(0.0, float(solid or 0.0))
+    p = max(0.0, float(professional or 0.0))
+    raw_total = b + i + c + s + p
+    if raw_total <= 0.0:
+        return 50.0
+    total = max(1e-9, raw_total)
+    speed_share = (1.30 * b + 1.00 * i + 0.55 * c) / total
+    classic_share = c / total
+    stamina_share = (1.25 * p + 1.00 * s + 0.45 * c) / total
+    if surface == 'dirt':
+        if np.isfinite(dist) and dist <= 1400:
+            target_speed, target_classic = 0.62, 0.20
+        elif np.isfinite(dist) and dist <= 1800:
+            target_speed, target_classic = 0.54, 0.24
+        else:
+            target_speed, target_classic = 0.46, 0.28
+    else:
+        if np.isfinite(dist) and dist <= 1400:
+            target_speed, target_classic = 0.64, 0.24
+        elif np.isfinite(dist) and dist <= 1800:
+            target_speed, target_classic = 0.56, 0.29
+        elif np.isfinite(dist) and dist <= 2200:
+            target_speed, target_classic = 0.47, 0.31
+        else:
+            target_speed, target_classic = 0.38, 0.28
+    base = 100.0 - abs(speed_share - target_speed) * 120.0 - abs(classic_share - target_classic) * 60.0
+    excess_stamina = max(0.0, stamina_share - (1.0 - target_speed + 0.08))
+    base -= excess_stamina * 35.0
+    if is_tokyo1400:
+        base += 8.0 * classic_share + 4.0 * speed_share - 2.0 * stamina_share
+    confidence = min(1.0, raw_total / 12.0)
+    base = 50.0 + (base - 50.0) * (0.42 + 0.58 * confidence)
+    return float(clamp(base, 0.0, 100.0))
+
+
+def add_high_granularity_pedigree_features(
+    df: pd.DataFrame,
+    meta: Dict[str, str],
+    params: Optional[dict] = None,
+) -> pd.DataFrame:
+    """高粒度血統特徴を計算して Pedigree* 列を付与する。未入力時は中立 50 に寄せる。"""
+    _ = params or {}
+    d = df.copy()
+    if d is None or len(d) == 0:
+        return d
+
+    dist, surface = _meta_distance_surface(meta)
+    is_tokyo1400 = _is_tokyo_turf_1400(meta)
+
+    dosage_cols = ['dosage_brilliant', 'dosage_intermediate', 'dosage_classic', 'dosage_solid', 'dosage_professional']
+    chef_flag_cols = ['chef_brilliant_flag', 'chef_intermediate_flag', 'chef_classic_flag', 'chef_solid_flag', 'chef_professional_flag']
+    tokyo_emb_cols = [
+        'tokyo1400_slope_lap_rank_emb1', 'tokyo1400_slope_lap_rank_emb2',
+        'tokyo1400_slope_lap_rank_emb3', 'tokyo1400_slope_lap_rank_emb4',
+        'tokyo1400_lap_rank_emb1', 'tokyo1400_lap_rank_emb2',
+        'tokyo1400_lap_rank_emb3', 'tokyo1400_lap_rank_emb4',
+    ]
+
+    bm_scores: list[float] = []
+    cross_scores: list[float] = []
+    dosage_scores: list[float] = []
+    chef_scores: list[float] = []
+    tokyo_scores: list[float] = []
+
+    for _, row in d.iterrows():
+        # 1) Dosage profile
+        dosage_vals = []
+        for c in dosage_cols:
+            try:
+                v = float(row.get(c, np.nan))
+            except Exception:
+                v = float('nan')
+            dosage_vals.append(v if np.isfinite(v) else np.nan)
+        if np.isfinite(np.nansum(dosage_vals)) and np.isfinite(np.sum([np.isfinite(x) for x in dosage_vals])) and np.sum([np.isfinite(x) for x in dosage_vals]) >= 2 and np.nansum(dosage_vals) > 0:
+            b, i, c0, s0, p0 = [max(0.0, float(x) if np.isfinite(x) else 0.0) for x in dosage_vals]
+        else:
+            nums = _pedigree_parse_num_list(row.get('dosage_profile', ''))
+            if len(nums) >= 5:
+                b, i, c0, s0, p0 = [max(0.0, float(x)) for x in nums[:5]]
+            else:
+                b = i = c0 = s0 = p0 = 0.0
+        dosage_fit = _pedigree_profile_fit_from_points(b, i, c0, s0, p0, dist, surface, is_tokyo1400=is_tokyo1400)
+        dosage_scores.append(dosage_fit)
+
+        # 2) Chef-de-race 6分類フラグ相当
+        chef_counts = {'b': 0.0, 'i': 0.0, 'c': 0.0, 's': 0.0, 'p': 0.0}
+        for out_key, col in zip(['b', 'i', 'c', 's', 'p'], chef_flag_cols):
+            try:
+                vv = float(row.get(col, np.nan))
+            except Exception:
+                vv = float('nan')
+            if np.isfinite(vv):
+                chef_counts[out_key] = 1.0 if vv >= 0.5 else 0.0
+        if sum(chef_counts.values()) <= 0.0:
+            parsed = _pedigree_category_counts_from_text(' '.join([
+                str(row.get('chef_race_class', '') or ''),
+                str(row.get('chef_de_race', '') or ''),
+                str(row.get('chef_flags', '') or ''),
+            ]).strip())
+            if sum(parsed.values()) > 0.0:
+                chef_counts = parsed
+        chef_fit = _pedigree_profile_fit_from_points(
+            chef_counts['b'], chef_counts['i'], chef_counts['c'], chef_counts['s'], chef_counts['p'],
+            dist, surface, is_tokyo1400=is_tokyo1400,
+        ) if sum(chef_counts.values()) > 0.0 else 50.0
+        chef_scores.append(chef_fit)
+
+        # 3) BM-Sire2（祖母父）
+        bm_text = ' '.join([
+            str(row.get('bm_sire2', '') or ''),
+            str(row.get('bm_sire2_profile', '') or ''),
+            str(row.get('bm_sire2_type', '') or ''),
+        ]).strip()
+        bm_rates = []
+        for c in ['bm_sire2_tokyo1400_rate', 'bm_sire2_course_rate', 'bm_sire2_distance_rate']:
+            pv = _pedigree_pct_value(row.get(c, np.nan))
+            if np.isfinite(pv):
+                bm_rates.append(pv)
+        bm_counts = _pedigree_category_counts_from_text(bm_text)
+        bm_profile_fit = _pedigree_profile_fit_from_points(
+            bm_counts['b'], bm_counts['i'], bm_counts['c'], bm_counts['s'], bm_counts['p'],
+            dist, surface, is_tokyo1400=is_tokyo1400,
+        ) if sum(bm_counts.values()) > 0.0 else 50.0
+        if bm_rates:
+            bm_rate_fit = float(np.mean(bm_rates))
+            bm_fit = 0.60 * bm_rate_fit + 0.40 * bm_profile_fit
+        else:
+            bm_fit = bm_profile_fit
+        bm_scores.append(float(clamp(bm_fit, 0.0, 100.0)))
+
+        # 4) クロス世代深度
+        raw_cross = ' '.join([
+            str(row.get('cross_depth', '') or ''),
+            str(row.get('cross_pattern', '') or ''),
+            str(row.get('inbreed_depth', '') or ''),
+            str(row.get('inbreed_pattern', '') or ''),
+        ]).strip()
+        try:
+            explicit_cross_depth = float(row.get('cross_depth', np.nan))
+        except Exception:
+            explicit_cross_depth = float('nan')
+        density = 0.0
+        if np.isfinite(explicit_cross_depth):
+            avg_depth = explicit_cross_depth
+            density = 1.0
+        else:
+            nums = _pedigree_parse_num_list(raw_cross)
+            if len(nums) >= 2 and (('X' in raw_cross.upper()) or ('×' in raw_cross)):
+                pair_vals = []
+                for i_pair in range(0, len(nums) - 1, 2):
+                    pair_vals.append((nums[i_pair] + nums[i_pair + 1]) / 2.0)
+                avg_depth = float(np.mean(pair_vals)) if pair_vals else float('nan')
+                density = float(len(pair_vals))
+            elif nums:
+                avg_depth = float(np.mean(nums[:min(4, len(nums))]))
+                density = float(len(nums[:min(4, len(nums))]))
+            else:
+                avg_depth = float('nan')
+        if np.isfinite(dist) and dist <= 1400:
+            target_depth = 3.9
+        elif np.isfinite(dist) and dist <= 1800:
+            target_depth = 4.2
+        elif np.isfinite(dist) and dist <= 2200:
+            target_depth = 4.6
+        else:
+            target_depth = 4.9
+        if np.isfinite(avg_depth):
+            cross_fit = 100.0 - abs(avg_depth - target_depth) * 18.0 - max(0.0, density - 3.0) * 4.0
+            if is_tokyo1400 and 3.5 <= avg_depth <= 4.5:
+                cross_fit += 6.0
+            cross_fit = float(clamp(cross_fit, 0.0, 100.0))
+        else:
+            cross_fit = 50.0
+        cross_scores.append(cross_fit)
+
+        # 5) 東京芝1400 坂上ラップ順位分布 embedding
+        emb_vals = []
+        for c in tokyo_emb_cols:
+            try:
+                ev = float(row.get(c, np.nan))
+            except Exception:
+                ev = float('nan')
+            if np.isfinite(ev):
+                emb_vals.append(ev)
+        if emb_vals:
+            emb4 = emb_vals[:4] + [0.0] * max(0, 4 - len(emb_vals[:4]))
+            tokyo_fit = 50.0 + 18.0 * emb4[0] + 12.0 * emb4[1] - 8.0 * abs(emb4[2]) + 6.0 * emb4[3]
+        else:
+            mean_rank = _pedigree_pct_value(row.get('tokyo1400_slope_lap_rank_mean', np.nan))
+            median_rank = _pedigree_pct_value(row.get('tokyo1400_slope_lap_rank_median', np.nan))
+            top3_rate = _pedigree_pct_value(row.get('tokyo1400_slope_lap_rank_top3_rate', np.nan))
+            top5_rate = _pedigree_pct_value(row.get('tokyo1400_slope_lap_rank_top5_rate', np.nan))
+            stat_parts = []
+            if np.isfinite(mean_rank) and mean_rank > 1.5:
+                stat_parts.append(clamp(100.0 - (mean_rank - 1.0) * 100.0 / 17.0, 0.0, 100.0))
+            if np.isfinite(median_rank) and median_rank > 1.5:
+                stat_parts.append(clamp(100.0 - (median_rank - 1.0) * 100.0 / 17.0, 0.0, 100.0))
+            if np.isfinite(top3_rate):
+                stat_parts.append(top3_rate)
+            if np.isfinite(top5_rate):
+                stat_parts.append(0.8 * top5_rate)
+            if stat_parts:
+                tokyo_fit = float(np.mean(stat_parts))
+            elif is_tokyo1400:
+                tokyo_fit = 0.55 * dosage_fit + 0.25 * bm_scores[-1] + 0.20 * cross_fit
+            else:
+                tokyo_fit = 50.0
+        if not is_tokyo1400:
+            tokyo_fit = 50.0 + (float(tokyo_fit) - 50.0) * 0.55
+        tokyo_scores.append(float(clamp(tokyo_fit, 0.0, 100.0)))
+
+    d['PedigreeBmSire2Fit'] = _num_series(pd.Series(bm_scores, index=d.index), 50.0, index=d.index, lower=0.0, upper=100.0)
+    d['PedigreeCrossDepthFit'] = _num_series(pd.Series(cross_scores, index=d.index), 50.0, index=d.index, lower=0.0, upper=100.0)
+    d['PedigreeDosageFit'] = _num_series(pd.Series(dosage_scores, index=d.index), 50.0, index=d.index, lower=0.0, upper=100.0)
+    d['PedigreeChefRaceFit'] = _num_series(pd.Series(chef_scores, index=d.index), 50.0, index=d.index, lower=0.0, upper=100.0)
+    d['PedigreeTokyo1400LapFit'] = _num_series(pd.Series(tokyo_scores, index=d.index), 50.0, index=d.index, lower=0.0, upper=100.0)
+
+    if is_tokyo1400:
+        fine_w = {'bm': 0.18, 'cross': 0.18, 'dosage': 0.22, 'chef': 0.14, 'tokyo': 0.28}
+    else:
+        fine_w = {'bm': 0.20, 'cross': 0.20, 'dosage': 0.28, 'chef': 0.18, 'tokyo': 0.14}
+    pedigree_fine = (
+        fine_w['bm'] * d['PedigreeBmSire2Fit']
+        + fine_w['cross'] * d['PedigreeCrossDepthFit']
+        + fine_w['dosage'] * d['PedigreeDosageFit']
+        + fine_w['chef'] * d['PedigreeChefRaceFit']
+        + fine_w['tokyo'] * d['PedigreeTokyo1400LapFit']
+    ) / max(1e-9, float(sum(fine_w.values())))
+    signal_count = (
+        (d['PedigreeBmSire2Fit'].sub(50.0).abs() >= 1.0).astype(float)
+        + (d['PedigreeCrossDepthFit'].sub(50.0).abs() >= 1.0).astype(float)
+        + (d['PedigreeDosageFit'].sub(50.0).abs() >= 1.0).astype(float)
+        + (d['PedigreeChefRaceFit'].sub(50.0).abs() >= 1.0).astype(float)
+        + (d['PedigreeTokyo1400LapFit'].sub(50.0).abs() >= 1.0).astype(float)
+    )
+    confidence_scale = (0.45 + 0.11 * signal_count).clip(lower=0.45, upper=1.0)
+    d['PedigreeFineFit'] = _num_series(50.0 + (pedigree_fine - 50.0) * confidence_scale, 50.0, index=d.index, lower=0.0, upper=100.0)
+    d['PedigreeFineDelta'] = (d['PedigreeFineFit'] - 50.0).clip(lower=-20.0, upper=20.0).astype(float)
+    return d
+
+
 def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: Optional[dict] = None) -> pd.DataFrame:
     """競馬場コース特性を既存特徴量へ落とし込み、CourseProfileFit 系列を付与する。"""
     _ = params or {}
     d = df.copy()
     if d is None or len(d) == 0:
         return d
-
+    d = add_high_granularity_pedigree_features(d, meta, params)
     venue, surface, profile = _resolve_course_profile(meta)
     dist, _ = _meta_distance_surface(meta)
     style_bias = dict(profile.get('style_bias', {}) or {})
@@ -13800,6 +14116,12 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     distance_style_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     distance_draw_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     distance_specific_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+    pedigree_bm_fit = _num_series(d.get('PedigreeBmSire2Fit', 50.0), 50.0, index=d.index)
+    pedigree_cross_fit = _num_series(d.get('PedigreeCrossDepthFit', 50.0), 50.0, index=d.index)
+    pedigree_dosage_fit = _num_series(d.get('PedigreeDosageFit', 50.0), 50.0, index=d.index)
+    pedigree_chef_fit = _num_series(d.get('PedigreeChefRaceFit', 50.0), 50.0, index=d.index)
+    pedigree_tokyo1400_fit = _num_series(d.get('PedigreeTokyo1400LapFit', 50.0), 50.0, index=d.index)
+    pedigree_fine_fit = _num_series(d.get('PedigreeFineFit', 50.0), 50.0, index=d.index)
 
     if distance_key:
         if distance_style_bias:
@@ -13878,12 +14200,15 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
                 class_pace_fit = (class_pace_fit + style_col.map(lambda z: 3.0 if z == 'FRONT' else (1.0 if z == 'MIDDLE' else -1.5)).astype(float)).clip(lower=0.0, upper=100.0)
 
         tokyo1400_fit = (
-            0.28 * rail_bias_fit
-            + 0.32 * class_pace_fit
-            + 0.14 * late_speed
-            + 0.10 * speed_fit
-            + 0.08 * straight_fit
-            + 0.08 * power_fit
+            0.24 * rail_bias_fit
+            + 0.26 * class_pace_fit
+            + 0.12 * late_speed
+            + 0.08 * speed_fit
+            + 0.07 * straight_fit
+            + 0.07 * power_fit
+            + 0.10 * pedigree_tokyo1400_fit
+            + 0.04 * pedigree_dosage_fit
+            + 0.02 * pedigree_bm_fit
         ).clip(lower=0.0, upper=100.0)
         if _is_wet_track(meta):
             tokyo1400_fit = (tokyo1400_fit + 0.14 * (power_fit - 50.0) + 0.06 * (michfit - 50.0)).clip(lower=0.0, upper=100.0)
@@ -13897,10 +14222,12 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     gate_w = 0.05 + 0.05 * float(profile.get('gate', 0.5) or 0.5)
     agility_w = 0.07 + 0.08 * float(profile.get('agility', 0.5) or 0.5)
     distance_w = (0.07 + 0.04 * distance_confidence) if distance_key else 0.0
+    pedigree_w = 0.07
+    pedigree_tokyo_w = 0.03 if is_tokyo1400 else 0.0
     rail_w = 0.05 if is_tokyo1400 else 0.0
     classpace_w = 0.06 if is_tokyo1400 else 0.0
     tokyo_w = 0.08 if is_tokyo1400 else 0.0
-    total_w = style_w + straight_w + corner_w + stamina_w + power_w + speed_w + gate_w + agility_w + distance_w + rail_w + classpace_w + tokyo_w
+    total_w = style_w + straight_w + corner_w + stamina_w + power_w + speed_w + gate_w + agility_w + distance_w + pedigree_w + pedigree_tokyo_w + rail_w + classpace_w + tokyo_w
 
     d['CourseStyleFit'] = _num_series(style_fit, 50.0, index=d.index)
     d['CourseStraightFit'] = _num_series(straight_fit, 50.0, index=d.index)
@@ -13912,6 +14239,8 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     d['CourseDistanceStyleFit'] = _num_series(distance_style_fit, 50.0, index=d.index)
     d['CourseDistanceDrawFit'] = _num_series(distance_draw_fit, 50.0, index=d.index)
     d['CourseDistanceSpecificFit'] = _num_series(distance_specific_fit, 50.0, index=d.index)
+    d['CoursePedigreeFineFit'] = _num_series(pedigree_fine_fit, 50.0, index=d.index)
+    d['CoursePedigreeTokyo1400Fit'] = _num_series(pedigree_tokyo1400_fit, 50.0, index=d.index)
     d['CourseRailBiasFit'] = _num_series(rail_bias_fit, 50.0, index=d.index)
     d['CourseClassPaceFit'] = _num_series(class_pace_fit, 50.0, index=d.index)
     d['CourseTokyo1400Fit'] = _num_series(tokyo1400_fit, 50.0, index=d.index)
@@ -13925,6 +14254,8 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
         + gate_w * gatefit
         + agility_w * d['CourseAgilityFit']
         + distance_w * d['CourseDistanceSpecificFit']
+        + pedigree_w * d['CoursePedigreeFineFit']
+        + pedigree_tokyo_w * d['CoursePedigreeTokyo1400Fit']
         + rail_w * d['CourseRailBiasFit']
         + classpace_w * d['CourseClassPaceFit']
         + tokyo_w * d['CourseTokyo1400Fit']
@@ -20124,6 +20455,58 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "WinOdds": "win_odds",
         "odds": "win_odds",
         "オッズ": "win_odds",
+        # pedigree fine-grained features
+        "祖母父": "bm_sire2",
+        "BM-Sire2": "bm_sire2",
+        "BMSire2": "bm_sire2",
+        "bm_sire2": "bm_sire2",
+        "ブロードメアサイアー2": "bm_sire2",
+        "クロス世代深度": "cross_depth",
+        "クロス深度": "cross_depth",
+        "inbreed_depth": "cross_depth",
+        "cross_depth": "cross_depth",
+        "cross_generation_depth": "cross_depth",
+        "クロス": "cross_pattern",
+        "インブリード": "cross_pattern",
+        "cross_pattern": "cross_pattern",
+        "inbreed_pattern": "cross_pattern",
+        "Dosage": "dosage_profile",
+        "dosage": "dosage_profile",
+        "DP": "dosage_profile",
+        "ドサージュ": "dosage_profile",
+        "Brilliant": "dosage_brilliant",
+        "Intermediate": "dosage_intermediate",
+        "Classic": "dosage_classic",
+        "Solid": "dosage_solid",
+        "Professional": "dosage_professional",
+        "dosage_brilliant": "dosage_brilliant",
+        "dosage_intermediate": "dosage_intermediate",
+        "dosage_classic": "dosage_classic",
+        "dosage_solid": "dosage_solid",
+        "dosage_professional": "dosage_professional",
+        "シェフドレース": "chef_race_class",
+        "シェフ・ド・レース": "chef_race_class",
+        "chef_de_race": "chef_race_class",
+        "chef_race": "chef_race_class",
+        "chef_race_class": "chef_race_class",
+        "chef_flags": "chef_flags",
+        "シェフB": "chef_brilliant_flag",
+        "シェフI": "chef_intermediate_flag",
+        "シェフC": "chef_classic_flag",
+        "シェフS": "chef_solid_flag",
+        "シェフP": "chef_professional_flag",
+        "東京芝1400坂上ラップ順位平均": "tokyo1400_slope_lap_rank_mean",
+        "東京芝1400坂上ラップ順位中央値": "tokyo1400_slope_lap_rank_median",
+        "東京芝1400坂上ラップ順位TOP3率": "tokyo1400_slope_lap_rank_top3_rate",
+        "東京芝1400坂上ラップ順位TOP5率": "tokyo1400_slope_lap_rank_top5_rate",
+        "tokyo1400_slope_lap_rank_mean": "tokyo1400_slope_lap_rank_mean",
+        "tokyo1400_slope_lap_rank_median": "tokyo1400_slope_lap_rank_median",
+        "tokyo1400_slope_lap_rank_top3_rate": "tokyo1400_slope_lap_rank_top3_rate",
+        "tokyo1400_slope_lap_rank_top5_rate": "tokyo1400_slope_lap_rank_top5_rate",
+        "tokyo1400_slope_lap_rank_emb1": "tokyo1400_slope_lap_rank_emb1",
+        "tokyo1400_slope_lap_rank_emb2": "tokyo1400_slope_lap_rank_emb2",
+        "tokyo1400_slope_lap_rank_emb3": "tokyo1400_slope_lap_rank_emb3",
+        "tokyo1400_slope_lap_rank_emb4": "tokyo1400_slope_lap_rank_emb4",
         # R24: 昇級点列（IMP-5 ClassUpBonus 用）
         '昇級点':    'class_up_point',
         'class_up': 'class_up_point',
