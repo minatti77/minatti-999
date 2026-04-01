@@ -1,0 +1,945 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🏇 STELLA 競馬予想 スーパーエージェント</title>
+<style>
+/* ─── リセット ─── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", sans-serif;
+  background: #0a0d14;
+  color: #dde3ee;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ─── ヘッダー ─── */
+header {
+  background: linear-gradient(135deg, #131826 0%, #0e1520 100%);
+  border-bottom: 1px solid #1e2a3d;
+  padding: 10px 20px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+  min-height: 56px;
+}
+.logo-wrap { display: flex; align-items: center; gap: 10px; }
+.logo-icon { font-size: 26px; line-height: 1; }
+.logo-title { font-size: 17px; font-weight: 800; color: #f6c90e; letter-spacing: 0.06em; }
+.logo-sub   { font-size: 11px; color: #6b7fa0; margin-top: 1px; }
+.header-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.badge-online {
+  background: #16423011;
+  border: 1px solid #22c55e55;
+  color: #22c55e;
+  padding: 3px 12px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex; align-items: center; gap: 5px;
+}
+.badge-online::before {
+  content: "";
+  width: 6px; height: 6px;
+  background: #22c55e;
+  border-radius: 50%;
+  animation: pulse 2s infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+/* ─── メインレイアウト ─── */
+main {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+/* ─── 左：チャットパネル ─── */
+#chat-panel {
+  width: 380px;
+  min-width: 300px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid #1e2a3d;
+  background: #0a0d14;
+  flex-shrink: 0;
+}
+
+#chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  scroll-behavior: smooth;
+}
+
+/* ─── メッセージ ─── */
+.msg { display: flex; gap: 10px; max-width: 100%; animation: fadeSlide .22s ease; }
+@keyframes fadeSlide {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+.msg.user { flex-direction: row-reverse; }
+.msg .av {
+  width: 30px; height: 30px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 15px; flex-shrink: 0;
+  background: #141c2e;
+}
+.msg.user .av { background: #1c2e4a; }
+.msg .bbl {
+  background: #141c2e;
+  border: 1px solid #1e2a3d;
+  border-radius: 14px 14px 14px 3px;
+  padding: 10px 14px;
+  max-width: calc(100% - 44px);
+  line-height: 1.7;
+  font-size: 13.5px;
+  word-break: break-word;
+}
+.msg.user .bbl {
+  background: #152545;
+  border-color: #1e4080;
+  border-radius: 14px 14px 3px 14px;
+  color: #b8d0f8;
+}
+.msg .bbl h1, .msg .bbl h2, .msg .bbl h3 {
+  color: #f6c90e; font-size: 13.5px; margin: 8px 0 4px;
+}
+.msg .bbl table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 12px; }
+.msg .bbl th, .msg .bbl td { border: 1px solid #1e2a3d; padding: 4px 8px; text-align: left; }
+.msg .bbl th { background: #101828; color: #6b7fa0; }
+.msg .bbl strong { color: #f6c90e; }
+.msg .bbl code { background: #0a0d14; border: 1px solid #1e2a3d; border-radius: 3px; padding: 1px 4px; font-size: 11.5px; }
+.msg .bbl ul, .msg .bbl ol { padding-left: 16px; }
+.msg .bbl li { margin: 3px 0; }
+.msg .bbl p  { margin: 4px 0; }
+.msg .bbl hr { border-color: #1e2a3d; margin: 6px 0; }
+
+/* ─── タイピング ─── */
+.typing { display: flex; gap: 5px; padding: 8px 12px; }
+.typing span {
+  width: 7px; height: 7px;
+  background: #3a4a62; border-radius: 50%;
+  animation: bounce 1.3s infinite;
+}
+.typing span:nth-child(2) { animation-delay: .2s; }
+.typing span:nth-child(3) { animation-delay: .4s; }
+@keyframes bounce {
+  0%, 80%, 100% { transform: translateY(0); background: #3a4a62; }
+  40% { transform: translateY(-8px); background: #f6c90e; }
+}
+
+/* ─── 入力欄 ─── */
+#input-area {
+  border-top: 1px solid #1e2a3d;
+  padding: 10px 12px;
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  background: #0a0d14;
+}
+#msg-input {
+  flex: 1;
+  background: #141c2e;
+  border: 1px solid #1e2a3d;
+  border-radius: 12px;
+  color: #dde3ee;
+  padding: 9px 13px;
+  font-size: 13.5px;
+  resize: none;
+  min-height: 40px;
+  max-height: 110px;
+  outline: none;
+  line-height: 1.5;
+  font-family: inherit;
+  transition: border-color .2s;
+}
+#msg-input:focus  { border-color: #f6c90e66; }
+#msg-input::placeholder { color: #3a4a62; }
+#send-btn {
+  background: #f6c90e;
+  border: none;
+  border-radius: 10px;
+  width: 40px; height: 40px;
+  cursor: pointer;
+  font-size: 17px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  transition: background .15s, transform .1s;
+  color: #0a0d14;
+}
+#send-btn:hover  { background: #ffd93d; transform: scale(1.06); }
+#send-btn:active { transform: scale(0.96); }
+
+/* ─── 右：作業パネル ─── */
+#work-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #0b0e18;
+}
+
+/* ─── タブ ─── */
+#tabs {
+  display: flex;
+  border-bottom: 1px solid #1e2a3d;
+  background: #0e1520;
+  flex-shrink: 0;
+}
+.tab-btn {
+  padding: 12px 20px;
+  border: none;
+  background: transparent;
+  color: #5a6a82;
+  font-size: 13px;
+  cursor: pointer;
+  font-family: inherit;
+  font-weight: 600;
+  border-bottom: 2px solid transparent;
+  transition: all .15s;
+  display: flex; align-items: center; gap: 6px;
+}
+.tab-btn:hover  { color: #a0b0c8; }
+.tab-btn.active { color: #f6c90e; border-bottom-color: #f6c90e; }
+
+/* ─── タブコンテンツ ─── */
+.tab-content { display: none; flex: 1; overflow: hidden; }
+.tab-content.active { display: flex; flex-direction: column; }
+.tab-inner { flex: 1; overflow-y: auto; padding: 24px; }
+
+/* ─── アップロードエリア ─── */
+.section-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #f6c90e;
+  margin-bottom: 16px;
+  display: flex; align-items: center; gap: 8px;
+}
+
+.upload-hint {
+  background: #141c2e;
+  border: 1px solid #1e2a3d;
+  border-radius: 10px;
+  padding: 12px 16px;
+  font-size: 12.5px;
+  color: #6b7fa0;
+  margin-bottom: 16px;
+  line-height: 1.6;
+}
+.upload-hint strong { color: #94a3b8; }
+
+.upload-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+/* ─── ドラッグ&ドロップカード ─── */
+.up-card {
+  background: #141c2e;
+  border: 2px dashed #1e2a3d;
+  border-radius: 11px;
+  padding: 14px 10px;
+  cursor: pointer;
+  transition: border-color .2s, background .2s, transform .1s;
+  position: relative;
+  text-align: center;
+  min-height: 100px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+}
+.up-card:hover    { border-color: #f6c90e66; background: #16213066; transform: translateY(-1px); }
+.up-card.required { border-color: #2563eb44; }
+.up-card.drag-over{ border-color: #f6c90e; background: #2c230a22; }
+.up-card.has-file { border-color: #22c55e99; background: #0a2016; border-style: solid; }
+.up-card.has-file::after {
+  content: "✅";
+  position: absolute;
+  top: 6px; right: 8px;
+  font-size: 13px;
+}
+.up-card input[type=file] {
+  position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+}
+.up-card .ci  { font-size: 24px; margin-bottom: 6px; }
+.up-card .cl  { font-size: 12px; font-weight: 700; color: #b0bec5; margin-bottom: 3px; }
+.up-card .cs  { font-size: 10.5px; color: #4a5a72; }
+.up-card .cbg {
+  display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 8px;
+  margin-top: 4px; font-weight: 700;
+}
+.cbg-req { background: #1a3a6a22; color: #4a9aff; border: 1px solid #1a3a6a; }
+.cbg-opt { background: #2a2a3a22; color: #7888a0; border: 1px solid #2a2a3a; }
+.up-card .prev-img {
+  width: 100%; height: 60px; object-fit: cover;
+  border-radius: 6px; margin-top: 8px; display: none;
+}
+.up-card.has-file .prev-img { display: block; }
+
+/* ─── 実行ボタン ─── */
+#run-btn {
+  width: 100%;
+  padding: 13px;
+  background: linear-gradient(135deg, #f6c90e, #f59e0b);
+  border: none;
+  border-radius: 11px;
+  font-size: 15px;
+  font-weight: 800;
+  color: #0a0d14;
+  cursor: pointer;
+  transition: opacity .2s, transform .1s, box-shadow .2s;
+  letter-spacing: 0.05em;
+  margin-bottom: 14px;
+  box-shadow: 0 4px 20px #f6c90e22;
+}
+#run-btn:hover    { opacity: 0.91; transform: translateY(-1px); box-shadow: 0 6px 28px #f6c90e33; }
+#run-btn:active   { transform: translateY(0); }
+#run-btn:disabled { opacity: 0.35; cursor: not-allowed; transform: none; box-shadow: none; }
+
+.opt-row {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 12.5px; color: #6b7fa0;
+  margin-bottom: 14px; cursor: pointer;
+}
+.opt-row input { accent-color: #f6c90e; width: 14px; height: 14px; cursor: pointer; }
+
+/* ─── 進捗 ─── */
+#progress-wrap {
+  display: none;
+  background: #141c2e;
+  border: 1px solid #1e2a3d;
+  border-radius: 10px;
+  padding: 14px;
+  margin-top: 4px;
+}
+#progress-wrap.show { display: block; }
+
+.prog-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 10px;
+}
+.prog-label  { font-size: 12.5px; font-weight: 600; color: #94a3b8; }
+.prog-time   { font-size: 11px; color: #4a5a72; font-variant-numeric: tabular-nums; }
+
+.prog-bar-bg {
+  background: #0a0d14;
+  border-radius: 6px; height: 7px; overflow: hidden; margin-bottom: 10px;
+}
+#progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #f6c90e, #22c55e);
+  width: 0%;
+  transition: width .5s ease;
+  border-radius: 6px;
+}
+#progress-bar.error   { background: #ef4444; }
+#progress-bar.success { background: #22c55e; }
+
+#progress-log {
+  font-size: 11.5px;
+  color: #4a5a72;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  max-height: 120px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  line-height: 1.55;
+}
+
+/* ─── 結果 ─── */
+.result-actions {
+  display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap;
+}
+.result-actions button {
+  padding: 7px 14px; border-radius: 8px;
+  border: 1px solid #1e2a3d; background: #141c2e;
+  color: #7888a0; cursor: pointer; font-size: 12.5px;
+  font-family: inherit; transition: all .15s;
+}
+.result-actions button:hover { border-color: #f6c90e55; color: #f6c90e; }
+
+#result-md {
+  background: #141c2e;
+  border: 1px solid #1e2a3d;
+  border-radius: 12px;
+  padding: 20px 24px;
+  line-height: 1.85;
+  font-size: 13.5px;
+}
+#result-md h1 { color: #f6c90e; font-size: 17px; border-bottom: 1px solid #1e2a3d; padding-bottom: 8px; margin: 16px 0 10px; }
+#result-md h2 { color: #f6c90e; font-size: 15px; margin: 14px 0 8px; }
+#result-md h3 { color: #d4a017; font-size: 13.5px; margin: 12px 0 6px; }
+#result-md table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+#result-md th, #result-md td { border: 1px solid #1e2a3d; padding: 6px 12px; text-align: left; font-size: 13px; }
+#result-md th { background: #0e1520; color: #6b7fa0; }
+#result-md tr:nth-child(even) td { background: #0f1728; }
+#result-md tr:hover td { background: #141f35; }
+#result-md strong { color: #f6c90e; }
+#result-md code   { background: #0a0d14; border: 1px solid #1e2a3d; border-radius: 4px; padding: 2px 6px; font-family: monospace; font-size: 12px; }
+#result-md pre    { background: #0a0d14; border: 1px solid #1e2a3d; border-radius: 8px; padding: 14px; overflow-x: auto; margin: 10px 0; }
+#result-md pre code { border: none; background: transparent; }
+#result-md hr     { border-color: #1e2a3d; margin: 14px 0; }
+#result-md ul, #result-md ol { padding-left: 20px; }
+#result-md li { margin: 4px 0; }
+#result-md blockquote { border-left: 3px solid #f6c90e44; padding-left: 14px; color: #8899b0; margin: 8px 0; }
+
+/* ─── ガイドタブ ─── */
+.guide-card {
+  background: #141c2e;
+  border: 1px solid #1e2a3d;
+  border-radius: 11px;
+  padding: 16px 18px;
+  margin-bottom: 14px;
+}
+.guide-card h3 { color: #f6c90e; font-size: 13.5px; margin-bottom: 8px; }
+.guide-card p, .guide-card li { color: #8899b0; font-size: 13px; line-height: 1.7; }
+.guide-card ul { padding-left: 18px; }
+.guide-card code { background: #0a0d14; border-radius: 4px; padding: 2px 6px; font-size: 12px; color: #94a3b8; }
+.step-num {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: #f6c90e; color: #0a0d14;
+  font-size: 12px; font-weight: 800; margin-right: 8px; flex-shrink: 0;
+}
+.step-row { display: flex; align-items: flex-start; gap: 4px; margin-bottom: 10px; font-size: 13px; color: #8899b0; line-height: 1.6; }
+
+/* ─── スクロールバー ─── */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1e2a3d; border-radius: 3px; }
+
+/* ─── レスポンシブ ─── */
+@media (max-width: 740px) {
+  main { flex-direction: column; }
+  #chat-panel { width: 100%; min-width: unset; max-height: 40dvh; border-right: none; border-bottom: 1px solid #1e2a3d; flex-shrink: 0; }
+  .upload-grid { grid-template-columns: repeat(2, 1fr); }
+  .tab-inner { padding: 16px; }
+}
+@media (max-width: 460px) {
+  .upload-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- ヘッダー -->
+<header>
+  <div class="logo-wrap">
+    <div class="logo-icon">🏇</div>
+    <div>
+      <div class="logo-title">STELLA 競馬予想</div>
+      <div class="logo-sub">v1.33 — ルールベース予想エンジン</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="badge-online">稼働中</div>
+  </div>
+</header>
+
+<main>
+  <!-- ── 左：チャット ── -->
+  <div id="chat-panel">
+    <div id="chat-messages">
+      <div class="msg bot">
+        <div class="av">🤖</div>
+        <div class="bbl">
+          <strong>STELLA へようこそ！🏇</strong><br><br>
+          <strong>「競馬予想」</strong> と入力するだけで予想を開始できます。<br><br>
+          📸 レイティング表とスピード指数表の画像（スクリーンショット可）を用意してください。
+        </div>
+      </div>
+    </div>
+    <div id="input-area">
+      <textarea id="msg-input" placeholder="「競馬予想」と入力..." rows="1"></textarea>
+      <button id="send-btn" title="送信">➤</button>
+    </div>
+  </div>
+
+  <!-- ── 右：作業パネル ── -->
+  <div id="work-panel">
+    <div id="tabs">
+      <button class="tab-btn active" data-tab="upload" onclick="switchTab('upload')">
+        📸 画像アップロード
+      </button>
+      <button class="tab-btn" data-tab="result" id="tab-result-btn" onclick="switchTab('result')" style="display:none;">
+        🏆 予想結果
+      </button>
+      <button class="tab-btn" data-tab="guide" onclick="switchTab('guide')">
+        📖 使い方
+      </button>
+    </div>
+
+    <!-- アップロードタブ -->
+    <div class="tab-content active" id="tab-upload">
+      <div class="tab-inner">
+        <div class="section-title">📸 レース画像をアップロード</div>
+
+        <div class="upload-hint">
+          <strong>ドラッグ&ドロップ</strong>またはクリックで画像を選択できます。
+          スマホのスクリーンショットも対応（jpg/png/webp）。<br>
+          ✅ 必須：レイティング表・スピード指数表 &nbsp;｜&nbsp; 任意：その他画像は精度向上に貢献します。
+        </div>
+
+        <div class="upload-grid">
+          <div class="up-card required" id="card-rating" ondragover="dragOver(event,'rating')" ondragleave="dragLeave('rating')" ondrop="dropFile(event,'rating')">
+            <div class="ci">📊</div>
+            <div class="cl">レイティング表</div>
+            <div class="cs">rating_img</div>
+            <div class="cbg cbg-req">✅ 必須</div>
+            <img class="prev-img" id="prev-rating" alt="">
+            <input type="file" id="file-rating" accept="image/*" onchange="onFileChange('rating')">
+          </div>
+
+          <div class="up-card required" id="card-speed" ondragover="dragOver(event,'speed')" ondragleave="dragLeave('speed')" ondrop="dropFile(event,'speed')">
+            <div class="ci">⚡</div>
+            <div class="cl">スピード指数表</div>
+            <div class="cs">speed_index_img</div>
+            <div class="cbg cbg-req">✅ 必須</div>
+            <img class="prev-img" id="prev-speed" alt="">
+            <input type="file" id="file-speed" accept="image/*" onchange="onFileChange('speed')">
+          </div>
+
+          <div class="up-card" id="card-meta" ondragover="dragOver(event,'meta')" ondragleave="dragLeave('meta')" ondrop="dropFile(event,'meta')">
+            <div class="ci">📋</div>
+            <div class="cl">レース情報</div>
+            <div class="cs">meta_img</div>
+            <div class="cbg cbg-opt">任意</div>
+            <img class="prev-img" id="prev-meta" alt="">
+            <input type="file" id="file-meta" accept="image/*" onchange="onFileChange('meta')">
+          </div>
+
+          <div class="up-card" id="card-factor" ondragover="dragOver(event,'factor')" ondragleave="dragLeave('factor')" ondrop="dropFile(event,'factor')">
+            <div class="ci">🔍</div>
+            <div class="cl">ファクター表</div>
+            <div class="cs">factor_img</div>
+            <div class="cbg cbg-opt">任意</div>
+            <img class="prev-img" id="prev-factor" alt="">
+            <input type="file" id="file-factor" accept="image/*" onchange="onFileChange('factor')">
+          </div>
+
+          <div class="up-card" id="card-aitime" ondragover="dragOver(event,'aitime')" ondragleave="dragLeave('aitime')" ondrop="dropFile(event,'aitime')">
+            <div class="ci">🤖</div>
+            <div class="cl">AI展開予測</div>
+            <div class="cs">ai_time_img</div>
+            <div class="cbg cbg-opt">任意</div>
+            <img class="prev-img" id="prev-aitime" alt="">
+            <input type="file" id="file-aitime" accept="image/*" onchange="onFileChange('aitime')">
+          </div>
+
+          <div class="up-card" id="card-track" ondragover="dragOver(event,'track')" ondragleave="dragLeave('track')" ondrop="dropFile(event,'track')">
+            <div class="ci">🌿</div>
+            <div class="cl">馬場状態</div>
+            <div class="cs">track_imgs</div>
+            <div class="cbg cbg-opt">任意</div>
+            <img class="prev-img" id="prev-track" alt="">
+            <input type="file" id="file-track" accept="image/*" onchange="onFileChange('track')">
+          </div>
+        </div>
+
+        <label class="opt-row">
+          <input type="checkbox" id="fast-mode">
+          ⚡ 高速モード（精度を少し下げて処理を高速化）
+        </label>
+
+        <button id="run-btn" onclick="runPredict()" disabled>
+          🏇 予想を開始する
+        </button>
+
+        <div id="progress-wrap">
+          <div class="prog-header">
+            <span class="prog-label" id="prog-label">処理中...</span>
+            <span class="prog-time" id="prog-time">0s</span>
+          </div>
+          <div class="prog-bar-bg">
+            <div id="progress-bar"></div>
+          </div>
+          <div id="progress-log">待機中...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 結果タブ -->
+    <div class="tab-content" id="tab-result">
+      <div class="tab-inner">
+        <div class="section-title">🏆 STELLA 予想結果</div>
+        <div class="result-actions">
+          <button onclick="copyResult()">📋 コピー</button>
+          <button onclick="downloadResult()">💾 Markdown保存</button>
+          <button onclick="newRace()">🔄 別レースを予想</button>
+        </div>
+        <div id="result-md">（予想結果がここに表示されます）</div>
+      </div>
+    </div>
+
+    <!-- 使い方タブ -->
+    <div class="tab-content" id="tab-guide">
+      <div class="tab-inner">
+        <div class="section-title">📖 STELLA の使い方</div>
+
+        <div class="guide-card">
+          <h3>🚀 基本の使い方（3ステップ）</h3>
+          <div class="step-row"><span class="step-num">1</span>左のチャットに <strong>「競馬予想」</strong> と入力</div>
+          <div class="step-row"><span class="step-num">2</span>「📸 画像アップロード」タブで画像をアップロード</div>
+          <div class="step-row"><span class="step-num">3</span>「🏇 予想を開始する」ボタンをクリック</div>
+        </div>
+
+        <div class="guide-card">
+          <h3>📸 必要な画像</h3>
+          <ul>
+            <li><strong>レイティング表</strong>（必須） — 各馬のレイティング一覧</li>
+            <li><strong>スピード指数表</strong>（必須） — 各馬のスピード指数</li>
+            <li>レース情報（任意） — 距離・馬場・クラス等</li>
+            <li>ファクター表（任意） — 脚質・ペース等</li>
+            <li>AI展開予測（任意） — AI時計・展開予測</li>
+            <li>馬場状態（任意） — 馬場状態詳細</li>
+          </ul>
+        </div>
+
+        <div class="guide-card">
+          <h3>💡 ヒント</h3>
+          <ul>
+            <li>スマホのスクリーンショット（jpg/png）でOK</li>
+            <li>ドラッグ&ドロップでアップロード可能</li>
+            <li>OCR処理のため <strong>数十秒〜数分</strong> かかります</li>
+            <li>⚡ 高速モードは処理時間を短縮できます</li>
+          </ul>
+        </div>
+
+        <div class="guide-card">
+          <h3>🤖 チャットコマンド</h3>
+          <ul>
+            <li><code>競馬予想</code> — 予想モードを開始</li>
+            <li><code>使い方</code> / <code>ヘルプ</code> — 使い方を表示</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- marked.js -->
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+// ─────────────────────────────────────────
+//  状態
+// ─────────────────────────────────────────
+const files = {
+  rating: null, speed: null, meta: null,
+  factor: null, aitime: null, track: null
+};
+let currentJobId   = null;
+let pollTimer      = null;
+let resultMarkdown = "";
+let elapsed        = 0;
+let elapsedTimer   = null;
+
+// ─────────────────────────────────────────
+//  タブ切替
+// ─────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+  document.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
+  document.querySelector(`[data-tab="${name}"]`).classList.add("active");
+  document.getElementById(`tab-${name}`).classList.add("active");
+}
+
+// ─────────────────────────────────────────
+//  ファイル選択
+// ─────────────────────────────────────────
+function setFile(key, f) {
+  if (!f) return;
+  files[key] = f;
+  const card = document.getElementById(`card-${key}`);
+  const prev = document.getElementById(`prev-${key}`);
+  card.classList.add("has-file");
+  card.querySelector(".cl").textContent = f.name.length > 18
+    ? f.name.slice(0, 16) + "…"
+    : f.name;
+  if (prev) {
+    prev.src = URL.createObjectURL(f);
+  }
+  updateRunBtn();
+}
+
+function onFileChange(key) {
+  const input = document.getElementById(`file-${key}`);
+  setFile(key, input.files[0]);
+}
+
+function updateRunBtn() {
+  document.getElementById("run-btn").disabled = !(files.rating && files.speed);
+}
+
+// ドラッグ&ドロップ
+function dragOver(e, key) {
+  e.preventDefault();
+  document.getElementById(`card-${key}`).classList.add("drag-over");
+}
+function dragLeave(key) {
+  document.getElementById(`card-${key}`).classList.remove("drag-over");
+}
+function dropFile(e, key) {
+  e.preventDefault();
+  dragLeave(key);
+  const f = e.dataTransfer.files[0];
+  if (f && f.type.startsWith("image/")) {
+    setFile(key, f);
+  }
+}
+
+// ─────────────────────────────────────────
+//  チャット
+// ─────────────────────────────────────────
+const chatMessages = document.getElementById("chat-messages");
+const msgInput     = document.getElementById("msg-input");
+
+marked.setOptions({ breaks: true });
+
+function addMsg(text, isUser = false) {
+  const div = document.createElement("div");
+  div.className = `msg ${isUser ? "user" : "bot"}`;
+  const av  = document.createElement("div");
+  av.className = "av";
+  av.textContent = isUser ? "👤" : "🤖";
+  const bbl = document.createElement("div");
+  bbl.className = "bubble bbl";
+  bbl.innerHTML = marked.parse(String(text));
+  div.append(av, bbl);
+  chatMessages.appendChild(div);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+  return bbl;
+}
+
+function addTyping() {
+  const div = document.createElement("div");
+  div.className = "msg bot";
+  div.id = "typing-ind";
+  div.innerHTML = `<div class="av">🤖</div><div class="bbl"><div class="typing"><span></span><span></span><span></span></div></div>`;
+  chatMessages.appendChild(div);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+function removeTyping() {
+  const el = document.getElementById("typing-ind");
+  if (el) el.remove();
+}
+
+async function sendMessage() {
+  const text = msgInput.value.trim();
+  if (!text) return;
+  msgInput.value = "";
+  msgInput.style.height = "40px";
+  addMsg(text, true);
+  addTyping();
+
+  try {
+    const res  = await fetch("/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text }),
+    });
+    const data = await res.json();
+    removeTyping();
+    addMsg(data.reply);
+
+    if (data.action === "show_upload") {
+      switchTab("upload");
+    }
+  } catch(e) {
+    removeTyping();
+    addMsg("⚠️ 通信エラーが発生しました。");
+  }
+}
+
+document.getElementById("send-btn").addEventListener("click", sendMessage);
+msgInput.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+msgInput.addEventListener("input", () => {
+  msgInput.style.height = "auto";
+  msgInput.style.height = Math.min(msgInput.scrollHeight, 110) + "px";
+});
+
+// ─────────────────────────────────────────
+//  予想実行
+// ─────────────────────────────────────────
+async function runPredict() {
+  const btn  = document.getElementById("run-btn");
+  const prog = document.getElementById("progress-wrap");
+  const bar  = document.getElementById("progress-bar");
+  const lbl  = document.getElementById("prog-label");
+
+  btn.disabled = true;
+  btn.textContent = "⏳ 予想中...";
+  prog.classList.add("show");
+  bar.className = "";
+  bar.style.width = "4%";
+  lbl.textContent = "画像を送信中...";
+  document.getElementById("progress-log").textContent = "";
+
+  // 経過時間カウント
+  elapsed = 0;
+  clearInterval(elapsedTimer);
+  elapsedTimer = setInterval(() => {
+    elapsed++;
+    document.getElementById("prog-time").textContent = elapsed + "s";
+  }, 1000);
+
+  const fd = new FormData();
+  fd.append("rating_img",      files.rating);
+  fd.append("speed_index_img", files.speed);
+  if (files.meta)   fd.append("meta_img",    files.meta);
+  if (files.factor) fd.append("factor_img",  files.factor);
+  if (files.aitime) fd.append("ai_time_img", files.aitime);
+  if (files.track)  fd.append("track_imgs",  files.track);
+  if (document.getElementById("fast-mode").checked) fd.append("fast", "true");
+
+  try {
+    const res  = await fetch("/predict", { method: "POST", body: fd });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    currentJobId = data.job_id;
+    lbl.textContent = "OCR処理中...";
+    bar.style.width = "8%";
+    addMsg("🏇 予想を開始しました！OCR解析中です…（数十秒かかる場合があります）");
+    pollJob();
+  } catch (e) {
+    clearInterval(elapsedTimer);
+    btn.disabled = false;
+    btn.textContent = "🏇 予想を開始する";
+    prog.classList.remove("show");
+    addMsg(`❌ エラー: ${e.message}`);
+  }
+}
+
+// ─────────────────────────────────────────
+//  ポーリング
+// ─────────────────────────────────────────
+let pollCount = 0;
+function pollJob() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollCount = 0;
+  pollTimer = setInterval(async () => {
+    pollCount++;
+    const pct = Math.min(8 + pollCount * 2.5, 88);
+    document.getElementById("progress-bar").style.width = pct + "%";
+
+    try {
+      const res  = await fetch(`/status/${currentJobId}`);
+      if (!res.ok) return;
+      const data = await res.json();
+
+      // ログ更新
+      if (data.log) {
+        const lines = data.log.split("\n").filter(Boolean);
+        document.getElementById("progress-log").textContent =
+          lines.slice(-6).join("\n");
+      }
+
+      if (data.status === "done") {
+        clearInterval(pollTimer);
+        clearInterval(elapsedTimer);
+        const bar = document.getElementById("progress-bar");
+        bar.style.width = "100%";
+        bar.classList.add("success");
+        document.getElementById("prog-label").textContent =
+          `✅ 完了（${data.elapsed ?? elapsed}秒）`;
+        showResult(data.markdown);
+
+      } else if (data.status === "error") {
+        clearInterval(pollTimer);
+        clearInterval(elapsedTimer);
+        const bar = document.getElementById("progress-bar");
+        bar.style.width = "100%";
+        bar.classList.add("error");
+        document.getElementById("prog-label").textContent = "❌ エラー";
+        addMsg(`❌ 予想に失敗しました:\n\`\`\`\n${(data.error || "").slice(0, 600)}\n\`\`\``);
+        const btn = document.getElementById("run-btn");
+        btn.disabled = false;
+        btn.textContent = "🏇 予想を開始する";
+      }
+    } catch (e) {
+      // ネットワークエラーは無視
+    }
+  }, 2500);
+}
+
+// ─────────────────────────────────────────
+//  結果表示
+// ─────────────────────────────────────────
+function showResult(md) {
+  resultMarkdown = md;
+
+  // 結果タブを表示
+  const tabBtn = document.getElementById("tab-result-btn");
+  tabBtn.style.display = "";
+  switchTab("result");
+
+  const el = document.getElementById("result-md");
+  el.innerHTML = marked.parse(md);
+  el.scrollTop = 0;
+
+  // チャットに通知（先頭15行）
+  const preview = md.split("\n").filter(Boolean).slice(0, 12).join("\n");
+  addMsg(`✅ **予想完了！** 「🏆 予想結果」タブをご確認ください。\n\n---\n${preview}\n\n…（続き）`);
+
+  const btn = document.getElementById("run-btn");
+  btn.disabled = false;
+  btn.textContent = "🏇 予想を開始する";
+}
+
+// ─────────────────────────────────────────
+//  アクション
+// ─────────────────────────────────────────
+function copyResult() {
+  navigator.clipboard.writeText(resultMarkdown)
+    .then(() => addMsg("📋 予想結果をクリップボードにコピーしました。"))
+    .catch(() => addMsg("⚠️ コピーに失敗しました。"));
+}
+
+function downloadResult() {
+  const blob = new Blob([resultMarkdown], { type: "text/markdown;charset=utf-8" });
+  const a    = document.createElement("a");
+  a.href     = URL.createObjectURL(blob);
+  a.download = `stella_${new Date().toISOString().slice(0,16).replace(/[T:]/g,"-")}.md`;
+  a.click();
+}
+
+function newRace() {
+  switchTab("upload");
+  addMsg("🔄 別レースの予想モードに切り替えました。新しい画像をアップロードしてください。");
+  // ファイル状態リセット
+  for (const key of Object.keys(files)) {
+    files[key] = null;
+    const card = document.getElementById(`card-${key}`);
+    if (card) {
+      card.classList.remove("has-file", "drag-over");
+      // デフォルトラベル復元
+      const labels = { rating:"レイティング表", speed:"スピード指数表", meta:"レース情報", factor:"ファクター表", aitime:"AI展開予測", track:"馬場状態" };
+      card.querySelector(".cl").textContent = labels[key];
+    }
+    const prev = document.getElementById(`prev-${key}`);
+    if (prev) { prev.src = ""; }
+    const inp = document.getElementById(`file-${key}`);
+    if (inp) inp.value = "";
+  }
+  updateRunBtn();
+  document.getElementById("progress-wrap").classList.remove("show");
+  document.getElementById("progress-bar").style.width = "0%";
+  document.getElementById("progress-bar").className = "";
+}
+</script>
+</body>
+</html>

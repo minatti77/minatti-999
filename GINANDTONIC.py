@@ -39,13 +39,13 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+# from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
+# from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import os
-import hashlib
+# import os
+# import hashlib
 
 import numpy as np
 import pandas as pd
@@ -80,6 +80,148 @@ except Exception:  # allow non-OCR runs
 
 # =========================
 # 0) Utils
+# =========================
+
+def _sha1_of_file(path: str) -> str:
+    """ファイルの SHA-1 ハッシュ（16進数文字列）を返す。"""
+    import hashlib
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _ocr_cache_key(prefix: str, img_path: str, lang: str) -> str:
+    """OCRキャッシュ用のキー文字列を生成する。"""
+    import hashlib
+    raw = f"{prefix}:{img_path}:{lang}".encode('utf-8', errors='ignore')
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _ocr_cache_load_json(cache_dir: Optional[str], key: str) -> Optional[dict]:
+    """OCRキャッシュから JSON を読み込む。存在しなければ None を返す。"""
+    if not cache_dir:
+        return None
+    try:
+        from pathlib import Path as _P
+        import json as _json
+        p = _P(cache_dir) / f"{key}.json"
+        if p.exists() and p.stat().st_size > 0:
+            return _json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        pass
+    return None
+
+
+def _ocr_cache_save_json(cache_dir: Optional[str], key: str, obj: dict) -> None:
+    """OCRキャッシュに JSON を保存する。"""
+    if not cache_dir:
+        return
+    try:
+        from pathlib import Path as _P
+        import json as _json
+        d = _P(cache_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{key}.json").write_text(
+            _json.dumps(obj, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def _wide_market_detail_map_for_anchor(
+    wide_market_df: Optional["pd.DataFrame"],
+    anchor_num: str,
+) -> dict:
+    """wide_market_df から anchor_num を軸にした相手ごとの市場情報 dict を返す。
+
+    wide_market_df が None または列が揃っていない場合は空 dict を返す。
+    """
+    result: dict = {}
+    if wide_market_df is None:
+        return result
+    try:
+        # import pandas as _pd
+        for _, row in wide_market_df.iterrows():
+            n1 = str(row.get('num1', '') or '')
+            n2 = str(row.get('num2', '') or '')
+            if n1 == str(anchor_num):
+                opp = n2
+            elif n2 == str(anchor_num):
+                opp = n1
+            else:
+                continue
+            if not opp:
+                continue
+            result[opp] = {
+                'market_min': float(row.get('market_min', 0) or 0),
+                'market_max': float(row.get('market_max', 0) or 0),
+                'market_mid': float(row.get('market_mid', 0) or 0),
+                'market_text': str(row.get('market_text', '') or ''),
+            }
+    except Exception:
+        pass
+    return result
+
+
+def _estimate_trio_probabilities(
+    df: "pd.DataFrame",
+    n_samples: int = 60000,
+    top_mass: float = 0.22,
+    seed: int = 0,
+    mode: str = 'global_then_filter_anchor',
+    z_ci: float = 1.281551565545,
+) -> Optional["pd.DataFrame"]:
+    """モンテカルロ法で三連複の確率を推定し、上位 DataFrame を返す。
+
+    SAS スコアをソフトマックスで確率に変換してサンプリングする。
+    """
+    try:
+        import numpy as _np
+        import pandas as _pd
+        d = df.copy()
+        d['num'] = d['num'].astype(str)
+        if 'SAS' not in d.columns:
+            d['SAS'] = 50.0
+        sas = d['SAS'].fillna(50.0).astype(float).values
+        nums = d['num'].values
+        n = len(nums)
+        if n < 3:
+            return None
+
+        # softmax で出走確率（≒勝率）に変換
+        tau = 10.0
+        logits = sas / tau
+        logits = logits - logits.max()
+        probs = _np.exp(logits)
+        probs = probs / probs.sum()
+
+        rng = _np.random.default_rng(seed)
+        combo_counts: dict = {}
+        for _ in range(n_samples):
+            drawn = rng.choice(n, size=min(3, n), replace=False, p=probs)
+            key = tuple(sorted([nums[i] for i in drawn]))
+            combo_counts[key] = combo_counts.get(key, 0) + 1
+
+        rows = []
+        for combo, cnt in combo_counts.items():
+            p_mean = cnt / n_samples
+            # ベータ分布の CI 下限（簡易）
+            _ = cnt + 1.0
+            _ = n_samples - cnt + 1.0
+            p_low = max(0.0, p_mean - z_ci * _np.sqrt(p_mean * (1 - p_mean) / n_samples))
+            rows.append({'num1': combo[0], 'num2': combo[1], 'num3': combo[2],
+                         'p_trio_mean': p_mean * 100.0,
+                         'p_trio_low':  p_low  * 100.0,
+                         'count': cnt})
+
+        if not rows:
+            return None
+        trio_df = _pd.DataFrame(rows).sort_values('p_trio_mean', ascending=False)
+        return trio_df
+    except Exception:
+        return None
+
 
 # =========================
 # Params (balanced tuning)
@@ -2372,7 +2514,7 @@ def analyze_race_results(
     df = _r41_load_results_df(result_dir)
     now_str = _dt.datetime.now().strftime('%Y-%m-%d %H:%M')
 
-    out = f'# STELLA v1.18 事後分析レポート (R41)\n\n'
+    out = '# STELLA v1.18 事後分析レポート (R41)\n\n'
     out += f'- 生成日時: {now_str}\n'
     out += f'- 読込ディレクトリ: `{result_dir}`\n'
 
@@ -2503,7 +2645,7 @@ def analyze_race_results(
         out += '\n'
 
     out += '---\n'
-    out += f'- version: STELLA v1.18 事後分析 (R41)\n'
+    out += '- version: STELLA v1.18 事後分析 (R41)\n'
     out += f'- source: `analyze_race_results("{result_dir}")`\n'
 
     # ファイル書き出し
@@ -2593,7 +2735,7 @@ def _r42_eval_params(
             valid (bool)
     """
     scored = _r42_rescore_df(df, high_p_min, medium_p_min, gap_high, gap_medium)
-    n_total = len(scored)
+    _ = len(scored)
 
     # — HIGH stats —
     high_sub = scored[(scored['r42_level'] == 'HIGH')].copy()
@@ -2813,7 +2955,7 @@ def tune_confidence_params(
     n_races = len(df)
 
     now_str = _dt.datetime.now().strftime('%Y-%m-%d %H:%M')
-    report = f'# STELLA v1.18 confidence 自動チューニングレポート (R42)\n\n'
+    report = '# STELLA v1.18 confidence 自動チューニングレポート (R42)\n\n'
     report += f'- 生成日時: {now_str}\n'
     report += f'- 読込ディレクトリ: `{result_dir}`\n'
     report += f'- 総レース数: {n_races}件\n\n'
@@ -2919,7 +3061,7 @@ def tune_confidence_params(
     report += '}\n```\n\n'
 
     report += '---\n'
-    report += f'- version: STELLA v1.18 confidence自動チューニング (R42)\n'
+    report += '- version: STELLA v1.18 confidence自動チューニング (R42)\n'
     report += f'- source: `tune_confidence_params("{result_dir}")`\n'
 
     if verbose:
@@ -3187,7 +3329,7 @@ def analyze_wide_roi(
       3. スコアベース仮想選択のROI（AnchorScore / SAS / p_place_est_pctで比較）
       4. 最適推奨設定の提案
     """
-    _params = params or {}
+    _ = params or {}
     df = _r41_load_results_df(result_dir)
     n_total = len(df)
     n_place_ok = int((df['place_ok'] == True).sum()) if not df.empty else 0
@@ -3671,7 +3813,7 @@ def analyze_trio_roi(
       6. 的中パターン分析（アンカー着順・配当帯分布）
       7. コスト・損益分岐点分析 + 推奨設定
     """
-    _params = params or {}
+    _ = params or {}
     df = _r41_load_results_df(result_dir)
     n_total = len(df)
     n_place_ok = int((df['place_ok'] == True).sum()) if not df.empty else 0
@@ -4525,7 +4667,7 @@ def _r46_enrich_df(df):
     """DataFrameにR46分類列を追加したコピーを返す。
     追加列: venue_cat, race_no, race_slot, dist_m, dist_cat
     """
-    import pandas as pd
+    # import pandas as pd
 
     if df is None or len(df) == 0:
         return df
@@ -4608,7 +4750,7 @@ def _r46_category_roi_stats(df, stake_per: float, category_col: str,
     bet_type: 'place' / 'wide' / 'trio'
     Returns: list of dicts {category, n, n_hit, roi, hit_rate, avg_payout}
     """
-    import numpy as np
+    # import numpy as np
 
     results = []
     if df is None or len(df) == 0:
@@ -4641,7 +4783,7 @@ def _r46_category_roi_stats(df, stake_per: float, category_col: str,
             hits = rows['wide_hit_count'].infer_objects(copy=False).fillna(0).astype(float).sum()
             payouts = rows['payout_wide_max'].infer_objects(copy=False).fillna(0.0).astype(float)
             # wide: assume 4-wide default; use wide_num_count column if available
-            n_points = float(rows.get('wide_num_count', 4) if isinstance(
+            _ = float(rows.get('wide_num_count', 4) if isinstance(
                 rows.get('wide_num_count'), float) else 4)
             investment = n * 4 * stake_per  # 4点購入として計算
             payout_per_100 = stake_per / 100.0
@@ -5222,7 +5364,7 @@ def _r47_rank_distribution(df) -> list:
 
 def _r47_score_vs_rank_buckets(df, n_buckets: int = 5) -> list:
     """AnchorScoreをn_buckets等分してバケット別の平均着順を計算する。"""
-    import numpy as np
+    # import numpy as np
 
     results = []
     if df is None or len(df) == 0:
@@ -5704,7 +5846,7 @@ def _r48_status_icon(error):
 
 def _r48_run_all_analyses(result_dir, params, stakes, verbose=True):
     """R41-R47 の全分析を順番に実行し結果辞書を返す"""
-    NL = '\n'
+    _ = '\n'
     all_results = {}
 
     MODULES = [
@@ -6362,7 +6504,7 @@ def _r49_load_df(result_dir, params=None):
     try:
         df = _r46_load_enriched_df(result_dir)
         return df
-    except Exception as _e49:
+    except Exception:
         return None
 
 
@@ -6628,7 +6770,7 @@ def _r49_build_venue_dashboard_md(venue_stats_list, df_total_n, meta, stakes):
                     cs = s['conf_stats'].get(cl, {})
                     cn = cs.get('n', 0)
                     ch = cs.get('hit', 0)
-                    cr = cs.get('rate')
+                    _ = cs.get('rate')
                     lines.append('| {} | {} | {} | {} |'.format(
                         cl, cn, ch, _r49_pct(ch, cn) if cn > 0 else 'N/A'))
                 lines.append('')
@@ -6940,7 +7082,7 @@ def _r50_enrich_df(df):
 
     avg_halon 列が存在しない場合は _r46_load_enriched_df のデータを利用。
     """
-    import pandas as _pd50
+    # import pandas as _pd50
 
     if df is None or len(df) == 0:
         return df
@@ -7123,7 +7265,7 @@ def _r50_venue_going_cross(df, stake_place):
 
     Returns: list of dict {venue, going_cat, n, place_hit_rate, place_roi}
     """
-    import pandas as _pd50
+    # import pandas as _pd50
 
     if df is None or len(df) == 0:
         return []
@@ -7525,9 +7667,9 @@ def analyze_track_condition(
 import pandas as _pd52
 import numpy as _np52
 import json as _json52
-import os as _os52
-from pathlib import Path as _Path52
-from typing import Optional, Dict, List, Any
+# import os as _os52
+# from pathlib import Path as _Path52
+# from typing import Optional, Dict, List, Any
 
 # ---- 定数 ----
 _R52_PACE_LABELS = {'H': 'ハイ(H)', 'M': 'ミドル(M)', 'S': 'スロー(S)', '': '不明'}
@@ -7790,8 +7932,8 @@ def _r52_build_cross_md(
         f"> STELLA v1.32 | 対象レース数: {n_races} | place_ok: {n_ok}",
         "",
         "## 0. 実行サマリー", "",
-        f"| 項目 | 値 |",
-        f"|------|-----|",
+        "| 項目 | 値 |",
+        "|------|-----|",
         f"| 総レース数 | {n_races} |",
         f"| 分析対象(place_ok) | {n_ok} |",
         f"| ペース軸 (H/M/S) | {n_pace} 種 |",
@@ -7958,7 +8100,7 @@ def analyze_cross_analysis(
     # --- データロード ---
     try:
         df = _r52_load_df(result_dir)
-    except Exception as e:
+    except Exception:
         df = _pd52.DataFrame()
 
     n_races = len(df)
@@ -8051,9 +8193,9 @@ def analyze_cross_analysis(
 import pandas as _pd53
 import numpy as _np53
 import json as _json53
-import os as _os53
-from pathlib import Path as _Path53
-from typing import Optional, List, Dict, Any
+# import os as _os53
+# from pathlib import Path as _Path53
+# from typing import Optional, List, Dict, Any
 
 # ---- 定数 ----
 _R53_GOING_LABELS = {
@@ -8216,7 +8358,7 @@ def _r53_find_best_alpha(df, going_cat, stake_place=1000.0):
         n_high = int(high_mask.sum())
         if n_high == 0:
             continue
-        n_hit = int(ph[high_mask].sum())
+        _ = int(ph[high_mask].sum())
         ret   = float((ph[high_mask].astype(float) * payouts[high_mask]).sum())
         roi   = ret / (n_high * stake_place) if n_high > 0 else float('-inf')
         if roi > best_roi:
@@ -9748,7 +9890,7 @@ def _r55_build_apply_md(alphas: dict, kpi: dict, meta: dict) -> str:
     lines.append("```python")
     lines.append("from gin_and_tonic import _r55_load_alphas, _r55_apply_alphas_to_params")
     lines.append("")
-    lines.append(f"# JSONからαをロード")
+    lines.append("# JSONからαをロード")
     lines.append(f"alphas = _r55_load_alphas('{meta.get('alpha_json', 'alphas.json')}')")
     lines.append("")
     lines.append("# paramsに組み込む")
@@ -11512,6 +11654,135 @@ def ocr_ai_time_summary_v10(image_path: str, lang: str = 'jpn+eng') -> Dict[str,
     return out
 
 
+def ocr_meta_image_cached(
+    meta_path: str,
+    lang: str = 'jpn+eng',
+    cache_dir: Optional[str] = None,
+    force: bool = False,
+) -> Dict[str, str]:
+    """レース情報画像をOCRしキャッシュ付きでmetaを返す。"""
+    key = _ocr_cache_key('meta_image', meta_path, lang)
+    if not force:
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, dict):
+            return hit
+    obj = ocr_meta_image(meta_path, lang=lang)
+    _ocr_cache_save_json(cache_dir, key, obj)
+    return obj
+
+
+def ocr_rating_table_v10_cached(
+    image_path: str,
+    lang: str = 'jpn+eng',
+    cache_dir: Optional[str] = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    """レイティング表画像をOCRしキャッシュ付きでDataFrameを返す。"""
+    key = _ocr_cache_key('rating_table_v10', image_path, lang)
+    if not force:
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, list):
+            try:
+                return pd.DataFrame(hit)
+            except Exception:
+                pass
+    df_result = ocr_rating_table_v10(image_path, lang=lang)
+    try:
+        _ocr_cache_save_json(cache_dir, key, df_result.to_dict(orient='records'))
+    except Exception:
+        pass
+    return df_result
+
+
+def ocr_speed_index_table_v10_cached(
+    image_path: str,
+    lang: str = 'jpn+eng',
+    cache_dir: Optional[str] = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    """スピード指数表画像をOCRしキャッシュ付きでDataFrameを返す。"""
+    key = _ocr_cache_key('speed_index_table_v10', image_path, lang)
+    if not force:
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, list):
+            try:
+                return pd.DataFrame(hit)
+            except Exception:
+                pass
+    df_result = ocr_speed_index_table_v10(image_path, lang=lang)
+    try:
+        _ocr_cache_save_json(cache_dir, key, df_result.to_dict(orient='records'))
+    except Exception:
+        pass
+    return df_result
+
+
+def ocr_factor_table_v10_cached(
+    image_path: str,
+    lang: str = 'jpn+eng',
+    cache_dir: Optional[str] = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    """ファクター表画像をOCRしキャッシュ付きでDataFrameを返す。"""
+    key = _ocr_cache_key('factor_table_v10', image_path, lang)
+    if not force:
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, list):
+            try:
+                return pd.DataFrame(hit)
+            except Exception:
+                pass
+    df_result = ocr_factor_table_v10(image_path, lang=lang)
+    try:
+        _ocr_cache_save_json(cache_dir, key, df_result.to_dict(orient='records'))
+    except Exception:
+        pass
+    return df_result
+
+
+def ocr_pred_times_table_v10_cached(
+    image_paths: List[str],
+    lang: str = 'jpn+eng',
+    cache_dir: Optional[str] = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    """予測タイム表画像（複数）をOCRしキャッシュ付きでDataFrameを返す。"""
+    import hashlib as _hl
+    combined_key_raw = ':'.join(sorted(image_paths) + [lang]).encode('utf-8', errors='ignore')
+    key = _ocr_cache_key('pred_times_table_v10',
+                         _hl.sha1(combined_key_raw).hexdigest(), lang)
+    if not force:
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, list):
+            try:
+                return pd.DataFrame(hit)
+            except Exception:
+                pass
+    df_result = ocr_pred_times_table_v10(image_paths, lang=lang)
+    try:
+        _ocr_cache_save_json(cache_dir, key, df_result.to_dict(orient='records'))
+    except Exception:
+        pass
+    return df_result
+
+
+def ocr_ai_time_summary_v10_cached(
+    image_path: str,
+    lang: str = 'jpn+eng',
+    cache_dir: Optional[str] = None,
+    force: bool = False,
+) -> Dict[str, str]:
+    """AI展開予測/タイム予測画像をOCRしキャッシュ付きでmetaを返す。"""
+    key = _ocr_cache_key('ai_time_summary_v10', image_path, lang)
+    if not force:
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, dict):
+            return hit
+    obj = ocr_ai_time_summary_v10(image_path, lang=lang)
+    _ocr_cache_save_json(cache_dir, key, obj)
+    return obj
+
+
 def _merge_entries_base(dfs: List[pd.DataFrame]) -> pd.DataFrame:
     """Merge multiple horse-level dfs by num (string). Prefer non-empty name."""
     base=None
@@ -11614,12 +11885,7 @@ def _cluster_rows(words: pd.DataFrame, y_tol: int = 18) -> pd.DataFrame:
 
 
 
-def _safe_float(x: str) -> Optional[float]:
-    """文字列を float に変換する。変換失敗時は None を返す。"""
-    try:
-        return float(str(x).strip())
-    except Exception:
-        return None
+# _safe_float は L2209 に定義済み（重複定義を削除）
 
 
 def going_to_firmness_score(going: str) -> Optional[float]:
@@ -13120,8 +13386,8 @@ def _kbs_raw_workout_score(work: dict, w4: float, w3: float, w1: float) -> float
 
 def _kbs_course_normalize(dfa, tr: dict) -> object:
     """コース別ロバスト正規化を dfa に適用して 'WorkoutScore_latest' を更新する。"""
-    import numpy as np
-    import pandas as pd
+    # import numpy as np
+    # import pandas as pd
     try:
         for course_val in dfa['course_latest'].unique():
             mask = dfa['course_latest'] == course_val
@@ -13138,7 +13404,7 @@ def _kbs_course_normalize(dfa, tr: dict) -> object:
 def _kbs_shape_score(dfa) -> object:
     """坂路（加速形）と W/CW（3F配分）の形スコアを計算して dfa に追加する。"""
     import numpy as np
-    import pandas as pd
+    # import pandas as pd
     try:
         # 坂路: lap復元 (t4,t3,t2,t1 → lap4..lap1)
         for c in ['t4_latest','t3_latest','t2_latest','t1_latest']:
@@ -13177,8 +13443,8 @@ def compute_training_scores_keibabook(entries: pd.DataFrame, ocr_all: dict, para
     w3 = float(tr.get('w_t3', 0.27) or 0.27)
     w1 = float(tr.get('w_t1', 0.18) or 0.18)
 
-    delta_scale = float(tr.get('delta_scale', 0.08) or 0.08)
-    delta_cap   = float(tr.get('delta_cap', 3.0) or 3.0)
+    _ = float(tr.get('_delta_scale', 0.08) or 0.08)
+    _ = float(tr.get('_delta_cap', 3.0) or 3.0)
 
     horses = (ocr_all or {}).get('horses', {}) or {}
 
@@ -14473,9 +14739,9 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     distance_draw_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     distance_specific_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
     pedigree_bm_fit = _num_series(d.get('PedigreeBmSire2Fit', 50.0), 50.0, index=d.index)
-    pedigree_cross_fit = _num_series(d.get('PedigreeCrossDepthFit', 50.0), 50.0, index=d.index)
+    _ = _num_series(d.get('PedigreeCrossDepthFit', 50.0), 50.0, index=d.index)
     pedigree_dosage_fit = _num_series(d.get('PedigreeDosageFit', 50.0), 50.0, index=d.index)
-    pedigree_chef_fit = _num_series(d.get('PedigreeChefRaceFit', 50.0), 50.0, index=d.index)
+    _ = _num_series(d.get('PedigreeChefRaceFit', 50.0), 50.0, index=d.index)
     pedigree_tokyo1400_fit = _num_series(d.get('PedigreeTokyo1400LapFit', 50.0), 50.0, index=d.index)
     pedigree_fine_fit = _num_series(d.get('PedigreeFineFit', 50.0), 50.0, index=d.index)
 
@@ -15202,7 +15468,7 @@ def compute_maintenance_run_relief_v1_1(df: pd.DataFrame, meta: Dict[str, str], 
     Returns:
         (flag: pd.Series[int], reason: pd.Series[str])
     """
-    fr = ((params or {}).get('favorite_logic_rules', {}) or {})
+    _ = ((params or {}).get('favorite_logic_rules', {}) or {})
     dist = _num_series(df, 'DistanceSuitScore', 50.0)
     tr = _num_series(df, 'TrainingScore', 50.0)
     dt = _num_series(df, 'delta_train', 0.0)
@@ -16380,7 +16646,7 @@ def build_comment_features(entries: pd.DataFrame, comments_df: pd.DataFrame, par
         g['start_hits'] = g['text'].astype(str).str.count(r'出遅|スタート|ゲート|発馬|一歩目|二の脚|ダッシュ|行き脚')
         # R22: 前走インタビューに「のっそり」「行き脚つかない」等が含まれる場合の追加ペナルティ
         _prev_intvw_penalty = float(cf.get('start_risk_prev_interview_penalty', 3.0) or 3.0)
-        _apply_to_anchor   = bool(cf.get('start_risk_apply_to_anchor', True))
+        _ = bool(cf.get('start_risk_apply_to_anchor', True))
         g['prev_interview_hits'] = g['text'].astype(str).str.count(
             r'のっそり|もたもた|行き脚つかな|ひと息|スタートいまひとつ|出遅れ気味|1歩目|二の足'
         )
@@ -16741,7 +17007,7 @@ def _sas_compute_weights(params: dict, wet_mode: bool) -> dict:
     w_p = float(wp.get('w_posfit',    0.18) or 0.18)
     w_m = float(wp.get('w_mapfit',    0.12) or 0.12)
     w_f = float(wp.get('w_factorfit', 0.12) or 0.12)
-    w_c = float(wp.get('w_consist',   0.30) or 0.30)
+    _ = float(wp.get('w_consist',   0.30) or 0.30)
     factor_w   = 0.06 if wet_mode else 0.03
     michiaku_w = 0.03 if wet_mode else 0.00
 
@@ -16787,7 +17053,7 @@ def _sas_apply_geo_blend(df, params: dict, sas_add_col: str = 'SAS') -> object:
 
 def _sas_apply_training_delta(df, params: dict) -> object:
     """TrainingScore Δ を SAS / AnchorScore へ小さく反映した df を返す。"""
-    import numpy as np
+    # import numpy as np
     wp = (params.get('wide_rules') or {})
     td_enabled = bool(wp.get('training_delta_apply_enabled', True))
     td_scale   = float(wp.get('training_delta_scale', 0.12) or 0.12)
@@ -16812,7 +17078,7 @@ def _csv_compute_sas(
     meta にも各重みを文字列で格納する。
     サブ関数: _sas_init_market / _sas_compute_weights / _sas_apply_geo_blend / _sas_apply_training_delta
     """
-    import numpy as np
+    # import numpy as np
     # 1. 市場特徴初期化
     df = _sas_init_market(df)
 
@@ -17051,8 +17317,8 @@ def _wps_compute_risk_signals(
     df['DevelopmentWaitRisk'] = _num_series(dev_wait_risk, 0.0, index=df.index)
     df['DevelopmentWaitReason'] = dev_wait_reason.infer_objects(copy=False).fillna('').astype(str)
 
-    trend_bonus = ((_num_series(df, 'CommentTrend', 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0)
-    comment_trend = _num_series(df, 'CommentTrend', 50.0)
+    _ = ((_num_series(df, 'CommentTrend', 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0)
+    _ = _num_series(df, 'CommentTrend', 50.0)
     dist, surface = _meta_distance_surface(meta)
 
     return df
@@ -17104,14 +17370,14 @@ def _wps_compute_pattern_scores(
     df['WinPatternBoost'] = (promote_win_bonus * promote_scale).astype(float)
     df['PlaceAxisBoost'] = (promote_place_bonus * promote_scale).astype(float)
 
-    temp_win_scale = float(wp.get('temperament_penalty_win_scale', 0.85) or 0.85)
-    temp_place_scale = float(wp.get('temperament_penalty_place_scale', 0.35) or 0.35)
+    _ = float(wp.get('temperament_penalty_win_scale', 0.85) or 0.85)
+    _ = float(wp.get('temperament_penalty_place_scale', 0.35) or 0.35)
 
     fr = (params.get('favorite_logic_rules', {}) or {})
-    maint_bonus_win = float(fr.get('maintenance_relief_bonus_win', 2.0) or 2.0)
-    maint_bonus_place = float(fr.get('maintenance_relief_bonus_place', 0.8) or 0.8)
-    dev_pen_win = float(fr.get('development_wait_penalty_win', 3.2) or 3.2)
-    dev_pen_place = float(fr.get('development_wait_penalty_place', 1.0) or 1.0)
+    _ = float(fr.get('maintenance_relief_bonus_win', 2.0) or 2.0)
+    _ = float(fr.get('maintenance_relief_bonus_place', 0.8) or 0.8)
+    _ = float(fr.get('development_wait_penalty_win', 3.2) or 3.2)
+    _ = float(fr.get('development_wait_penalty_place', 1.0) or 1.0)
 
     return df
 
@@ -17691,7 +17957,7 @@ def _comp_position_accel(
     pf3 = _num_series(df, 'pred_first3f', np.nan, index=df.index)
     pl3 = _num_series(df, 'pred_last3f', np.nan, index=df.index)
     pf3_rank = pf3.rank(method='min', ascending=True)
-    pl3_rank  = pl3.rank(method='min', ascending=True)
+    _ = pl3.rank(method='min', ascending=True)
     pace_mode = str((meta or {}).get('pace_eval_mode', '') or '')
     wp = (params.get('win_pattern_rules', {}) or {})
     front_auto_rank  = int(wp.get('pace_front_auto_promote_rank_max', 3) or 3)
@@ -17706,9 +17972,9 @@ def _comp_position_accel(
     front_bias = front_bias + (((z4 == 'FRONT') & (gatefit >= 58.0)).astype(float) * front_keep_bonus)
     good_pos_mask = z4.isin(['FRONT', 'MIDDLE'])
     if pf3.notna().sum() > 1 and float(pf3.max()) != float(pf3.min()):
-        pf3_fast01 = ((float(pf3.max()) - pf3) / (float(pf3.max()) - float(pf3.min()))).clip(lower=0.0, upper=1.0)
+        _ = ((float(pf3.max()) - pf3) / (float(pf3.max()) - float(pf3.min()))).clip(lower=0.0, upper=1.0)
     else:
-        pf3_fast01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
+        _ = pd.Series([0.5] * len(df), index=df.index, dtype=float)
     if pl3.notna().sum() > 1 and float(pl3.max()) != float(pl3.min()):
         last3f_fast01 = ((float(pl3.max()) - pl3) / (float(pl3.max()) - float(pl3.min()))).clip(lower=0.0, upper=1.0)
     else:
@@ -17953,11 +18219,11 @@ def _comp_axis_final(
     stability        = _num_series(df, ['StabilityComposite', 'SAS'], 50.0)
     distance_num     = _num_series(df, 'DistanceSuitScore',  50.0)
     favorite_num     = _num_series(df, 'FavoriteScore',      50.0)
-    anchor_base_num  = _num_series(df, ['AnchorScore', 'SAS'], 50.0)
-    win_num          = _num_series(df, 'WinCandidateScore',  50.0)
+    _ = _num_series(df, ['AnchorScore', 'SAS'], 50.0)
+    _ = _num_series(df, 'WinCandidateScore',  50.0)
     ability_num       = _num_series(df, 'Ability',            50.0)
     comment_trend_num = _num_series(df, 'CommentTrend',       50.0)
-    recent_num        = _num_series(df, 'RecentFormScore',    50.0)
+    _ = _num_series(df, 'RecentFormScore',    50.0)
     conn_num          = _num_series(df, 'HumanConnectionScore', 50.0)
     conn_recent_num   = _num_series(df, 'ConnectionRecentFormScore', 50.0)
     network_num       = _num_series(df, 'HumanNetworkScore', 50.0)
@@ -18467,9 +18733,9 @@ def compute_scores_v1_1(entries: pd.DataFrame, meta: Dict[str, str], params: Opt
 
     # MARKET_FEATURES_OFF_SCORE_V2: 市場市場由来特徴は予想に使わない（表示のみ可）
     try:
-        market_enabled = bool(params.get('market_features_enabled', False))
+        _ = bool(params.get('market_features_enabled', False))
     except Exception:
-        market_enabled = False
+        _ = False
 
     # R24: class_up_point 列が存在する場合は数値に正規化（entries.copy() 後の df に適用）
     # R29 fix: fillna(0.0) を削除。NaN は NaN のまま保持し valid_mask 方式で後段処理する。
@@ -21815,8 +22081,8 @@ def _bam_init_params(params, place_model_bundle, pair_model_bundle, meta) -> dic
     pace = str((meta or {}).get('pace', 'M') or 'M')
     if pace.upper().strip() not in ['H','M','S']:
         pace = 'M'
-    bias = (meta or {}).get('bias', 'Unknown')
-    map_summary = (meta or {}).get('map_summary', 'Unknown')
+    _ = (meta or {}).get('_bias', 'Unknown')
+    _ = (meta or {}).get('_map_summary', 'Unknown')
 
     out = ''
     out += '# STELLA v1.18 RULES-ONLY (LITE) + PLACE-ISO (AUTOFEATURE) 予想\n\n'
@@ -21983,14 +22249,14 @@ def _bam_section_anchor_place(df, params: dict) -> dict:
     """
     out = ''
     anchor = select_anchor(df, params=params)
-    score_col = str(params.get('anchor_score_col', 'AnchorScore'))
-    score_mode = str(params.get('anchor_score_mode', 'mul'))
+    _ = str(params.get('anchor_score_col', 'AnchorScore'))
+    _ = str(params.get('anchor_score_mode', 'mul'))
 
     # --- place rules ---
     place_rule = params.get('place_rules', {}) or {}
     stake_place = int(place_rule.get('stake_place', 1000) or 1000)
     min_p_place = float(place_rule.get('min_p_place_est', 0.26) or 0.26)
-    min_place_market = 0.0  # PURE_DATA: market gate removed
+    _ = 0.0  # PURE_DATA: market gate removed
 
     p_place_pct = float(anchor.get('p_place_est_pct', float('nan')))
     # strict: clamp for display and gating
@@ -22121,7 +22387,8 @@ def _bam_section_anchor_place(df, params: dict) -> dict:
 
 def _bam_prepare_wide(df, params: dict, anchor: dict,
                       pair_model_bundle, wide_market_df,
-                      analysis_cache, p_place: float) -> dict:
+                      analysis_cache, p_place: float,
+                      meta: dict = None) -> dict:
     """ワイド相手候補確率を計算し、ルールモード選択と表示候補を返す。
 
     Returns:
@@ -22574,7 +22841,7 @@ def _bam_fp_speed(dI, A: list, d0, wr_ft: dict, anchor_num: str,
     speed_removed = ''
     if force_speed:
         try:
-            import numpy as np
+            # import numpy as np
             if 'speed' in d0.columns:
                 _tmp = d0[['num', 'speed']].copy()
                 _tmp['speed'] = _num_series(_tmp['speed'], index=_tmp.index)
@@ -22870,6 +23137,12 @@ def _bam_build_ab_candidates(
     wr_ft: dict,
     tilt: float,
     opps_display,
+    meta: dict = None,
+    d0=None,
+    pace_union_enabled: bool = True,
+    topk: int = 8,
+    p_mean_pct=None,
+    p_low_pct=None,
 ) -> tuple:
     """ワイド相手 A (4頭) / 三連複 3列目 B (10頭) / extras を選出する。
 
@@ -22883,10 +23156,26 @@ def _bam_build_ab_candidates(
         wr_ft: wide_rules サブ辞書。
         tilt: ペース傾き係数。
         opps_display: ワイド表示候補 DataFrame（fallback 用）。
+        meta: レースメタ情報辞書。
+        d0: 全馬 DataFrame（アンカー含む）。
+        pace_union_enabled: ペースユニオン有効フラグ。
+        topk: ユニオン上位k頭。
+        p_mean_pct: ワイド平均確率 Series。
+        p_low_pct: ワイド下限確率 Series。
 
     Returns:
         (A, B, extras, fixed_info) タプル。
     """
+    # import numpy as np
+    import pandas as pd
+    if meta is None:
+        meta = {}
+    if d0 is None:
+        d0 = dI  # fallback: アンカー含む全馬DFがなければdIで代用
+    if p_mean_pct is None:
+        p_mean_pct = pd.Series([float('nan')] * len(dI), index=dI.index)
+    if p_low_pct is None:
+        p_low_pct = pd.Series([float('nan')] * len(dI), index=dI.index)
     fixed_info: dict = {}
     A: list = []
     B: list = []
@@ -23076,7 +23365,7 @@ def _bsa_score_table(d0, meta: dict, params: dict) -> str:
 
 def _bsa_next_race(d0, params: dict) -> str:
     """次走推奨馬（先物注目）セクションを Markdown 文字列で返す。"""
-    import numpy as np
+    # import numpy as np
     out = '## 次走推奨馬（先物注目）\n'
     try:
         if 'comment_tags' in d0.columns:
@@ -23115,8 +23404,16 @@ def _bam_section_analysis(d0, meta: dict, anchor_num: str, params: dict) -> str:
 def _bam_section_betting_plan(
     d0, anchor_num: str, A: list, B: list,
     params: dict, dI, meta: dict, df,
+    fixed_info: dict = None,
+    opps=None,
+    opps_display=None,
+    anchor: dict = None,
 ) -> str:
     """買い目・三連複フォーメーション・データ使用状況を Markdown 文字列で返す。"""
+    if fixed_info is None:
+        fixed_info = {}
+    if anchor is None:
+        anchor = {}
     out = ''
     # -------------------------
     # 買い目（複勝＋ワイド）※固定テンプレ（画像準拠）
@@ -23328,6 +23625,11 @@ def _bam_fixed_template(
     tilt = _bam_apply_senkyo_chui_tilt(tilt, meta, wr_ft)
     A, B, extras, fixed_info = _bam_build_ab_candidates(
         dI, anchor_num, params, wr_ft, tilt, opps_display,
+        meta=meta, d0=d0,
+        pace_union_enabled=pace_union_enabled,
+        topk=topk,
+        p_mean_pct=opps_display.get('p_wide_est_pct', None) if (opps_display is not None and hasattr(opps_display, 'get')) else None,
+        p_low_pct=opps_display.get('p_wide_low_pct', None) if (opps_display is not None and hasattr(opps_display, 'get')) else None,
     )
     if len(A) < 4 or len(B) < 10:
         try:
@@ -23341,13 +23643,19 @@ def _bam_fixed_template(
             pass
     A = A[:4]
     B = B[:10]
-    extras = [x for x in B if x not in A][:6]
+    _ = [x for x in B if x not in A][:6]
 
     # 30点固定（B=10, A=4 を想定）
-    points = 30
+    _ = 30
     # ---- セクション出力 ----
     out += _bam_section_analysis(d0, meta, anchor_num, params)
-    out += _bam_section_betting_plan(d0, anchor_num, A, B, params, dI, meta, df)
+    out += _bam_section_betting_plan(
+        d0, anchor_num, A, B, params, dI, meta, df,
+        fixed_info=fixed_info,
+        opps=None,
+        opps_display=opps_display,
+        anchor=anchor,
+    )
     return out
 
 def _bfw_alloc_units_by_weights(weights: list, base_units: int) -> "List[int]":
@@ -23599,7 +23907,7 @@ def _bft_sample_trio(df, te: dict, analysis_cache: dict) -> object:
 
     キャッシュヒット時はキャッシュから返す。
     """
-    import numpy as np
+    # import numpy as np
     base_samples = int(te.get('n_samples', 20000) or 20000)
     n_runs = int(te.get('n_runs', 3) or 3)
     seed   = int(te.get('seed', 0) or 0)
@@ -23614,7 +23922,7 @@ def _bft_sample_trio(df, te: dict, analysis_cache: dict) -> object:
         return trio_df
     # SPEED_OPT_TRIO_SAMPLE_ONCE_V1: sample once (n_runs*base_samples)
     try:
-        from itertools import combinations
+        # from itertools import combinations
         trio_df = _estimate_trio_probabilities(
             df, n_samples=n_runs * base_samples, top_mass=top_mass,
             seed=seed, mode=mode, z_ci=z_ci
@@ -23626,12 +23934,12 @@ def _bft_sample_trio(df, te: dict, analysis_cache: dict) -> object:
 
 def _bft_build_formation(trio_df, df, opps_display, params: dict, anchor: dict) -> str:
     """三連複フォーメーション買い目 Markdown セクションを返す。"""
-    import numpy as np
+    # import numpy as np
     out = ''
     try:
         wr = (params.get('wide_rules') or {})
-        trio_formation_max_points = int(wr.get('trio_formation_max_points', 30) or 30)
-        trio_budget = float(wr.get('trio_formation_budget_yen', 3000) or 3000)
+        _ = int(wr.get('_trio_formation_max_points', 30) or 30)
+        _ = float(wr.get('trio_formation_budget_yen', 3000) or 3000)
         anchor_num  = str(anchor.get('num', ''))
 
         if trio_df is None or not hasattr(trio_df, 'columns') or len(trio_df) < 3:
@@ -23656,7 +23964,7 @@ def _bft_build_formation(trio_df, df, opps_display, params: dict, anchor: dict) 
 
         # ABSOLUTE: trio TOP 30 only
         out += '## 三連複フォーメーション（参考）\n'
-        out += f'上位30組（確率計算）\n\n'
+        out += '上位30組（確率計算）\n\n'
         try:
             wide_nums = []
             if opps_display is not None and hasattr(opps_display, '__iter__'):
@@ -23691,7 +23999,7 @@ def _bft_checklist(df, anchor: dict, params: dict, rule_info: dict) -> str:
     import numpy as np
     out = '\n## ✅ 試運転後チェック（絶対厳守 / report.md）\n'
     try:
-        wr = (params.get('wide_rules') or {})
+        _ = (params.get('wide_rules') or {})
         anchor_num = str(anchor.get('num', ''))
 
         # 1) ◎ p_place_est display
@@ -23840,12 +24148,13 @@ def build_audit_markdown(
 
     # ---- ワイド相手候補 ----
     wp = _bam_prepare_wide(df, params, anchor, pair_model_bundle,
-                           wide_market_df, analysis_cache, p_place)
+                           wide_market_df, analysis_cache, p_place,
+                           meta=meta)
     opps         = wp['opps']
     opps_display = wp['opps_display']
     rule_info    = wp['rule_info']
     wr           = wp['wr']
-    _thr_skip    = wp['_thr_skip']
+    _ = wp['_thr_skip']
     anchor_num   = str(anchor.get('num', ''))
 
     # ---- 固定テンプレ（主経路） ----
@@ -24451,7 +24760,7 @@ def backtest_pnl_from_row(row: dict) -> dict:
     for (a, b) in wide_pairs:
         pair = {a, b}
         if pair.issubset(result3):
-            key = f'payout_wide_{min(a,b,key=lambda x:int(x) if x.isdigit() else 99)}'
+            _ = f'payout_wide_{min(a,b,_key=lambda x:int(x) if x.isdigit() else 99)}'
             # payout_wide_12/13/23 のいずれかを参照
             w12 = float(row.get('payout_wide_12', 0.0) or 0.0)
             w13 = float(row.get('payout_wide_13', 0.0) or 0.0)
@@ -24805,7 +25114,7 @@ def main() -> None:
                 print(f'[R41] result saved -> {_r39_result_path}')
                 # R57: Markdownも同ディレクトリに自動保存
                 try:
-                    import shutil as _shutil
+                    # import shutil as _shutil
                     _r57_report_dir = Path(str(args.result_dir)) / 'reports'
                     _r57_report_dir.mkdir(parents=True, exist_ok=True)
                     _r57_safe_id = str(
