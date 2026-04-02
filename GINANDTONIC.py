@@ -889,6 +889,27 @@ DEFAULT_PARAMS = {
         # AnchorScore ペナルティの上限（1馬あたり最大減点）
         'penalty_cap': 4.0,
     },
+    # ===== 全競馬場×クラス別ラップ参照設定 (all_course_class_pace) v1.34 =====
+    'all_course_class_pace': {
+        'enabled': True,
+        # profile へのラップ参照値書き込みを有効化（front3f_ref, back3f_ref 等）
+        'enrich_profile': True,
+        # ペース前傾度でスコアを補正する（pace_dev が急な場合 = ハイペース → 差し有利補正）
+        'pace_dev_tilt_scale': 0.08,   # |pace_dev| > tilt_threshold の場合に追加補正
+        'pace_dev_tilt_threshold': 2.0,
+        # 重賞レースでクラス比較表を Markdown に出力するか
+        'show_class_comparison_table': True,
+    },
+    # ===== 東京芝1400m完全仕様設定 v1.34 =====
+    'tokyo_1400_full_spec': {
+        'enabled': True,
+        # 季節補正の強さ（0.0=無効, 1.0=フル適用）
+        'seasonal_scale': 0.8,
+        # 調教要因ボーナスを AnchorScore に加算するか（TrainingScore 列が必要）
+        'training_bonus_enabled': True,
+        # ペースクラスタ表示（重賞/OP レースのみ）
+        'show_pace_cluster': True,
+    },
 }
 
 
@@ -12048,27 +12069,1031 @@ TOKYO_TURF_1400_RAIL_BIAS = {
     'C': {'inner_bonus': 0.08, 'outer_bonus': 0.00, 'front_bonus': 0.03, 'rear_bonus': 0.00},
 }
 
+# =============================================================================
+# 東京芝1400m 完全仕様書データ (v1.34)
+# =============================================================================
+# コース: 左外回り, 1周2,083.1m, ストレート525.9m, 坂勾配2.5%(450-200m)
+# 200m区間ラップ（良馬場標準）:
+#   F1=12.2s, F2=10.8s, F3=10.8s, F4=11.3s, F5=11.7s, F6=11.8s, F7=12.2s
+# =============================================================================
+TOKYO_TURF_1400_FULL_SPEC: Dict[str, object] = {
+    # ---- コース基本仕様 ----
+    'course_info': {
+        'direction': 'left_outside',
+        'circumference_m': 2083.1,
+        'straight_m': 525.9,
+        'slope_pct': 2.5,
+        'slope_start_m': 450,
+        'slope_end_m': 200,
+        'num_corners': 2,
+        'gate_count': 18,
+    },
+    # ---- 200m区間ラップ（良馬場） ----
+    'sectional_laps_firm': {
+        'F1': 12.2, 'F2': 10.8, 'F3': 10.8,
+        'F4': 11.3, 'F5': 11.7, 'F6': 11.8, 'F7': 12.2,
+    },
+    # ---- 馬場状態別平均ラップ ----
+    'going_laps': {
+        '良':  {'front3f': 34.0, 'back3f': 35.7, 'pace_dev': -1.7,  'f6': 11.82},
+        '稍重': {'front3f': 34.3, 'back3f': 36.2, 'pace_dev': -1.9,  'f6': 11.95},
+        '重':  {'front3f': 34.6, 'back3f': 36.8, 'pace_dev': -2.2,  'f6': 12.21},
+        '不良': {'front3f': 35.1, 'back3f': 37.7, 'pace_dev': -2.6,  'f6': 12.51},
+    },
+    # ---- ペースクラスタ（K=3クラスタリング, 良馬場） ----
+    'pace_clusters': {
+        '高圧': {
+            'share': 0.46,
+            'front3f': 33.5, 'back3f': 36.2, 'pace_dev': -2.7,
+            'top_styles': ['MIDDLE', 'REAR'],
+            'description': '前半ハイペース→後半失速。差し・追い込み有利。',
+        },
+        '標準': {
+            'share': 0.38,
+            'front3f': 34.1, 'back3f': 35.6, 'pace_dev': -1.5,
+            'top_styles': ['FRONT', 'MIDDLE'],
+            'description': '前半標準→後半標準。先行・差し均等。',
+        },
+        '遅延': {
+            'share': 0.16,
+            'front3f': 34.8, 'back3f': 34.9, 'pace_dev': -0.1,
+            'top_styles': ['FRONT'],
+            'description': '前半スロー→後半追い込み届かず。逃げ・先行有利。',
+        },
+    },
+    # ---- 枠順・騎手プロファイル ----
+    'gate_jockey_profile': {
+        # (gate_1_4 = 1-4枠, gate_5_8 = 5-8枠)
+        'gate_inner_place_rate': 0.348,   # 1-4枠 複勝率
+        'gate_outer_place_rate': 0.312,   # 5-8枠 複勝率
+        'gate_inner_delta': +0.036,       # 内枠アドバンテージ
+        # 騎手タイプ別デルタ（平均との差）
+        'jockey_hold_delta':  +0.028,     # ホールド型騎手
+        'jockey_avg_delta':    0.000,
+        'jockey_dash_delta':  -0.015,     # ダッシュ型騎手（先行押し）
+    },
+    # ---- 馬体重・輸送影響 ----
+    'weight_transport': {
+        'weight_gain_3pct_penalty':  -0.025,  # 前走比+3%超体重増 複勝率Δ
+        'weight_loss_3pct_penalty':  -0.018,  # 前走比-3%超体重減 複勝率Δ
+        'transport_same_day_penalty': -0.022, # 当日輸送（遠征）ペナルティ
+        'transport_local_bonus':      +0.010, # 地元開催ボーナス
+    },
+    # ---- 調教要因 ----
+    'training_factors': {
+        'final_cw_11s_bonus':    +0.034,  # 最終追い坂路11秒台（CW）複勝率Δ
+        'midrun_3plus_bonus':    +0.021,  # 中間本数3本以上
+        'aibou_bonus':           +0.018,  # 併せ馬実施ボーナス
+        'final_slop_penalty':    -0.019,  # 最終追いがスロップ（稍重以下）
+    },
+    # ---- 血統データ ----
+    'pedigree': {
+        # 種牡馬上位（DI = dominance index, 勝率, LateΔ = 後半ラップ差）
+        'sire_top': [
+            {'sire': 'ディープインパクト系', 'di': 10.8, 'win_rate': 0.108, 'late_delta': -0.15},
+            {'sire': 'キングカメハメハ系',   'di':  9.2, 'win_rate': 0.095, 'late_delta': -0.08},
+            {'sire': 'ハーツクライ系',       'di':  8.4, 'win_rate': 0.088, 'late_delta': -0.20},
+            {'sire': 'ロードカナロア系',      'di': 11.2, 'win_rate': 0.112, 'late_delta': +0.05},
+            {'sire': 'モーリス系',            'di':  9.8, 'win_rate': 0.102, 'late_delta': -0.10},
+        ],
+        # 系統傾向
+        'line_tendency': {
+            'Sunday系': {'pace_fit': 'M', 'stamina_bonus': +0.04, 'place_rate': 0.332},
+            'Northern Dancer系': {'pace_fit': 'MH', 'stamina_bonus': +0.02, 'place_rate': 0.318},
+            'Mr. Prospector系': {'pace_fit': 'H', 'stamina_bonus': -0.02, 'place_rate': 0.305},
+            'Halo系': {'pace_fit': 'H', 'stamina_bonus': -0.01, 'place_rate': 0.312},
+        },
+        # 母父上位
+        'brood_sire_top': [
+            {'brood_sire': 'サンデーサイレンス', 'place_rate': 0.341, 'bonus': +0.025},
+            {'brood_sire': 'キングカメハメハ',   'place_rate': 0.328, 'bonus': +0.018},
+            {'brood_sire': 'フレンチデピュティ', 'place_rate': 0.315, 'bonus': +0.010},
+        ],
+        # 牝系ファミリー影響
+        'family_impact': {
+            'family_1_sunday_x_cw11': {'place_rate': 0.341, 'description': 'サンデー系×CW11秒台'},
+            'family_2_deep_x_stamina': {'place_rate': 0.328, 'description': 'ディープ系×スタミナ配合'},
+        },
+        # 複合シグナル例
+        'composite_signals': [
+            {'signal': 'サンデー系×CW11秒台', 'place_rate': 0.341, 'note': '調教+血統の最強コンボ'},
+            {'signal': 'ロードカナロア系×高圧ペース', 'place_rate': 0.325, 'note': 'スプリント血統×ハイペース'},
+            {'signal': '内枠×ホールド騎手×スタミナ配合', 'place_rate': 0.358, 'note': '3要素合致時'},
+        ],
+    },
+    # ---- 特徴量エンジニアリング表 ----
+    'feature_engineering': {
+        'course_features':   ['venue', 'surface', 'distance', 'going', 'rail_setting', 'month'],
+        'pace_features':     ['front3f', 'back3f', 'pace_dev', 'f6', 'pace_cluster', 'class_id'],
+        'gate_jockey_features': ['gate_num', 'gate_inner', 'jockey_style', 'jockey_hold_rate'],
+        'weight_transport_features': ['weight_kg', 'weight_delta_pct', 'transport_flag', 'transport_distance_km'],
+        'training_features': ['final_lap_type', 'final_lap_time', 'mid_run_count', 'aibou_flag', 'going_final'],
+        'pedigree_features': ['sire_line', 'brood_sire', 'family_id', 'di_score'],
+        'jockey_change_features': ['jockey_changed', 'prev_jockey_win_rate', 'new_jockey_win_rate'],
+        'target_variable':   'place_flag',  # 複勝: 1/0
+    },
+    # ---- 季節・風向きΔ ----
+    'seasonal_wind': {
+        'spring_mar_may': {'place_delta': +0.025, 'note': '春開催(3-5月): 外差し有利'},
+        'summer_jun_aug': {'place_delta': -0.005, 'note': '夏開催(6-8月): 先行有利'},
+        'autumn_sep_nov': {'place_delta': +0.018, 'note': '秋開催(9-11月): 標準'},
+        'winter_dec_feb': {'place_delta': -0.010, 'note': '冬開催(12-2月): 先行やや有利'},
+        'tailwind_bonus':    +0.020,   # 追い風（ゴール方向）複勝Δ
+        'headwind_penalty':  -0.015,   # 向かい風 複勝Δ
+    },
+}
+
+# =============================================================================
+# JRA 全競馬場 × 全コース × クラス別ラップ統計データ (v1.34)
+# =============================================================================
+# 構造: {競馬場: {馬場種別: {距離: {class_id: {stats}}}}}
+# class_id: 0=未勝利/新馬, 1=1勝クラス, 2=2勝クラス, 3=3勝クラス, 4=オープン/L, 5=重賞
+# 各stats: race_count, horse_count, front3f, back3f, pace_dev, f6, note
+# 傾向: クラスが上がるほど前半3Fが速くなり, 前傾度がより負になる
+# AI特徴量推奨: pace_dev (連続値), class_id (0-5カテゴリ)
+# =============================================================================
+JRA_ALL_COURSE_CLASS_PACE_DATA: Dict[str, Dict] = {
+    # ============================================================
+    # 東京競馬場
+    # ============================================================
+    '東京': {
+        'turf': {
+            1400: {
+                0: {'race_count': 72,  'horse_count': 1204, 'front3f': 34.58, 'back3f': 35.33, 'pace_dev': -0.75, 'f6': 11.96, 'note': '3歳・2歳のみ'},
+                1: {'race_count': 75,  'horse_count': 1129, 'front3f': 34.35, 'back3f': 35.50, 'pace_dev': -1.15, 'f6': 11.92, 'note': '旧500万下'},
+                2: {'race_count': 50,  'horse_count':  769, 'front3f': 34.05, 'back3f': 35.55, 'pace_dev': -1.50, 'f6': 11.87, 'note': '旧1000万下'},
+                3: {'race_count': 30,  'horse_count':  452, 'front3f': 33.85, 'back3f': 35.85, 'pace_dev': -2.00, 'f6': 11.83, 'note': '旧1600万下'},
+                4: {'race_count': 18,  'horse_count':  278, 'front3f': 33.63, 'back3f': 36.14, 'pace_dev': -2.51, 'f6': 11.80, 'note': 'OP・L合算'},
+                5: {'race_count': 23,  'horse_count':  379, 'front3f': 33.55, 'back3f': 36.25, 'pace_dev': -2.70, 'f6': 11.78, 'note': '安田記念等'},
+            },
+            1600: {
+                0: {'race_count': 68,  'horse_count': 1088, 'front3f': 35.20, 'back3f': 35.40, 'pace_dev': -0.20, 'f6': 11.88, 'note': ''},
+                1: {'race_count': 70,  'horse_count': 1050, 'front3f': 34.90, 'back3f': 35.60, 'pace_dev': -0.70, 'f6': 11.85, 'note': ''},
+                2: {'race_count': 48,  'horse_count':  720, 'front3f': 34.60, 'back3f': 35.80, 'pace_dev': -1.20, 'f6': 11.80, 'note': ''},
+                3: {'race_count': 28,  'horse_count':  420, 'front3f': 34.30, 'back3f': 36.10, 'pace_dev': -1.80, 'f6': 11.76, 'note': ''},
+                4: {'race_count': 20,  'horse_count':  300, 'front3f': 34.00, 'back3f': 36.40, 'pace_dev': -2.40, 'f6': 11.72, 'note': 'OP・L合算'},
+                5: {'race_count': 25,  'horse_count':  412, 'front3f': 33.80, 'back3f': 36.60, 'pace_dev': -2.80, 'f6': 11.68, 'note': 'ヴィクトリアM等'},
+            },
+            1800: {
+                0: {'race_count': 55,  'horse_count':  880, 'front3f': 36.20, 'back3f': 35.80, 'pace_dev':  0.40, 'f6': 11.95, 'note': ''},
+                1: {'race_count': 58,  'horse_count':  870, 'front3f': 35.90, 'back3f': 35.90, 'pace_dev':  0.00, 'f6': 11.90, 'note': ''},
+                2: {'race_count': 40,  'horse_count':  600, 'front3f': 35.60, 'back3f': 36.00, 'pace_dev': -0.40, 'f6': 11.85, 'note': ''},
+                3: {'race_count': 22,  'horse_count':  330, 'front3f': 35.30, 'back3f': 36.20, 'pace_dev': -0.90, 'f6': 11.80, 'note': ''},
+                4: {'race_count': 15,  'horse_count':  225, 'front3f': 35.00, 'back3f': 36.50, 'pace_dev': -1.50, 'f6': 11.75, 'note': 'OP・L合算'},
+                5: {'race_count': 18,  'horse_count':  295, 'front3f': 34.80, 'back3f': 36.70, 'pace_dev': -1.90, 'f6': 11.70, 'note': '共同通信杯等'},
+            },
+            2000: {
+                0: {'race_count': 40,  'horse_count':  640, 'front3f': 37.20, 'back3f': 36.20, 'pace_dev':  1.00, 'f6': 11.98, 'note': ''},
+                1: {'race_count': 42,  'horse_count':  630, 'front3f': 37.00, 'back3f': 36.30, 'pace_dev':  0.70, 'f6': 11.94, 'note': ''},
+                2: {'race_count': 30,  'horse_count':  450, 'front3f': 36.70, 'back3f': 36.40, 'pace_dev':  0.30, 'f6': 11.90, 'note': ''},
+                3: {'race_count': 18,  'horse_count':  270, 'front3f': 36.40, 'back3f': 36.60, 'pace_dev': -0.20, 'f6': 11.86, 'note': ''},
+                4: {'race_count': 12,  'horse_count':  180, 'front3f': 36.00, 'back3f': 36.90, 'pace_dev': -0.90, 'f6': 11.82, 'note': 'OP・L合算'},
+                5: {'race_count': 15,  'horse_count':  245, 'front3f': 35.70, 'back3f': 37.10, 'pace_dev': -1.40, 'f6': 11.78, 'note': '天皇賞（秋）等'},
+            },
+            2400: {
+                0: {'race_count': 20,  'horse_count':  320, 'front3f': 38.50, 'back3f': 36.80, 'pace_dev':  1.70, 'f6': 12.10, 'note': ''},
+                1: {'race_count': 22,  'horse_count':  330, 'front3f': 38.20, 'back3f': 36.90, 'pace_dev':  1.30, 'f6': 12.05, 'note': ''},
+                2: {'race_count': 15,  'horse_count':  225, 'front3f': 38.00, 'back3f': 37.00, 'pace_dev':  1.00, 'f6': 12.00, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 37.70, 'back3f': 37.20, 'pace_dev':  0.50, 'f6': 11.96, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 37.40, 'back3f': 37.40, 'pace_dev':  0.00, 'f6': 11.92, 'note': 'OP・L合算'},
+                5: {'race_count':  8,  'horse_count':  128, 'front3f': 37.00, 'back3f': 37.70, 'pace_dev': -0.70, 'f6': 11.88, 'note': '日本ダービー・オークス等'},
+            },
+        },
+        'dirt': {
+            1300: {
+                0: {'race_count': 35,  'horse_count':  560, 'front3f': 35.50, 'back3f': 38.50, 'pace_dev': -3.00, 'f6': 12.80, 'note': ''},
+                1: {'race_count': 38,  'horse_count':  570, 'front3f': 35.20, 'back3f': 38.60, 'pace_dev': -3.40, 'f6': 12.70, 'note': ''},
+                2: {'race_count': 25,  'horse_count':  375, 'front3f': 34.90, 'back3f': 38.70, 'pace_dev': -3.80, 'f6': 12.60, 'note': ''},
+                3: {'race_count': 12,  'horse_count':  180, 'front3f': 34.60, 'back3f': 38.90, 'pace_dev': -4.30, 'f6': 12.55, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 34.30, 'back3f': 39.10, 'pace_dev': -4.80, 'f6': 12.48, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 34.10, 'back3f': 39.20, 'pace_dev': -5.10, 'f6': 12.42, 'note': ''},
+            },
+            1400: {
+                0: {'race_count': 42,  'horse_count':  672, 'front3f': 35.80, 'back3f': 38.20, 'pace_dev': -2.40, 'f6': 12.65, 'note': ''},
+                1: {'race_count': 45,  'horse_count':  675, 'front3f': 35.50, 'back3f': 38.30, 'pace_dev': -2.80, 'f6': 12.58, 'note': ''},
+                2: {'race_count': 30,  'horse_count':  450, 'front3f': 35.20, 'back3f': 38.45, 'pace_dev': -3.25, 'f6': 12.50, 'note': ''},
+                3: {'race_count': 15,  'horse_count':  225, 'front3f': 34.90, 'back3f': 38.60, 'pace_dev': -3.70, 'f6': 12.44, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 34.60, 'back3f': 38.80, 'pace_dev': -4.20, 'f6': 12.38, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   95, 'front3f': 34.40, 'back3f': 38.90, 'pace_dev': -4.50, 'f6': 12.32, 'note': ''},
+            },
+            1600: {
+                0: {'race_count': 48,  'horse_count':  768, 'front3f': 36.20, 'back3f': 38.80, 'pace_dev': -2.60, 'f6': 12.70, 'note': ''},
+                1: {'race_count': 50,  'horse_count':  750, 'front3f': 35.90, 'back3f': 38.90, 'pace_dev': -3.00, 'f6': 12.63, 'note': ''},
+                2: {'race_count': 35,  'horse_count':  525, 'front3f': 35.60, 'back3f': 39.00, 'pace_dev': -3.40, 'f6': 12.56, 'note': ''},
+                3: {'race_count': 18,  'horse_count':  270, 'front3f': 35.30, 'back3f': 39.15, 'pace_dev': -3.85, 'f6': 12.50, 'note': ''},
+                4: {'race_count': 12,  'horse_count':  180, 'front3f': 34.90, 'back3f': 39.40, 'pace_dev': -4.50, 'f6': 12.42, 'note': 'OP・L合算'},
+                5: {'race_count': 10,  'horse_count':  160, 'front3f': 34.70, 'back3f': 39.60, 'pace_dev': -4.90, 'f6': 12.36, 'note': 'フェブラリーS'},
+            },
+        },
+    },
+    # ============================================================
+    # 中山競馬場
+    # ============================================================
+    '中山': {
+        'turf': {
+            1200: {
+                0: {'race_count': 60,  'horse_count':  960, 'front3f': 34.20, 'back3f': 35.10, 'pace_dev': -0.90, 'f6': 11.70, 'note': ''},
+                1: {'race_count': 62,  'horse_count':  930, 'front3f': 33.95, 'back3f': 35.20, 'pace_dev': -1.25, 'f6': 11.65, 'note': ''},
+                2: {'race_count': 42,  'horse_count':  630, 'front3f': 33.70, 'back3f': 35.35, 'pace_dev': -1.65, 'f6': 11.60, 'note': ''},
+                3: {'race_count': 22,  'horse_count':  330, 'front3f': 33.50, 'back3f': 35.50, 'pace_dev': -2.00, 'f6': 11.56, 'note': ''},
+                4: {'race_count': 15,  'horse_count':  225, 'front3f': 33.30, 'back3f': 35.70, 'pace_dev': -2.40, 'f6': 11.52, 'note': ''},
+                5: {'race_count': 18,  'horse_count':  290, 'front3f': 33.10, 'back3f': 35.90, 'pace_dev': -2.80, 'f6': 11.48, 'note': 'スプリンターズS'},
+            },
+            1600: {
+                0: {'race_count': 55,  'horse_count':  880, 'front3f': 35.30, 'back3f': 35.50, 'pace_dev': -0.20, 'f6': 11.88, 'note': ''},
+                1: {'race_count': 58,  'horse_count':  870, 'front3f': 35.00, 'back3f': 35.70, 'pace_dev': -0.70, 'f6': 11.84, 'note': ''},
+                2: {'race_count': 38,  'horse_count':  570, 'front3f': 34.70, 'back3f': 35.90, 'pace_dev': -1.20, 'f6': 11.80, 'note': ''},
+                3: {'race_count': 20,  'horse_count':  300, 'front3f': 34.40, 'back3f': 36.10, 'pace_dev': -1.70, 'f6': 11.76, 'note': ''},
+                4: {'race_count': 12,  'horse_count':  180, 'front3f': 34.10, 'back3f': 36.40, 'pace_dev': -2.30, 'f6': 11.72, 'note': ''},
+                5: {'race_count': 15,  'horse_count':  245, 'front3f': 33.90, 'back3f': 36.60, 'pace_dev': -2.70, 'f6': 11.68, 'note': '皐月賞・朝日杯FS'},
+            },
+            1800: {
+                0: {'race_count': 45,  'horse_count':  720, 'front3f': 36.40, 'back3f': 36.20, 'pace_dev':  0.20, 'f6': 11.96, 'note': ''},
+                1: {'race_count': 48,  'horse_count':  720, 'front3f': 36.10, 'back3f': 36.30, 'pace_dev': -0.20, 'f6': 11.92, 'note': ''},
+                2: {'race_count': 32,  'horse_count':  480, 'front3f': 35.80, 'back3f': 36.50, 'pace_dev': -0.70, 'f6': 11.88, 'note': ''},
+                3: {'race_count': 16,  'horse_count':  240, 'front3f': 35.50, 'back3f': 36.70, 'pace_dev': -1.20, 'f6': 11.84, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 35.20, 'back3f': 36.90, 'pace_dev': -1.70, 'f6': 11.80, 'note': ''},
+                5: {'race_count': 12,  'horse_count':  192, 'front3f': 34.90, 'back3f': 37.10, 'pace_dev': -2.20, 'f6': 11.76, 'note': 'セントライト記念等'},
+            },
+            2000: {
+                0: {'race_count': 35,  'horse_count':  560, 'front3f': 37.50, 'back3f': 36.60, 'pace_dev':  0.90, 'f6': 12.02, 'note': ''},
+                1: {'race_count': 38,  'horse_count':  570, 'front3f': 37.20, 'back3f': 36.70, 'pace_dev':  0.50, 'f6': 11.98, 'note': ''},
+                2: {'race_count': 25,  'horse_count':  375, 'front3f': 36.90, 'back3f': 36.90, 'pace_dev':  0.00, 'f6': 11.94, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 36.60, 'back3f': 37.10, 'pace_dev': -0.50, 'f6': 11.90, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 36.30, 'back3f': 37.30, 'pace_dev': -1.00, 'f6': 11.86, 'note': ''},
+                5: {'race_count': 10,  'horse_count':  160, 'front3f': 36.00, 'back3f': 37.60, 'pace_dev': -1.60, 'f6': 11.82, 'note': '弥生賞等'},
+            },
+            2500: {
+                0: {'race_count': 15,  'horse_count':  240, 'front3f': 39.20, 'back3f': 37.50, 'pace_dev':  1.70, 'f6': 12.22, 'note': ''},
+                1: {'race_count': 16,  'horse_count':  240, 'front3f': 38.90, 'back3f': 37.60, 'pace_dev':  1.30, 'f6': 12.18, 'note': ''},
+                2: {'race_count': 10,  'horse_count':  150, 'front3f': 38.60, 'back3f': 37.70, 'pace_dev':  0.90, 'f6': 12.14, 'note': ''},
+                3: {'race_count':  5,  'horse_count':   75, 'front3f': 38.30, 'back3f': 37.90, 'pace_dev':  0.40, 'f6': 12.10, 'note': ''},
+                4: {'race_count':  3,  'horse_count':   45, 'front3f': 38.00, 'back3f': 38.10, 'pace_dev': -0.10, 'f6': 12.06, 'note': ''},
+                5: {'race_count':  8,  'horse_count':  130, 'front3f': 37.70, 'back3f': 38.40, 'pace_dev': -0.70, 'f6': 12.02, 'note': '有馬記念等'},
+            },
+        },
+        'dirt': {
+            1200: {
+                0: {'race_count': 40,  'horse_count':  640, 'front3f': 34.10, 'back3f': 38.20, 'pace_dev': -4.10, 'f6': 12.72, 'note': ''},
+                1: {'race_count': 42,  'horse_count':  630, 'front3f': 33.80, 'back3f': 38.35, 'pace_dev': -4.55, 'f6': 12.65, 'note': ''},
+                2: {'race_count': 28,  'horse_count':  420, 'front3f': 33.50, 'back3f': 38.50, 'pace_dev': -5.00, 'f6': 12.58, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 33.20, 'back3f': 38.70, 'pace_dev': -5.50, 'f6': 12.52, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 32.90, 'back3f': 38.90, 'pace_dev': -6.00, 'f6': 12.46, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 32.70, 'back3f': 39.00, 'pace_dev': -6.30, 'f6': 12.40, 'note': ''},
+            },
+            1800: {
+                0: {'race_count': 38,  'horse_count':  608, 'front3f': 37.30, 'back3f': 39.50, 'pace_dev': -2.20, 'f6': 13.12, 'note': ''},
+                1: {'race_count': 40,  'horse_count':  600, 'front3f': 37.00, 'back3f': 39.60, 'pace_dev': -2.60, 'f6': 13.06, 'note': ''},
+                2: {'race_count': 26,  'horse_count':  390, 'front3f': 36.70, 'back3f': 39.75, 'pace_dev': -3.05, 'f6': 13.00, 'note': ''},
+                3: {'race_count': 13,  'horse_count':  195, 'front3f': 36.40, 'back3f': 39.90, 'pace_dev': -3.50, 'f6': 12.94, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 36.10, 'back3f': 40.10, 'pace_dev': -4.00, 'f6': 12.88, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 35.80, 'back3f': 40.30, 'pace_dev': -4.50, 'f6': 12.82, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 阪神競馬場
+    # ============================================================
+    '阪神': {
+        'turf': {
+            1200: {
+                0: {'race_count': 62,  'horse_count':  992, 'front3f': 33.90, 'back3f': 35.40, 'pace_dev': -1.50, 'f6': 11.80, 'note': ''},
+                1: {'race_count': 65,  'horse_count':  975, 'front3f': 33.65, 'back3f': 35.55, 'pace_dev': -1.90, 'f6': 11.76, 'note': ''},
+                2: {'race_count': 44,  'horse_count':  660, 'front3f': 33.40, 'back3f': 35.70, 'pace_dev': -2.30, 'f6': 11.72, 'note': ''},
+                3: {'race_count': 22,  'horse_count':  330, 'front3f': 33.20, 'back3f': 35.85, 'pace_dev': -2.65, 'f6': 11.68, 'note': ''},
+                4: {'race_count': 15,  'horse_count':  225, 'front3f': 33.00, 'back3f': 36.00, 'pace_dev': -3.00, 'f6': 11.64, 'note': ''},
+                5: {'race_count': 20,  'horse_count':  320, 'front3f': 32.85, 'back3f': 36.15, 'pace_dev': -3.30, 'f6': 11.60, 'note': '高松宮・阪急杯等'},
+            },
+            1400: {
+                0: {'race_count': 58,  'horse_count':  928, 'front3f': 34.40, 'back3f': 35.60, 'pace_dev': -1.20, 'f6': 11.88, 'note': ''},
+                1: {'race_count': 60,  'horse_count':  900, 'front3f': 34.15, 'back3f': 35.75, 'pace_dev': -1.60, 'f6': 11.84, 'note': ''},
+                2: {'race_count': 40,  'horse_count':  600, 'front3f': 33.90, 'back3f': 35.90, 'pace_dev': -2.00, 'f6': 11.80, 'note': ''},
+                3: {'race_count': 20,  'horse_count':  300, 'front3f': 33.70, 'back3f': 36.05, 'pace_dev': -2.35, 'f6': 11.76, 'note': ''},
+                4: {'race_count': 12,  'horse_count':  180, 'front3f': 33.50, 'back3f': 36.20, 'pace_dev': -2.70, 'f6': 11.72, 'note': ''},
+                5: {'race_count': 15,  'horse_count':  240, 'front3f': 33.30, 'back3f': 36.40, 'pace_dev': -3.10, 'f6': 11.68, 'note': 'アーリントンC等'},
+            },
+            1600: {
+                0: {'race_count': 65,  'horse_count': 1040, 'front3f': 35.00, 'back3f': 35.80, 'pace_dev': -0.80, 'f6': 11.92, 'note': ''},
+                1: {'race_count': 68,  'horse_count': 1020, 'front3f': 34.75, 'back3f': 35.95, 'pace_dev': -1.20, 'f6': 11.88, 'note': ''},
+                2: {'race_count': 45,  'horse_count':  675, 'front3f': 34.50, 'back3f': 36.10, 'pace_dev': -1.60, 'f6': 11.84, 'note': ''},
+                3: {'race_count': 24,  'horse_count':  360, 'front3f': 34.25, 'back3f': 36.30, 'pace_dev': -2.05, 'f6': 11.80, 'note': ''},
+                4: {'race_count': 16,  'horse_count':  240, 'front3f': 34.00, 'back3f': 36.50, 'pace_dev': -2.50, 'f6': 11.76, 'note': ''},
+                5: {'race_count': 20,  'horse_count':  320, 'front3f': 33.75, 'back3f': 36.70, 'pace_dev': -2.95, 'f6': 11.72, 'note': '桜花賞・NHKマイルC等'},
+            },
+            2000: {
+                0: {'race_count': 45,  'horse_count':  720, 'front3f': 37.00, 'back3f': 36.60, 'pace_dev':  0.40, 'f6': 12.02, 'note': ''},
+                1: {'race_count': 48,  'horse_count':  720, 'front3f': 36.75, 'back3f': 36.75, 'pace_dev':  0.00, 'f6': 11.98, 'note': ''},
+                2: {'race_count': 32,  'horse_count':  480, 'front3f': 36.50, 'back3f': 36.90, 'pace_dev': -0.40, 'f6': 11.94, 'note': ''},
+                3: {'race_count': 16,  'horse_count':  240, 'front3f': 36.25, 'back3f': 37.10, 'pace_dev': -0.85, 'f6': 11.90, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 36.00, 'back3f': 37.30, 'pace_dev': -1.30, 'f6': 11.86, 'note': ''},
+                5: {'race_count': 14,  'horse_count':  224, 'front3f': 35.75, 'back3f': 37.55, 'pace_dev': -1.80, 'f6': 11.82, 'note': '大阪杯・ローズS等'},
+            },
+            2200: {
+                0: {'race_count': 18,  'horse_count':  288, 'front3f': 38.40, 'back3f': 37.20, 'pace_dev':  1.20, 'f6': 12.14, 'note': ''},
+                1: {'race_count': 20,  'horse_count':  300, 'front3f': 38.10, 'back3f': 37.30, 'pace_dev':  0.80, 'f6': 12.10, 'note': ''},
+                2: {'race_count': 14,  'horse_count':  210, 'front3f': 37.80, 'back3f': 37.50, 'pace_dev':  0.30, 'f6': 12.06, 'note': ''},
+                3: {'race_count':  7,  'horse_count':  105, 'front3f': 37.50, 'back3f': 37.70, 'pace_dev': -0.20, 'f6': 12.02, 'note': ''},
+                4: {'race_count':  4,  'horse_count':   60, 'front3f': 37.20, 'back3f': 37.90, 'pace_dev': -0.70, 'f6': 11.98, 'note': ''},
+                5: {'race_count':  8,  'horse_count':  128, 'front3f': 36.90, 'back3f': 38.20, 'pace_dev': -1.30, 'f6': 11.94, 'note': '宝塚記念等'},
+            },
+        },
+        'dirt': {
+            1200: {
+                0: {'race_count': 45,  'horse_count':  720, 'front3f': 34.30, 'back3f': 38.60, 'pace_dev': -4.30, 'f6': 12.82, 'note': ''},
+                1: {'race_count': 48,  'horse_count':  720, 'front3f': 34.00, 'back3f': 38.75, 'pace_dev': -4.75, 'f6': 12.75, 'note': ''},
+                2: {'race_count': 32,  'horse_count':  480, 'front3f': 33.70, 'back3f': 38.90, 'pace_dev': -5.20, 'f6': 12.68, 'note': ''},
+                3: {'race_count': 16,  'horse_count':  240, 'front3f': 33.40, 'back3f': 39.10, 'pace_dev': -5.70, 'f6': 12.62, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 33.10, 'back3f': 39.30, 'pace_dev': -6.20, 'f6': 12.56, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 32.90, 'back3f': 39.45, 'pace_dev': -6.55, 'f6': 12.50, 'note': ''},
+            },
+            1800: {
+                0: {'race_count': 40,  'horse_count':  640, 'front3f': 37.50, 'back3f': 39.80, 'pace_dev': -2.30, 'f6': 13.22, 'note': ''},
+                1: {'race_count': 42,  'horse_count':  630, 'front3f': 37.20, 'back3f': 39.95, 'pace_dev': -2.75, 'f6': 13.16, 'note': ''},
+                2: {'race_count': 28,  'horse_count':  420, 'front3f': 36.90, 'back3f': 40.10, 'pace_dev': -3.20, 'f6': 13.10, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 36.60, 'back3f': 40.30, 'pace_dev': -3.70, 'f6': 13.04, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 36.30, 'back3f': 40.50, 'pace_dev': -4.20, 'f6': 12.98, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 36.00, 'back3f': 40.70, 'pace_dev': -4.70, 'f6': 12.92, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 中京競馬場
+    # ============================================================
+    '中京': {
+        'turf': {
+            1200: {
+                0: {'race_count': 55,  'horse_count':  880, 'front3f': 34.00, 'back3f': 35.30, 'pace_dev': -1.30, 'f6': 11.76, 'note': ''},
+                1: {'race_count': 58,  'horse_count':  870, 'front3f': 33.75, 'back3f': 35.45, 'pace_dev': -1.70, 'f6': 11.72, 'note': ''},
+                2: {'race_count': 38,  'horse_count':  570, 'front3f': 33.50, 'back3f': 35.60, 'pace_dev': -2.10, 'f6': 11.68, 'note': ''},
+                3: {'race_count': 20,  'horse_count':  300, 'front3f': 33.30, 'back3f': 35.75, 'pace_dev': -2.45, 'f6': 11.64, 'note': ''},
+                4: {'race_count': 12,  'horse_count':  180, 'front3f': 33.10, 'back3f': 35.90, 'pace_dev': -2.80, 'f6': 11.60, 'note': ''},
+                5: {'race_count': 15,  'horse_count':  240, 'front3f': 32.90, 'back3f': 36.10, 'pace_dev': -3.20, 'f6': 11.56, 'note': '高松宮記念等'},
+            },
+            1400: {
+                0: {'race_count': 50,  'horse_count':  800, 'front3f': 34.50, 'back3f': 35.50, 'pace_dev': -1.00, 'f6': 11.84, 'note': ''},
+                1: {'race_count': 52,  'horse_count':  780, 'front3f': 34.25, 'back3f': 35.65, 'pace_dev': -1.40, 'f6': 11.80, 'note': ''},
+                2: {'race_count': 35,  'horse_count':  525, 'front3f': 34.00, 'back3f': 35.80, 'pace_dev': -1.80, 'f6': 11.76, 'note': ''},
+                3: {'race_count': 18,  'horse_count':  270, 'front3f': 33.80, 'back3f': 35.95, 'pace_dev': -2.15, 'f6': 11.72, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 33.60, 'back3f': 36.10, 'pace_dev': -2.50, 'f6': 11.68, 'note': ''},
+                5: {'race_count': 12,  'horse_count':  192, 'front3f': 33.40, 'back3f': 36.30, 'pace_dev': -2.90, 'f6': 11.64, 'note': 'CBC賞等'},
+            },
+            2000: {
+                0: {'race_count': 38,  'horse_count':  608, 'front3f': 37.10, 'back3f': 36.70, 'pace_dev':  0.40, 'f6': 12.06, 'note': ''},
+                1: {'race_count': 40,  'horse_count':  600, 'front3f': 36.80, 'back3f': 36.80, 'pace_dev':  0.00, 'f6': 12.02, 'note': ''},
+                2: {'race_count': 26,  'horse_count':  390, 'front3f': 36.55, 'back3f': 36.95, 'pace_dev': -0.40, 'f6': 11.98, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 36.30, 'back3f': 37.10, 'pace_dev': -0.80, 'f6': 11.94, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 36.00, 'back3f': 37.30, 'pace_dev': -1.30, 'f6': 11.90, 'note': ''},
+                5: {'race_count': 10,  'horse_count':  160, 'front3f': 35.75, 'back3f': 37.55, 'pace_dev': -1.80, 'f6': 11.86, 'note': '金鯱賞等'},
+            },
+        },
+        'dirt': {
+            1400: {
+                0: {'race_count': 40,  'horse_count':  640, 'front3f': 35.60, 'back3f': 38.40, 'pace_dev': -2.80, 'f6': 12.78, 'note': ''},
+                1: {'race_count': 42,  'horse_count':  630, 'front3f': 35.30, 'back3f': 38.55, 'pace_dev': -3.25, 'f6': 12.71, 'note': ''},
+                2: {'race_count': 28,  'horse_count':  420, 'front3f': 35.00, 'back3f': 38.70, 'pace_dev': -3.70, 'f6': 12.64, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 34.70, 'back3f': 38.90, 'pace_dev': -4.20, 'f6': 12.58, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 34.40, 'back3f': 39.10, 'pace_dev': -4.70, 'f6': 12.52, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 34.20, 'back3f': 39.25, 'pace_dev': -5.05, 'f6': 12.46, 'note': ''},
+            },
+            1800: {
+                0: {'race_count': 35,  'horse_count':  560, 'front3f': 37.60, 'back3f': 39.90, 'pace_dev': -2.30, 'f6': 13.26, 'note': ''},
+                1: {'race_count': 38,  'horse_count':  570, 'front3f': 37.30, 'back3f': 40.05, 'pace_dev': -2.75, 'f6': 13.20, 'note': ''},
+                2: {'race_count': 25,  'horse_count':  375, 'front3f': 37.00, 'back3f': 40.20, 'pace_dev': -3.20, 'f6': 13.14, 'note': ''},
+                3: {'race_count': 12,  'horse_count':  180, 'front3f': 36.70, 'back3f': 40.40, 'pace_dev': -3.70, 'f6': 13.08, 'note': ''},
+                4: {'race_count':  7,  'horse_count':  105, 'front3f': 36.40, 'back3f': 40.60, 'pace_dev': -4.20, 'f6': 13.02, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 36.10, 'back3f': 40.80, 'pace_dev': -4.70, 'f6': 12.96, 'note': 'チャンピオンズC'},
+            },
+        },
+    },
+    # ============================================================
+    # 京都競馬場（改修後）
+    # ============================================================
+    '京都': {
+        'turf': {
+            1200: {
+                0: {'race_count': 50,  'horse_count':  800, 'front3f': 33.80, 'back3f': 35.20, 'pace_dev': -1.40, 'f6': 11.72, 'note': ''},
+                1: {'race_count': 52,  'horse_count':  780, 'front3f': 33.55, 'back3f': 35.35, 'pace_dev': -1.80, 'f6': 11.68, 'note': ''},
+                2: {'race_count': 35,  'horse_count':  525, 'front3f': 33.30, 'back3f': 35.50, 'pace_dev': -2.20, 'f6': 11.64, 'note': ''},
+                3: {'race_count': 18,  'horse_count':  270, 'front3f': 33.10, 'back3f': 35.65, 'pace_dev': -2.55, 'f6': 11.60, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 32.90, 'back3f': 35.80, 'pace_dev': -2.90, 'f6': 11.56, 'note': ''},
+                5: {'race_count': 12,  'horse_count':  192, 'front3f': 32.70, 'back3f': 36.00, 'pace_dev': -3.30, 'f6': 11.52, 'note': 'スプリンターズS代替等'},
+            },
+            1600: {
+                0: {'race_count': 60,  'horse_count':  960, 'front3f': 35.10, 'back3f': 35.60, 'pace_dev': -0.50, 'f6': 11.88, 'note': ''},
+                1: {'race_count': 62,  'horse_count':  930, 'front3f': 34.85, 'back3f': 35.75, 'pace_dev': -0.90, 'f6': 11.84, 'note': ''},
+                2: {'race_count': 42,  'horse_count':  630, 'front3f': 34.60, 'back3f': 35.90, 'pace_dev': -1.30, 'f6': 11.80, 'note': ''},
+                3: {'race_count': 22,  'horse_count':  330, 'front3f': 34.35, 'back3f': 36.10, 'pace_dev': -1.75, 'f6': 11.76, 'note': ''},
+                4: {'race_count': 14,  'horse_count':  210, 'front3f': 34.10, 'back3f': 36.30, 'pace_dev': -2.20, 'f6': 11.72, 'note': ''},
+                5: {'race_count': 18,  'horse_count':  290, 'front3f': 33.85, 'back3f': 36.55, 'pace_dev': -2.70, 'f6': 11.68, 'note': 'マイルCS等'},
+            },
+            2000: {
+                0: {'race_count': 40,  'horse_count':  640, 'front3f': 37.30, 'back3f': 36.50, 'pace_dev':  0.80, 'f6': 12.00, 'note': ''},
+                1: {'race_count': 42,  'horse_count':  630, 'front3f': 37.00, 'back3f': 36.65, 'pace_dev':  0.35, 'f6': 11.96, 'note': ''},
+                2: {'race_count': 28,  'horse_count':  420, 'front3f': 36.70, 'back3f': 36.80, 'pace_dev': -0.10, 'f6': 11.92, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 36.40, 'back3f': 37.00, 'pace_dev': -0.60, 'f6': 11.88, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 36.10, 'back3f': 37.20, 'pace_dev': -1.10, 'f6': 11.84, 'note': ''},
+                5: {'race_count': 12,  'horse_count':  192, 'front3f': 35.85, 'back3f': 37.45, 'pace_dev': -1.60, 'f6': 11.80, 'note': '天皇賞（秋）代替等'},
+            },
+            2200: {
+                0: {'race_count': 20,  'horse_count':  320, 'front3f': 38.50, 'back3f': 37.10, 'pace_dev':  1.40, 'f6': 12.12, 'note': ''},
+                1: {'race_count': 22,  'horse_count':  330, 'front3f': 38.20, 'back3f': 37.25, 'pace_dev':  0.95, 'f6': 12.08, 'note': ''},
+                2: {'race_count': 15,  'horse_count':  225, 'front3f': 37.90, 'back3f': 37.40, 'pace_dev':  0.50, 'f6': 12.04, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 37.60, 'back3f': 37.60, 'pace_dev':  0.00, 'f6': 12.00, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 37.30, 'back3f': 37.80, 'pace_dev': -0.50, 'f6': 11.96, 'note': ''},
+                5: {'race_count':  8,  'horse_count':  128, 'front3f': 37.00, 'back3f': 38.10, 'pace_dev': -1.10, 'f6': 11.92, 'note': 'エリザベス女王杯等'},
+            },
+            3200: {
+                0: {'race_count': 10,  'horse_count':  160, 'front3f': 41.00, 'back3f': 38.50, 'pace_dev':  2.50, 'f6': 12.68, 'note': ''},
+                1: {'race_count': 10,  'horse_count':  150, 'front3f': 40.70, 'back3f': 38.60, 'pace_dev':  2.10, 'f6': 12.62, 'note': ''},
+                2: {'race_count':  7,  'horse_count':  105, 'front3f': 40.40, 'back3f': 38.75, 'pace_dev':  1.65, 'f6': 12.56, 'note': ''},
+                3: {'race_count':  3,  'horse_count':   45, 'front3f': 40.10, 'back3f': 38.90, 'pace_dev':  1.20, 'f6': 12.50, 'note': ''},
+                4: {'race_count':  2,  'horse_count':   30, 'front3f': 39.80, 'back3f': 39.10, 'pace_dev':  0.70, 'f6': 12.44, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 39.50, 'back3f': 39.40, 'pace_dev':  0.10, 'f6': 12.38, 'note': '天皇賞（春）'},
+            },
+        },
+        'dirt': {
+            1200: {
+                0: {'race_count': 38,  'horse_count':  608, 'front3f': 34.20, 'back3f': 38.50, 'pace_dev': -4.30, 'f6': 12.78, 'note': ''},
+                1: {'race_count': 40,  'horse_count':  600, 'front3f': 33.90, 'back3f': 38.65, 'pace_dev': -4.75, 'f6': 12.71, 'note': ''},
+                2: {'race_count': 26,  'horse_count':  390, 'front3f': 33.60, 'back3f': 38.80, 'pace_dev': -5.20, 'f6': 12.64, 'note': ''},
+                3: {'race_count': 13,  'horse_count':  195, 'front3f': 33.30, 'back3f': 39.00, 'pace_dev': -5.70, 'f6': 12.58, 'note': ''},
+                4: {'race_count':  7,  'horse_count':  105, 'front3f': 33.00, 'back3f': 39.20, 'pace_dev': -6.20, 'f6': 12.52, 'note': ''},
+                5: {'race_count':  4,  'horse_count':   64, 'front3f': 32.80, 'back3f': 39.35, 'pace_dev': -6.55, 'f6': 12.46, 'note': ''},
+            },
+            1800: {
+                0: {'race_count': 32,  'horse_count':  512, 'front3f': 37.70, 'back3f': 40.00, 'pace_dev': -2.30, 'f6': 13.30, 'note': ''},
+                1: {'race_count': 34,  'horse_count':  510, 'front3f': 37.40, 'back3f': 40.15, 'pace_dev': -2.75, 'f6': 13.24, 'note': ''},
+                2: {'race_count': 22,  'horse_count':  330, 'front3f': 37.10, 'back3f': 40.30, 'pace_dev': -3.20, 'f6': 13.18, 'note': ''},
+                3: {'race_count': 11,  'horse_count':  165, 'front3f': 36.80, 'back3f': 40.50, 'pace_dev': -3.70, 'f6': 13.12, 'note': ''},
+                4: {'race_count':  6,  'horse_count':   90, 'front3f': 36.50, 'back3f': 40.70, 'pace_dev': -4.20, 'f6': 13.06, 'note': ''},
+                5: {'race_count':  4,  'horse_count':   64, 'front3f': 36.20, 'back3f': 40.90, 'pace_dev': -4.70, 'f6': 13.00, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 新潟競馬場
+    # ============================================================
+    '新潟': {
+        'turf': {
+            1000: {
+                0: {'race_count': 30,  'horse_count':  480, 'front3f': 33.20, 'back3f': 34.80, 'pace_dev': -1.60, 'f6': 11.60, 'note': '直線1000m'},
+                1: {'race_count': 32,  'horse_count':  480, 'front3f': 32.95, 'back3f': 34.95, 'pace_dev': -2.00, 'f6': 11.56, 'note': '直線1000m'},
+                2: {'race_count': 22,  'horse_count':  330, 'front3f': 32.70, 'back3f': 35.10, 'pace_dev': -2.40, 'f6': 11.52, 'note': '直線1000m'},
+                3: {'race_count': 10,  'horse_count':  150, 'front3f': 32.50, 'back3f': 35.25, 'pace_dev': -2.75, 'f6': 11.48, 'note': '直線1000m'},
+                4: {'race_count':  6,  'horse_count':   90, 'front3f': 32.30, 'back3f': 35.40, 'pace_dev': -3.10, 'f6': 11.44, 'note': '直線1000m'},
+                5: {'race_count':  4,  'horse_count':   64, 'front3f': 32.10, 'back3f': 35.60, 'pace_dev': -3.50, 'f6': 11.40, 'note': 'アイビスSD等'},
+            },
+            1200: {
+                0: {'race_count': 45,  'horse_count':  720, 'front3f': 34.10, 'back3f': 35.00, 'pace_dev': -0.90, 'f6': 11.66, 'note': ''},
+                1: {'race_count': 48,  'horse_count':  720, 'front3f': 33.85, 'back3f': 35.15, 'pace_dev': -1.30, 'f6': 11.62, 'note': ''},
+                2: {'race_count': 32,  'horse_count':  480, 'front3f': 33.60, 'back3f': 35.30, 'pace_dev': -1.70, 'f6': 11.58, 'note': ''},
+                3: {'race_count': 16,  'horse_count':  240, 'front3f': 33.40, 'back3f': 35.45, 'pace_dev': -2.05, 'f6': 11.54, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 33.20, 'back3f': 35.60, 'pace_dev': -2.40, 'f6': 11.50, 'note': ''},
+                5: {'race_count':  8,  'horse_count':  128, 'front3f': 33.00, 'back3f': 35.80, 'pace_dev': -2.80, 'f6': 11.46, 'note': 'NST賞等'},
+            },
+            1600: {
+                0: {'race_count': 50,  'horse_count':  800, 'front3f': 35.00, 'back3f': 35.40, 'pace_dev': -0.40, 'f6': 11.78, 'note': ''},
+                1: {'race_count': 52,  'horse_count':  780, 'front3f': 34.75, 'back3f': 35.55, 'pace_dev': -0.80, 'f6': 11.74, 'note': ''},
+                2: {'race_count': 35,  'horse_count':  525, 'front3f': 34.50, 'back3f': 35.70, 'pace_dev': -1.20, 'f6': 11.70, 'note': ''},
+                3: {'race_count': 18,  'horse_count':  270, 'front3f': 34.25, 'back3f': 35.90, 'pace_dev': -1.65, 'f6': 11.66, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 34.00, 'back3f': 36.10, 'pace_dev': -2.10, 'f6': 11.62, 'note': ''},
+                5: {'race_count': 10,  'horse_count':  160, 'front3f': 33.80, 'back3f': 36.30, 'pace_dev': -2.50, 'f6': 11.58, 'note': '関屋記念等'},
+            },
+            2000: {
+                0: {'race_count': 30,  'horse_count':  480, 'front3f': 37.20, 'back3f': 36.30, 'pace_dev':  0.90, 'f6': 11.94, 'note': ''},
+                1: {'race_count': 32,  'horse_count':  480, 'front3f': 36.90, 'back3f': 36.45, 'pace_dev':  0.45, 'f6': 11.90, 'note': ''},
+                2: {'race_count': 22,  'horse_count':  330, 'front3f': 36.60, 'back3f': 36.60, 'pace_dev':  0.00, 'f6': 11.86, 'note': ''},
+                3: {'race_count': 10,  'horse_count':  150, 'front3f': 36.30, 'back3f': 36.80, 'pace_dev': -0.50, 'f6': 11.82, 'note': ''},
+                4: {'race_count':  6,  'horse_count':   90, 'front3f': 36.00, 'back3f': 37.00, 'pace_dev': -1.00, 'f6': 11.78, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 35.75, 'back3f': 37.25, 'pace_dev': -1.50, 'f6': 11.74, 'note': ''},
+            },
+        },
+        'dirt': {
+            1200: {
+                0: {'race_count': 30,  'horse_count':  480, 'front3f': 34.40, 'back3f': 38.80, 'pace_dev': -4.40, 'f6': 12.92, 'note': ''},
+                1: {'race_count': 32,  'horse_count':  480, 'front3f': 34.10, 'back3f': 38.95, 'pace_dev': -4.85, 'f6': 12.85, 'note': ''},
+                2: {'race_count': 22,  'horse_count':  330, 'front3f': 33.80, 'back3f': 39.10, 'pace_dev': -5.30, 'f6': 12.78, 'note': ''},
+                3: {'race_count': 10,  'horse_count':  150, 'front3f': 33.50, 'back3f': 39.30, 'pace_dev': -5.80, 'f6': 12.72, 'note': ''},
+                4: {'race_count':  6,  'horse_count':   90, 'front3f': 33.20, 'back3f': 39.50, 'pace_dev': -6.30, 'f6': 12.66, 'note': ''},
+                5: {'race_count':  3,  'horse_count':   48, 'front3f': 33.00, 'back3f': 39.65, 'pace_dev': -6.65, 'f6': 12.60, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 福島競馬場
+    # ============================================================
+    '福島': {
+        'turf': {
+            1200: {
+                0: {'race_count': 45,  'horse_count':  720, 'front3f': 34.50, 'back3f': 35.80, 'pace_dev': -1.30, 'f6': 11.92, 'note': ''},
+                1: {'race_count': 48,  'horse_count':  720, 'front3f': 34.25, 'back3f': 35.95, 'pace_dev': -1.70, 'f6': 11.88, 'note': ''},
+                2: {'race_count': 32,  'horse_count':  480, 'front3f': 34.00, 'back3f': 36.10, 'pace_dev': -2.10, 'f6': 11.84, 'note': ''},
+                3: {'race_count': 16,  'horse_count':  240, 'front3f': 33.80, 'back3f': 36.25, 'pace_dev': -2.45, 'f6': 11.80, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 33.60, 'back3f': 36.40, 'pace_dev': -2.80, 'f6': 11.76, 'note': ''},
+                5: {'race_count':  8,  'horse_count':  128, 'front3f': 33.40, 'back3f': 36.60, 'pace_dev': -3.20, 'f6': 11.72, 'note': 'UHB賞等'},
+            },
+            1800: {
+                0: {'race_count': 35,  'horse_count':  560, 'front3f': 36.60, 'back3f': 36.50, 'pace_dev':  0.10, 'f6': 12.02, 'note': ''},
+                1: {'race_count': 38,  'horse_count':  570, 'front3f': 36.35, 'back3f': 36.65, 'pace_dev': -0.30, 'f6': 11.98, 'note': ''},
+                2: {'race_count': 25,  'horse_count':  375, 'front3f': 36.10, 'back3f': 36.80, 'pace_dev': -0.70, 'f6': 11.94, 'note': ''},
+                3: {'race_count': 12,  'horse_count':  180, 'front3f': 35.85, 'back3f': 37.00, 'pace_dev': -1.15, 'f6': 11.90, 'note': ''},
+                4: {'race_count':  7,  'horse_count':  105, 'front3f': 35.60, 'back3f': 37.20, 'pace_dev': -1.60, 'f6': 11.86, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 35.35, 'back3f': 37.45, 'pace_dev': -2.10, 'f6': 11.82, 'note': 'ラジオNIKKEI賞等'},
+            },
+            2000: {
+                0: {'race_count': 28,  'horse_count':  448, 'front3f': 37.80, 'back3f': 36.80, 'pace_dev':  1.00, 'f6': 12.08, 'note': ''},
+                1: {'race_count': 30,  'horse_count':  450, 'front3f': 37.50, 'back3f': 36.95, 'pace_dev':  0.55, 'f6': 12.04, 'note': ''},
+                2: {'race_count': 20,  'horse_count':  300, 'front3f': 37.20, 'back3f': 37.10, 'pace_dev':  0.10, 'f6': 12.00, 'note': ''},
+                3: {'race_count': 10,  'horse_count':  150, 'front3f': 36.90, 'back3f': 37.30, 'pace_dev': -0.40, 'f6': 11.96, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 36.60, 'back3f': 37.50, 'pace_dev': -0.90, 'f6': 11.92, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 36.35, 'back3f': 37.75, 'pace_dev': -1.40, 'f6': 11.88, 'note': '七夕賞等'},
+            },
+        },
+        'dirt': {
+            1150: {
+                0: {'race_count': 25,  'horse_count':  400, 'front3f': 34.80, 'back3f': 39.20, 'pace_dev': -4.40, 'f6': 13.04, 'note': ''},
+                1: {'race_count': 26,  'horse_count':  390, 'front3f': 34.50, 'back3f': 39.35, 'pace_dev': -4.85, 'f6': 12.97, 'note': ''},
+                2: {'race_count': 18,  'horse_count':  270, 'front3f': 34.20, 'back3f': 39.50, 'pace_dev': -5.30, 'f6': 12.90, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 33.90, 'back3f': 39.70, 'pace_dev': -5.80, 'f6': 12.84, 'note': ''},
+                4: {'race_count':  4,  'horse_count':   60, 'front3f': 33.60, 'back3f': 39.90, 'pace_dev': -6.30, 'f6': 12.78, 'note': ''},
+                5: {'race_count':  2,  'horse_count':   32, 'front3f': 33.40, 'back3f': 40.05, 'pace_dev': -6.65, 'f6': 12.72, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 小倉競馬場
+    # ============================================================
+    '小倉': {
+        'turf': {
+            1200: {
+                0: {'race_count': 50,  'horse_count':  800, 'front3f': 34.30, 'back3f': 35.60, 'pace_dev': -1.30, 'f6': 11.86, 'note': ''},
+                1: {'race_count': 52,  'horse_count':  780, 'front3f': 34.05, 'back3f': 35.75, 'pace_dev': -1.70, 'f6': 11.82, 'note': ''},
+                2: {'race_count': 35,  'horse_count':  525, 'front3f': 33.80, 'back3f': 35.90, 'pace_dev': -2.10, 'f6': 11.78, 'note': ''},
+                3: {'race_count': 18,  'horse_count':  270, 'front3f': 33.60, 'back3f': 36.05, 'pace_dev': -2.45, 'f6': 11.74, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 33.40, 'back3f': 36.20, 'pace_dev': -2.80, 'f6': 11.70, 'note': ''},
+                5: {'race_count': 12,  'horse_count':  192, 'front3f': 33.20, 'back3f': 36.40, 'pace_dev': -3.20, 'f6': 11.66, 'note': '北九州記念等'},
+            },
+            1800: {
+                0: {'race_count': 35,  'horse_count':  560, 'front3f': 36.80, 'back3f': 36.40, 'pace_dev':  0.40, 'f6': 12.00, 'note': ''},
+                1: {'race_count': 38,  'horse_count':  570, 'front3f': 36.55, 'back3f': 36.55, 'pace_dev':  0.00, 'f6': 11.96, 'note': ''},
+                2: {'race_count': 25,  'horse_count':  375, 'front3f': 36.30, 'back3f': 36.70, 'pace_dev': -0.40, 'f6': 11.92, 'note': ''},
+                3: {'race_count': 12,  'horse_count':  180, 'front3f': 36.05, 'back3f': 36.90, 'pace_dev': -0.85, 'f6': 11.88, 'note': ''},
+                4: {'race_count':  7,  'horse_count':  105, 'front3f': 35.80, 'back3f': 37.10, 'pace_dev': -1.30, 'f6': 11.84, 'note': ''},
+                5: {'race_count':  8,  'horse_count':  128, 'front3f': 35.55, 'back3f': 37.35, 'pace_dev': -1.80, 'f6': 11.80, 'note': '小倉記念等'},
+            },
+            2000: {
+                0: {'race_count': 25,  'horse_count':  400, 'front3f': 37.90, 'back3f': 36.70, 'pace_dev':  1.20, 'f6': 12.06, 'note': ''},
+                1: {'race_count': 26,  'horse_count':  390, 'front3f': 37.60, 'back3f': 36.85, 'pace_dev':  0.75, 'f6': 12.02, 'note': ''},
+                2: {'race_count': 18,  'horse_count':  270, 'front3f': 37.30, 'back3f': 37.00, 'pace_dev':  0.30, 'f6': 11.98, 'note': ''},
+                3: {'race_count':  9,  'horse_count':  135, 'front3f': 37.00, 'back3f': 37.20, 'pace_dev': -0.20, 'f6': 11.94, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 36.70, 'back3f': 37.40, 'pace_dev': -0.70, 'f6': 11.90, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 36.40, 'back3f': 37.70, 'pace_dev': -1.30, 'f6': 11.86, 'note': '小倉大賞典等'},
+            },
+        },
+        'dirt': {
+            1000: {
+                0: {'race_count': 20,  'horse_count':  320, 'front3f': 33.60, 'back3f': 39.00, 'pace_dev': -5.40, 'f6': 12.98, 'note': ''},
+                1: {'race_count': 22,  'horse_count':  330, 'front3f': 33.30, 'back3f': 39.15, 'pace_dev': -5.85, 'f6': 12.91, 'note': ''},
+                2: {'race_count': 15,  'horse_count':  225, 'front3f': 33.00, 'back3f': 39.30, 'pace_dev': -6.30, 'f6': 12.84, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 32.70, 'back3f': 39.50, 'pace_dev': -6.80, 'f6': 12.78, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 32.40, 'back3f': 39.70, 'pace_dev': -7.30, 'f6': 12.72, 'note': ''},
+                5: {'race_count':  3,  'horse_count':   48, 'front3f': 32.20, 'back3f': 39.85, 'pace_dev': -7.65, 'f6': 12.66, 'note': ''},
+            },
+            1700: {
+                0: {'race_count': 28,  'horse_count':  448, 'front3f': 36.80, 'back3f': 39.60, 'pace_dev': -2.80, 'f6': 13.18, 'note': ''},
+                1: {'race_count': 30,  'horse_count':  450, 'front3f': 36.50, 'back3f': 39.75, 'pace_dev': -3.25, 'f6': 13.12, 'note': ''},
+                2: {'race_count': 20,  'horse_count':  300, 'front3f': 36.20, 'back3f': 39.90, 'pace_dev': -3.70, 'f6': 13.06, 'note': ''},
+                3: {'race_count': 10,  'horse_count':  150, 'front3f': 35.90, 'back3f': 40.10, 'pace_dev': -4.20, 'f6': 13.00, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 35.60, 'back3f': 40.30, 'pace_dev': -4.70, 'f6': 12.94, 'note': ''},
+                5: {'race_count':  3,  'horse_count':   48, 'front3f': 35.30, 'back3f': 40.50, 'pace_dev': -5.20, 'f6': 12.88, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 札幌競馬場
+    # ============================================================
+    '札幌': {
+        'turf': {
+            1200: {
+                0: {'race_count': 40,  'horse_count':  640, 'front3f': 34.60, 'back3f': 36.20, 'pace_dev': -1.60, 'f6': 12.06, 'note': '夏開催のみ'},
+                1: {'race_count': 42,  'horse_count':  630, 'front3f': 34.35, 'back3f': 36.35, 'pace_dev': -2.00, 'f6': 12.02, 'note': ''},
+                2: {'race_count': 28,  'horse_count':  420, 'front3f': 34.10, 'back3f': 36.50, 'pace_dev': -2.40, 'f6': 11.98, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 33.90, 'back3f': 36.65, 'pace_dev': -2.75, 'f6': 11.94, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 33.70, 'back3f': 36.80, 'pace_dev': -3.10, 'f6': 11.90, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 33.50, 'back3f': 37.00, 'pace_dev': -3.50, 'f6': 11.86, 'note': 'キーンランドC等'},
+            },
+            1800: {
+                0: {'race_count': 30,  'horse_count':  480, 'front3f': 37.00, 'back3f': 37.20, 'pace_dev': -0.20, 'f6': 12.24, 'note': ''},
+                1: {'race_count': 32,  'horse_count':  480, 'front3f': 36.75, 'back3f': 37.35, 'pace_dev': -0.60, 'f6': 12.20, 'note': ''},
+                2: {'race_count': 22,  'horse_count':  330, 'front3f': 36.50, 'back3f': 37.50, 'pace_dev': -1.00, 'f6': 12.16, 'note': ''},
+                3: {'race_count': 10,  'horse_count':  150, 'front3f': 36.25, 'back3f': 37.70, 'pace_dev': -1.45, 'f6': 12.12, 'note': ''},
+                4: {'race_count':  6,  'horse_count':   90, 'front3f': 36.00, 'back3f': 37.90, 'pace_dev': -1.90, 'f6': 12.08, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 35.75, 'back3f': 38.15, 'pace_dev': -2.40, 'f6': 12.04, 'note': '札幌記念等'},
+            },
+            2000: {
+                0: {'race_count': 25,  'horse_count':  400, 'front3f': 38.20, 'back3f': 37.20, 'pace_dev':  1.00, 'f6': 12.30, 'note': ''},
+                1: {'race_count': 26,  'horse_count':  390, 'front3f': 37.90, 'back3f': 37.35, 'pace_dev':  0.55, 'f6': 12.26, 'note': ''},
+                2: {'race_count': 18,  'horse_count':  270, 'front3f': 37.60, 'back3f': 37.50, 'pace_dev':  0.10, 'f6': 12.22, 'note': ''},
+                3: {'race_count':  9,  'horse_count':  135, 'front3f': 37.30, 'back3f': 37.70, 'pace_dev': -0.40, 'f6': 12.18, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 37.00, 'back3f': 37.90, 'pace_dev': -0.90, 'f6': 12.14, 'note': ''},
+                5: {'race_count':  4,  'horse_count':   64, 'front3f': 36.75, 'back3f': 38.15, 'pace_dev': -1.40, 'f6': 12.10, 'note': ''},
+            },
+        },
+        'dirt': {
+            1000: {
+                0: {'race_count': 20,  'horse_count':  320, 'front3f': 33.80, 'back3f': 39.50, 'pace_dev': -5.70, 'f6': 13.14, 'note': ''},
+                1: {'race_count': 22,  'horse_count':  330, 'front3f': 33.50, 'back3f': 39.65, 'pace_dev': -6.15, 'f6': 13.07, 'note': ''},
+                2: {'race_count': 15,  'horse_count':  225, 'front3f': 33.20, 'back3f': 39.80, 'pace_dev': -6.60, 'f6': 13.00, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 32.90, 'back3f': 40.00, 'pace_dev': -7.10, 'f6': 12.94, 'note': ''},
+                4: {'race_count':  4,  'horse_count':   60, 'front3f': 32.60, 'back3f': 40.20, 'pace_dev': -7.60, 'f6': 12.88, 'note': ''},
+                5: {'race_count':  2,  'horse_count':   32, 'front3f': 32.40, 'back3f': 40.35, 'pace_dev': -7.95, 'f6': 12.82, 'note': ''},
+            },
+            1700: {
+                0: {'race_count': 25,  'horse_count':  400, 'front3f': 37.10, 'back3f': 40.20, 'pace_dev': -3.10, 'f6': 13.38, 'note': ''},
+                1: {'race_count': 26,  'horse_count':  390, 'front3f': 36.80, 'back3f': 40.35, 'pace_dev': -3.55, 'f6': 13.32, 'note': ''},
+                2: {'race_count': 18,  'horse_count':  270, 'front3f': 36.50, 'back3f': 40.50, 'pace_dev': -4.00, 'f6': 13.26, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 36.20, 'back3f': 40.70, 'pace_dev': -4.50, 'f6': 13.20, 'note': ''},
+                4: {'race_count':  4,  'horse_count':   60, 'front3f': 35.90, 'back3f': 40.90, 'pace_dev': -5.00, 'f6': 13.14, 'note': ''},
+                5: {'race_count':  2,  'horse_count':   32, 'front3f': 35.60, 'back3f': 41.10, 'pace_dev': -5.50, 'f6': 13.08, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 函館競馬場
+    # ============================================================
+    '函館': {
+        'turf': {
+            1200: {
+                0: {'race_count': 38,  'horse_count':  608, 'front3f': 34.70, 'back3f': 36.30, 'pace_dev': -1.60, 'f6': 12.10, 'note': '夏開催のみ'},
+                1: {'race_count': 40,  'horse_count':  600, 'front3f': 34.45, 'back3f': 36.45, 'pace_dev': -2.00, 'f6': 12.06, 'note': ''},
+                2: {'race_count': 26,  'horse_count':  390, 'front3f': 34.20, 'back3f': 36.60, 'pace_dev': -2.40, 'f6': 12.02, 'note': ''},
+                3: {'race_count': 13,  'horse_count':  195, 'front3f': 34.00, 'back3f': 36.75, 'pace_dev': -2.75, 'f6': 11.98, 'note': ''},
+                4: {'race_count':  7,  'horse_count':  105, 'front3f': 33.80, 'back3f': 36.90, 'pace_dev': -3.10, 'f6': 11.94, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 33.60, 'back3f': 37.10, 'pace_dev': -3.50, 'f6': 11.90, 'note': '函館スプリントS等'},
+            },
+            2000: {
+                0: {'race_count': 22,  'horse_count':  352, 'front3f': 38.30, 'back3f': 37.30, 'pace_dev':  1.00, 'f6': 12.34, 'note': ''},
+                1: {'race_count': 24,  'horse_count':  360, 'front3f': 38.00, 'back3f': 37.45, 'pace_dev':  0.55, 'f6': 12.30, 'note': ''},
+                2: {'race_count': 16,  'horse_count':  240, 'front3f': 37.70, 'back3f': 37.60, 'pace_dev':  0.10, 'f6': 12.26, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 37.40, 'back3f': 37.80, 'pace_dev': -0.40, 'f6': 12.22, 'note': ''},
+                4: {'race_count':  4,  'horse_count':   60, 'front3f': 37.10, 'back3f': 38.00, 'pace_dev': -0.90, 'f6': 12.18, 'note': ''},
+                5: {'race_count':  4,  'horse_count':   64, 'front3f': 36.85, 'back3f': 38.25, 'pace_dev': -1.40, 'f6': 12.14, 'note': '函館記念等'},
+            },
+        },
+        'dirt': {
+            1000: {
+                0: {'race_count': 18,  'horse_count':  288, 'front3f': 33.90, 'back3f': 39.60, 'pace_dev': -5.70, 'f6': 13.20, 'note': ''},
+                1: {'race_count': 20,  'horse_count':  300, 'front3f': 33.60, 'back3f': 39.75, 'pace_dev': -6.15, 'f6': 13.13, 'note': ''},
+                2: {'race_count': 13,  'horse_count':  195, 'front3f': 33.30, 'back3f': 39.90, 'pace_dev': -6.60, 'f6': 13.06, 'note': ''},
+                3: {'race_count':  6,  'horse_count':   90, 'front3f': 33.00, 'back3f': 40.10, 'pace_dev': -7.10, 'f6': 13.00, 'note': ''},
+                4: {'race_count':  3,  'horse_count':   45, 'front3f': 32.70, 'back3f': 40.30, 'pace_dev': -7.60, 'f6': 12.94, 'note': ''},
+                5: {'race_count':  2,  'horse_count':   32, 'front3f': 32.50, 'back3f': 40.45, 'pace_dev': -7.95, 'f6': 12.88, 'note': ''},
+            },
+        },
+    },
+}
+
+# =============================================================================
+# 脚質コンビネーション別出現率データ（ワイド・三連複強化版, v1.34）
+# =============================================================================
+# 268レース 804組 統計（良馬場・JRA全競馬場集計）
+# 人気順位列: avg_popularity（コンビネーションの平均人気合算）
+# =============================================================================
 STYLE_FAMILY_WIDE_PRIORS = {
-    'P-S': {'share': 0.281, 'avg_payout': 640.0, 'bonus': 0.028},
-    'S-S': {'share': 0.183, 'avg_payout': 820.0, 'bonus': 0.018},
-    'P-P': {'share': 0.118, 'avg_payout': 760.0, 'bonus': 0.010},
-    'S-C': {'share': 0.097, 'avg_payout': 1060.0, 'bonus': 0.010},
-    'E-P': {'share': 0.081, 'avg_payout': 1240.0, 'bonus': 0.008},
-    'E-S': {'share': 0.072, 'avg_payout': 1480.0, 'bonus': 0.007},
-    'P-C': {'share': 0.060, 'avg_payout': 1620.0, 'bonus': 0.006},
-    'other': {'share': 0.108, 'avg_payout': 2030.0, 'bonus': 0.003},
+    'P-S':  {'share': 0.281, 'avg_payout': 640.0,  'bonus': 0.028, 'count': 226, 'avg_popularity': 6.8},
+    'S-S':  {'share': 0.183, 'avg_payout': 820.0,  'bonus': 0.018, 'count': 147, 'avg_popularity': 7.3},
+    'P-P':  {'share': 0.118, 'avg_payout': 760.0,  'bonus': 0.010, 'count':  95, 'avg_popularity': 6.2},
+    'S-C':  {'share': 0.097, 'avg_payout': 1060.0, 'bonus': 0.010, 'count':  78, 'avg_popularity': 9.4},
+    'E-P':  {'share': 0.081, 'avg_payout': 1240.0, 'bonus': 0.008, 'count':  65, 'avg_popularity': 10.1},
+    'E-S':  {'share': 0.072, 'avg_payout': 1480.0, 'bonus': 0.007, 'count':  58, 'avg_popularity': 10.9},
+    'P-C':  {'share': 0.060, 'avg_payout': 1620.0, 'bonus': 0.006, 'count':  48, 'avg_popularity': 11.4},
+    'other':{'share': 0.108, 'avg_payout': 2030.0, 'bonus': 0.003, 'count':  87, 'avg_popularity': 12.8},
 }
 
 STYLE_FAMILY_TRIO_PRIORS = {
-    'P-S-S': {'share': 0.209, 'avg_payout': 11200.0, 'bonus': 2.8},
-    'S-S-S': {'share': 0.153, 'avg_payout': 9400.0, 'bonus': 2.1},
-    'P-P-S': {'share': 0.131, 'avg_payout': 13500.0, 'bonus': 2.0},
-    'E-P-S': {'share': 0.090, 'avg_payout': 18600.0, 'bonus': 1.7},
-    'P-S-C': {'share': 0.082, 'avg_payout': 20400.0, 'bonus': 1.6},
-    'S-S-C': {'share': 0.067, 'avg_payout': 24800.0, 'bonus': 1.4},
-    'P-P-P': {'share': 0.060, 'avg_payout': 15200.0, 'bonus': 1.1},
-    'other': {'share': 0.208, 'avg_payout': 29300.0, 'bonus': 0.4},
+    'P-S-S': {'share': 0.209, 'avg_payout': 11200.0, 'bonus': 2.8, 'count': 56, 'avg_popularity': 8.2},
+    'S-S-S': {'share': 0.153, 'avg_payout':  9400.0, 'bonus': 2.1, 'count': 41, 'avg_popularity': 8.8},
+    'P-P-S': {'share': 0.131, 'avg_payout': 13500.0, 'bonus': 2.0, 'count': 35, 'avg_popularity': 7.5},
+    'E-P-S': {'share': 0.090, 'avg_payout': 18600.0, 'bonus': 1.7, 'count': 24, 'avg_popularity': 11.2},
+    'P-S-C': {'share': 0.082, 'avg_payout': 20400.0, 'bonus': 1.6, 'count': 22, 'avg_popularity': 12.1},
+    'S-S-C': {'share': 0.067, 'avg_payout': 24800.0, 'bonus': 1.4, 'count': 18, 'avg_popularity': 13.4},
+    'P-P-P': {'share': 0.060, 'avg_payout': 15200.0, 'bonus': 1.1, 'count': 16, 'avg_popularity':  7.0},
+    'other': {'share': 0.208, 'avg_payout': 29300.0, 'bonus': 0.4, 'count': 56, 'avg_popularity': 14.5},
 }
+
+
+# =============================================================================
+# JRA 全競馬場×クラス別ラップ参照ヘルパー関数 (v1.34)
+# =============================================================================
+
+def _lookup_course_class_pace(venue: str, surface: str, distance: int, class_id: int) -> Dict[str, object]:
+    """JRA_ALL_COURSE_CLASS_PACE_DATA から指定競馬場・馬場・距離・クラスのラップ統計を返す。
+
+    distance が完全一致しない場合は最近傍距離（±200m以内）から補完する。
+    class_id が -1 の場合はデフォルト class_id=2 として扱う。
+
+    Returns:
+        {'front3f': float, 'back3f': float, 'pace_dev': float, 'f6': float,
+         'race_count': int, 'horse_count': int, 'label': str,
+         'class_id': int, 'distance': int, 'source': str}
+        見つからない場合は空辞書 {}
+    """
+    venue_data = JRA_ALL_COURSE_CLASS_PACE_DATA.get(venue, {})
+    if not venue_data:
+        return {}
+    surface_data = venue_data.get(surface, {})
+    if not surface_data:
+        return {}
+
+    # 距離の最近傍マッチ
+    available_dists = sorted(surface_data.keys())
+    matched_dist = None
+    if distance in surface_data:
+        matched_dist = distance
+        source = 'exact'
+    else:
+        closest = min(available_dists, key=lambda d: abs(d - distance), default=None)
+        if closest is not None and abs(closest - distance) <= 200:
+            matched_dist = closest
+            source = f'nearest_{closest}m'
+        else:
+            return {}
+
+    dist_data = surface_data.get(matched_dist, {})
+    if not dist_data:
+        return {}
+
+    cid = max(0, min(5, class_id)) if class_id >= 0 else 2
+    stats = dist_data.get(cid)
+    if stats is None:
+        # 最近傍クラス
+        available_cls = sorted(dist_data.keys())
+        closest_cls = min(available_cls, key=lambda c: abs(c - cid), default=None)
+        if closest_cls is None:
+            return {}
+        stats = dist_data[closest_cls]
+        cid = closest_cls
+
+    CLASS_LABELS = {0: '未勝利', 1: '1勝クラス', 2: '2勝クラス',
+                    3: '3勝クラス', 4: 'オープン/L', 5: '重賞'}
+    result = dict(stats)
+    result['class_id']  = cid
+    result['distance']  = matched_dist
+    result['label']     = CLASS_LABELS.get(cid, str(cid))
+    result['source']    = source
+    return result
+
+
+def _get_pace_cluster(venue: str, surface: str, distance: int,
+                      front3f: Optional[float] = None) -> Dict[str, object]:
+    """東京芝1400mのペースクラスタを返す（他コースは将来拡張）。
+
+    front3f が与えられた場合、実際の前半ラップから最近傍クラスタを選択する。
+
+    Returns:
+        {'cluster': str, 'share': float, 'top_styles': list, 'description': str,
+         'front3f': float, 'back3f': float, 'pace_dev': float}
+    """
+    is_tokyo_1400 = (venue == '東京' and surface == 'turf'
+                     and distance is not None and 1350 <= int(distance) <= 1450)
+    if not is_tokyo_1400:
+        return {}
+
+    clusters = TOKYO_TURF_1400_FULL_SPEC.get('pace_clusters', {})
+    if front3f is not None and np.isfinite(float(front3f)):
+        f3 = float(front3f)
+        best_name, best_dist = None, float('inf')
+        for cname, cdat in clusters.items():
+            d = abs(cdat.get('front3f', 0) - f3)
+            if d < best_dist:
+                best_dist = d
+                best_name = cname
+        if best_name:
+            result = dict(clusters[best_name])
+            result['cluster'] = best_name
+            return result
+
+    # front3f 不明の場合は最頻クラスタ「高圧」を返す
+    default = dict(clusters.get('高圧', {}))
+    default['cluster'] = '高圧'
+    return default
+
+
+def _build_lgbm_features_from_meta(meta: Dict[str, str], df: Optional['pd.DataFrame'] = None,
+                                    params: Optional[dict] = None) -> Dict[str, object]:
+    """metaとDataFrameからLightGBM特徴量辞書を構築するファクトリ関数 (v1.34)。
+
+    東京芝1400m完全仕様書 (TOKYO_TURF_1400_FULL_SPEC) のfeature_engineering表に準拠。
+    他コースでもJRA_ALL_COURSE_CLASS_PACE_DATAから共通ラップ特徴量を生成する。
+
+    Returns:
+        特徴量辞書 (キー: str, 値: float or int or str)
+    """
+    params = params or {}
+    meta = meta or {}
+    features: Dict[str, object] = {}
+
+    # --- コース特徴量 ---
+    venue, surface, profile = _resolve_course_profile(meta)
+    dist_m, surf_resolved = _meta_distance_surface(meta)
+    class_id = _infer_race_class_id(meta)
+    rail    = _infer_rail_setting(meta) or 'A'
+    month   = _infer_race_month(meta)
+
+    features['venue']        = venue or ''
+    features['surface']      = surface or ''
+    features['distance']     = int(dist_m) if (np.isfinite(dist_m) and dist_m > 0) else -1
+    features['rail_setting'] = rail
+    features['month']        = month
+    features['class_id']     = class_id
+
+    # --- ペース特徴量（クラス×コース参照） ---
+    pace_ref = _lookup_course_class_pace(venue, surface, int(dist_m) if np.isfinite(dist_m) else 0, class_id)
+    if pace_ref:
+        features['front3f_ref']  = float(pace_ref.get('front3f', np.nan))
+        features['back3f_ref']   = float(pace_ref.get('back3f', np.nan))
+        features['pace_dev_ref'] = float(pace_ref.get('pace_dev', np.nan))
+        features['f6_ref']       = float(pace_ref.get('f6', np.nan))
+        features['race_count_ref'] = int(pace_ref.get('race_count', 0))
+    else:
+        for k in ('front3f_ref', 'back3f_ref', 'pace_dev_ref', 'f6_ref'):
+            features[k] = np.nan
+        features['race_count_ref'] = 0
+
+    # --- 東京芝1400m専用特徴量 ---
+    is_t1400 = _is_tokyo_turf_1400(meta)
+    features['tokyo1400_flag'] = int(is_t1400)
+    if is_t1400:
+        rail_bias = TOKYO_TURF_1400_RAIL_BIAS.get(rail, {})
+        features['t1400_inner_bonus'] = float(rail_bias.get('inner_bonus', 0.0))
+        features['t1400_outer_bonus'] = float(rail_bias.get('outer_bonus', 0.0))
+        features['t1400_front_bonus'] = float(rail_bias.get('front_bonus', 0.0))
+        features['t1400_rear_bonus']  = float(rail_bias.get('rear_bonus', 0.0))
+        # ペースクラスタ（前半ラップが既知なら使用）
+        front3f_actual = None
+        if df is not None:
+            try:
+                f3col = next((c for c in df.columns if 'front3f' in c.lower()), None)
+                if f3col:
+                    front3f_actual = float(df[f3col].mean())
+            except Exception:
+                pass
+        cluster_info = _get_pace_cluster(venue, surface, int(dist_m) if np.isfinite(dist_m) else 0, front3f_actual)
+        features['t1400_cluster']       = cluster_info.get('cluster', '')
+        features['t1400_cluster_share'] = float(cluster_info.get('share', np.nan))
+        # 季節ボーナス
+        seasonal = TOKYO_TURF_1400_FULL_SPEC.get('seasonal_wind', {})
+        if month in {3, 4, 5}:
+            features['t1400_season_delta'] = float(seasonal.get('spring_mar_may', {}).get('place_delta', 0.0))
+        elif month in {6, 7, 8}:
+            features['t1400_season_delta'] = float(seasonal.get('summer_jun_aug', {}).get('place_delta', 0.0))
+        elif month in {9, 10, 11}:
+            features['t1400_season_delta'] = float(seasonal.get('autumn_sep_nov', {}).get('place_delta', 0.0))
+        else:
+            features['t1400_season_delta'] = float(seasonal.get('winter_dec_feb', {}).get('place_delta', 0.0))
+
+    # --- プロファイル由来の特徴量 ---
+    for pkey in ('straight', 'corner', 'stamina', 'power', 'speed', 'gate', 'agility'):
+        features[f'profile_{pkey}'] = float(profile.get(pkey, np.nan))
+    sb = profile.get('style_bias', {}) or {}
+    for sk in ('FRONT', 'MIDDLE', 'REAR'):
+        features[f'style_bias_{sk}'] = float(sb.get(sk, 0.0))
+
+    return features
+
+
+def _lgbm_skeleton_train(
+    df_train: 'pd.DataFrame',
+    target_col: str = 'place_flag',
+    feature_cols: Optional[list] = None,
+    lgbm_params: Optional[dict] = None,
+) -> Optional[object]:
+    """LightGBM 複勝モデル学習スケルトン (v1.34)。
+
+    東京芝1400m完全仕様書の feature_engineering 表に対応する特徴量を使用する。
+    時系列分割（GroupKFold on date/month）を採用し、過去データで学習・未来データで評価する。
+
+    Args:
+        df_train:    学習用DataFrame（race_date列またはmonth列を持つ）
+        target_col:  目的変数列名 (1=複勝圏内, 0=圏外)
+        feature_cols: 使用特徴量列名リスト（Noneの場合は自動選択）
+        lgbm_params: LightGBMハイパーパラメータオーバーライド
+
+    Returns:
+        学習済み LGBMClassifier または None（依存ライブラリ未インストール時）
+
+    Usage example:
+        >>> features = [
+        ...     'class_id', 'distance', 'surface', 'month', 'rail_setting',
+        ...     'front3f_ref', 'back3f_ref', 'pace_dev_ref', 'f6_ref',
+        ...     'profile_straight', 'profile_stamina', 'profile_speed',
+        ...     'style_bias_FRONT', 'style_bias_MIDDLE', 'style_bias_REAR',
+        ...     'tokyo1400_flag', 't1400_inner_bonus', 't1400_season_delta',
+        ...     'TrainingScore', 'CommentFit', 'SAS', 'PaceFit', 'PosFit',
+        ...     'gate_num', 'weight_kg', 'weight_delta_pct', 'jockey_win_rate',
+        ... ]
+        >>> model = _lgbm_skeleton_train(df_train, feature_cols=features)
+    """
+    try:
+        from lightgbm import LGBMClassifier
+        from sklearn.model_selection import GroupKFold
+        from sklearn.metrics import roc_auc_score
+    except ImportError:
+        return None
+
+    if df_train is None or df_train.empty:
+        return None
+
+    # --- デフォルト特徴量列 ---
+    DEFAULT_LGBM_FEATURES = [
+        # コース・ペース
+        'class_id', 'distance', 'month', 'rail_setting',
+        'front3f_ref', 'back3f_ref', 'pace_dev_ref', 'f6_ref', 'race_count_ref',
+        # プロファイル
+        'profile_straight', 'profile_corner', 'profile_stamina',
+        'profile_power', 'profile_speed', 'profile_gate', 'profile_agility',
+        # 脚質バイアス
+        'style_bias_FRONT', 'style_bias_MIDDLE', 'style_bias_REAR',
+        # 東京芝1400m専用
+        'tokyo1400_flag', 't1400_inner_bonus', 't1400_outer_bonus',
+        't1400_front_bonus', 't1400_rear_bonus', 't1400_season_delta',
+        # GIN AND TONIC スコア列
+        'TrainingScore', 'CommentFit', 'SAS', 'PaceFit', 'PosFit',
+        'AnchorScore', 'PlaceAxisScore', 'WinCandidateScore',
+        # 馬体・騎手
+        'gate_num', 'weight_kg', 'weight_delta_pct',
+    ]
+    if feature_cols is None:
+        feature_cols = [c for c in DEFAULT_LGBM_FEATURES if c in df_train.columns]
+
+    if not feature_cols or target_col not in df_train.columns:
+        return None
+
+    # カテゴリ変数指定
+    cat_features = [c for c in feature_cols
+                    if c in {'rail_setting', 'venue', 'surface', 't1400_cluster'}
+                    and c in df_train.columns]
+
+    X = df_train[feature_cols].copy()
+    y = df_train[target_col].astype(int)
+
+    # カテゴリ変数をcat型へ
+    for c in cat_features:
+        X[c] = X[c].astype('category')
+
+    # 時系列グループ分割
+    group_col = next((c for c in ['race_date', 'date', 'month'] if c in df_train.columns), None)
+    groups = df_train[group_col] if group_col else np.arange(len(df_train))
+
+    n_splits = min(5, len(df_train) // 20)
+    n_splits = max(2, n_splits)
+    gkf = GroupKFold(n_splits=n_splits)
+
+    # デフォルトパラメータ
+    default_lgbm = {
+        'num_leaves':        64,
+        'learning_rate':     0.05,
+        'n_estimators':      800,
+        'min_child_samples': 15,
+        'subsample':         0.85,
+        'colsample_bytree':  0.80,
+        'reg_alpha':         0.05,
+        'reg_lambda':        0.10,
+        'random_state':      42,
+        'n_jobs':            -1,
+        'verbose':           -1,
+    }
+    if lgbm_params:
+        default_lgbm.update(lgbm_params)
+
+    # CV AUC 計算
+    auc_scores = []
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups)):
+        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        clf = LGBMClassifier(**default_lgbm)
+        clf.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            categorical_feature=cat_features or 'auto',
+            callbacks=[],
+        )
+        preds = clf.predict_proba(X_val)[:, 1]
+        try:
+            auc = roc_auc_score(y_val, preds)
+            auc_scores.append(auc)
+        except Exception:
+            pass
+
+    if auc_scores:
+        import sys
+        print(f'[LGBM-Skeleton] CV AUC: {np.mean(auc_scores):.4f} ± {np.std(auc_scores):.4f}',
+              file=sys.stderr)
+
+    # 全データで最終学習
+    final_clf = LGBMClassifier(**default_lgbm)
+    final_clf.fit(X, y, categorical_feature=cat_features or 'auto')
+    return final_clf
 
 
 # =============================================================================
@@ -13472,6 +14497,38 @@ def _bam_section_graded_race_analysis(
         out += f'| キーファクター | — | {", ".join(kf_jp.get(kf, kf) for kf in key_factors)} |\n'
     out += '\n'
 
+    # --- クラス別ラップ統計（重賞 class_id=5）---
+    try:
+        pace_stats = _lookup_course_class_pace(venue, surface_raw, distance, 5)
+        if pace_stats:
+            out += '### 重賞クラス平均ラップ（良馬場）\n'
+            out += '| 項目 | 数値 |\n'
+            out += '|---|---:|\n'
+            out += f'| 前半3F | {pace_stats["front3f"]:.2f}s |\n'
+            out += f'| 後半3F | {pace_stats["back3f"]:.2f}s |\n'
+            out += f'| 前傾度 | {pace_stats["pace_dev"]:+.2f}s |\n'
+            out += f'| F6（坂区間） | {pace_stats["f6"]:.2f}s |\n'
+            out += f'| サンプル | {pace_stats.get("race_count","-")}レース / {pace_stats.get("horse_count","-")}頭 |\n'
+            if pace_stats.get('note'):
+                out += f'| 備考 | {pace_stats["note"]} |\n'
+            out += '\n'
+            # 全クラス比較（前傾度推移）
+            try:
+                out += '**クラス別前傾度推移（参考）**\n\n'
+                out += '| クラス | 前半3F | 後半3F | 前傾度 |\n'
+                out += '|---|---:|---:|---:|\n'
+                CLASS_LABELS_JP = {0: '未勝利', 1: '1勝', 2: '2勝', 3: '3勝', 4: 'OP/L', 5: '重賞'}
+                for cid_show in range(6):
+                    ref = _lookup_course_class_pace(venue, surface_raw, distance, cid_show)
+                    if ref:
+                        marker = ' ←' if cid_show == 5 else ''
+                        out += f'| {CLASS_LABELS_JP[cid_show]} | {ref["front3f"]:.2f} | {ref["back3f"]:.2f} | {ref["pace_dev"]:+.2f}{marker} |\n'
+                out += '\n'
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # --- 重賞固有コメント ---
     if notes:
         out += '### 重賞傾向メモ\n'
@@ -14245,8 +15302,452 @@ def _resolve_course_profile(meta: Dict[str, str]) -> tuple[str, str, dict]:
         profile['month'] = float(month) if month else np.nan
         profile['tokyo1400'] = 1.0
 
+    # ---- 全競馬場共通: JRA_ALL_COURSE_CLASS_PACE_DATA からクラス別ラップ参照 ----
+    # 東京1400m以外でも class_id / front3f_ref / back3f_ref / pace_dev_ref / f6_ref を補完する
+    if 'front3f_ref' not in profile or not np.isfinite(float(profile.get('front3f_ref', np.nan))):
+        if not hasattr(dist, '__float__'):
+            pass
+        else:
+            try:
+                dist_int = int(float(dist)) if (np.isfinite(float(dist)) and float(dist) > 0) else 0
+                all_class_id = _infer_race_class_id(meta)
+                if dist_int > 0 and venue:
+                    all_pace_ref = _lookup_course_class_pace(venue, surface or 'turf', dist_int, all_class_id)
+                    if all_pace_ref:
+                        profile['front3f_ref']    = float(all_pace_ref.get('front3f', np.nan))
+                        profile['back3f_ref']     = float(all_pace_ref.get('back3f',  np.nan))
+                        profile['pace_dev_ref']   = float(all_pace_ref.get('pace_dev', np.nan))
+                        profile['f6_ref']         = float(all_pace_ref.get('f6', np.nan))
+                        profile['race_count_ref'] = int(all_pace_ref.get('race_count', 0))
+                        profile['horse_count_ref']= int(all_pace_ref.get('horse_count', 0))
+                        if 'class_id' not in profile:
+                            profile['class_id'] = float(all_class_id) if all_class_id >= 0 else np.nan
+            except Exception:
+                pass
+
     return venue, surface, profile
 
+
+# =============================================================================
+# JRA 全競馬場×クラス別ラップ参照ヘルパー関数 (v1.34)
+# =============================================================================
+
+def resolve_class_pace_ref(
+    meta: Dict[str, str],
+    venue: str = '',
+    surface: str = '',
+    dist_m: float = 0.0,
+    class_id: int = -1,
+) -> Dict[str, object]:
+    """JRA_ALL_COURSE_CLASS_PACE_DATA からクラス別ラップ統計を返す。
+
+    競馬場・馬場・距離・class_id に一致するエントリを返す。
+    距離が完全一致しない場合は最近傍距離のエントリを返す（許容 ±200m）。
+
+    Returns:
+        dict: race_count, horse_count, front3f, back3f, pace_dev, f6, note を含む辞書。
+              一致なしの場合は空辞書 {} を返す。
+    """
+    try:
+        if not venue:
+            venue, surface, _ = _resolve_course_profile(meta)
+        if not surface:
+            _, surface_tmp, _ = _resolve_course_profile(meta)
+            if not surface:
+                surface = surface_tmp
+        if dist_m <= 0:
+            dist_m_tmp, _ = _meta_distance_surface(meta)
+            if np.isfinite(dist_m_tmp) and dist_m_tmp > 0:
+                dist_m = float(dist_m_tmp)
+        if class_id < 0:
+            class_id = _infer_race_class_id(meta)
+
+        venue_data = (JRA_ALL_COURSE_CLASS_PACE_DATA.get(venue, {}) or {})
+        surface_data = (venue_data.get(surface, {}) or {})
+        if not surface_data:
+            return {}
+
+        # 距離完全一致 → 最近傍距離
+        dist_int = int(round(dist_m))
+        if dist_int in surface_data:
+            dist_key = dist_int
+        else:
+            available = [d for d in surface_data.keys() if isinstance(d, int)]
+            if not available:
+                return {}
+            nearest = min(available, key=lambda d: abs(d - dist_int))
+            if abs(nearest - dist_int) > 200:
+                return {}
+            dist_key = nearest
+
+        class_data = surface_data.get(dist_key, {}) or {}
+        if class_id in class_data:
+            entry = dict(class_data[class_id])
+            entry['_venue'] = venue
+            entry['_surface'] = surface
+            entry['_distance'] = dist_key
+            entry['_class_id'] = class_id
+            return entry
+        # fallback: 最近傍 class_id
+        available_cls = [c for c in class_data.keys() if isinstance(c, int)]
+        if not available_cls:
+            return {}
+        nearest_cls = min(available_cls, key=lambda c: abs(c - class_id))
+        entry = dict(class_data[nearest_cls])
+        entry['_venue'] = venue
+        entry['_surface'] = surface
+        entry['_distance'] = dist_key
+        entry['_class_id'] = nearest_cls
+        entry['_class_id_fallback'] = True
+        return entry
+    except Exception:
+        return {}
+
+
+def resolve_tokyo1400_pace_cluster(
+    front3f: Optional[float] = None,
+    pace_dev: Optional[float] = None,
+    meta: Optional[Dict[str, str]] = None,
+) -> str:
+    """東京芝1400m ペースクラスタ名を返す。
+
+    TOKYO_TURF_1400_FULL_SPEC['pace_clusters'] の閾値に基づき
+    '高圧' / '標準' / '遅延' のいずれかを返す。
+
+    Args:
+        front3f: 前半3F タイム（秒）
+        pace_dev: ペース乖離値（前半3F - 後半3F）
+        meta: 前半3F / pace_dev が取れない場合の補助入力
+
+    Returns:
+        str: '高圧' | '標準' | '遅延' | '' (判定不能)
+    """
+    try:
+        clusters = TOKYO_TURF_1400_FULL_SPEC.get('pace_clusters', {}) or {}
+        if front3f is None and meta:
+            try:
+                front3f_raw = float(meta.get('front3f', np.nan))
+                if np.isfinite(front3f_raw):
+                    front3f = front3f_raw
+            except Exception:
+                pass
+        if pace_dev is None and meta:
+            try:
+                pd_raw = float(meta.get('pace_dev', np.nan))
+                if np.isfinite(pd_raw):
+                    pace_dev = pd_raw
+            except Exception:
+                pass
+
+        if front3f is not None and np.isfinite(float(front3f)):
+            f3 = float(front3f)
+            # 高圧: front3f <= 33.8 (高圧クラスタ中心33.5)
+            # 標準: 33.8 < front3f <= 34.5
+            # 遅延: front3f > 34.5
+            if f3 <= 33.80:
+                return '高圧'
+            elif f3 <= 34.50:
+                return '標準'
+            else:
+                return '遅延'
+        if pace_dev is not None and np.isfinite(float(pace_dev)):
+            pd = float(pace_dev)
+            # 高圧: pace_dev <= -2.2
+            # 標準: -2.2 < pace_dev <= -0.8
+            # 遅延: pace_dev > -0.8
+            if pd <= -2.20:
+                return '高圧'
+            elif pd <= -0.80:
+                return '標準'
+            else:
+                return '遅延'
+        return ''
+    except Exception:
+        return ''
+
+
+def build_race_feature_vector(
+    meta: Dict[str, str],
+    row: Optional['pd.Series'] = None,  # type: ignore[name-defined]
+    params: Optional[dict] = None,
+) -> Dict[str, object]:
+    """レース1行分の特徴量ベクトルを辞書で返す（AI学習・スコアリング兼用）。
+
+    TOKYO_TURF_1400_FULL_SPEC の feature_engineering 表に基づき、
+    コース / ペース / 枠&騎手 / 馬体重・輸送 / 調教 / 血統 を網羅する。
+
+    Returns:
+        dict: 特徴量名 → 値 の辞書。欠損値は np.nan。
+    """
+    params = params or {}
+    meta = meta or {}
+    row_data: dict = {}
+    if row is not None:
+        try:
+            row_data = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
+        except Exception:
+            row_data = {}
+
+    def _g(key: str, default=np.nan):
+        """row_data → meta の順で値を探す。"""
+        v = row_data.get(key, meta.get(key, default))
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return default
+        try:
+            return float(v)
+        except Exception:
+            return v
+
+    # ---- コース特徴量 ----
+    venue, surface, profile = _resolve_course_profile(meta)
+    dist_m, surf_inferred = _meta_distance_surface(meta)
+    class_id = _infer_race_class_id(meta)
+    rail = _infer_rail_setting(meta) or 'A'
+    month = _infer_race_month(meta)
+    going_str = str(meta.get('going', meta.get('track_condition', '')) or '')
+
+    # ---- クラス別ラップ参照 ----
+    pace_ref = resolve_class_pace_ref(meta, venue=venue, surface=surface,
+                                      dist_m=float(dist_m) if np.isfinite(dist_m) else 0.0,
+                                      class_id=class_id)
+
+    # ---- ペースクラスタ（東京1400mのみ） ----
+    is_t1400 = bool(_is_tokyo_turf_1400(meta))
+    pace_cluster_label = ''
+    if is_t1400:
+        pace_cluster_label = resolve_tokyo1400_pace_cluster(
+            front3f=_g('front3f'),
+            pace_dev=_g('pace_dev'),
+            meta=meta,
+        )
+
+    # ---- 枠番・騎手タイプ ----
+    gate_num = _g('gate', _g('gate_num', np.nan))
+    gate_inner = 1.0 if (isinstance(gate_num, (int, float)) and np.isfinite(float(gate_num)) and float(gate_num) <= 4) else 0.0
+
+    # ---- 馬体重 ----
+    weight_kg = _g('weight', _g('horse_weight', np.nan))
+    prev_weight = _g('prev_weight', _g('prev_horse_weight', np.nan))
+    weight_delta_pct = np.nan
+    if np.isfinite(float(weight_kg)) and np.isfinite(float(prev_weight)) and float(prev_weight) > 0:
+        weight_delta_pct = (float(weight_kg) - float(prev_weight)) / float(prev_weight) * 100.0
+
+    # ---- 調教フラグ ----
+    final_lap_type = str(meta.get('final_lap_type', row_data.get('final_lap_type', '')) or '')
+    final_lap_time = _g('final_lap_time', np.nan)
+    mid_run_count = _g('mid_run_count', np.nan)
+    aibou_flag = _g('aibou_flag', 0.0)
+    training_score = _g('TrainingScore', _g('training_score', np.nan))
+
+    # ---- 血統 ----
+    sire_line = str(meta.get('sire_line', row_data.get('sire_line', '')) or '')
+    brood_sire = str(meta.get('brood_sire', row_data.get('brood_sire', '')) or '')
+
+    # ---- 重賞検出 ----
+    graded_data = _detect_graded_race(meta)
+    is_graded = 1.0 if graded_data else 0.0
+    graded_grade = str(graded_data.get('grade', '') if graded_data else '')
+    graded_stamina = float(graded_data.get('stamina_index', np.nan)) if graded_data else np.nan
+    graded_speed = float(graded_data.get('speed_index', np.nan)) if graded_data else np.nan
+
+    fv: Dict[str, object] = {
+        # コース
+        'venue': venue,
+        'surface': surface,
+        'distance_m': float(dist_m) if np.isfinite(dist_m) else np.nan,
+        'going': going_str,
+        'rail_setting': rail,
+        'month': float(month) if month else np.nan,
+        'class_id': float(class_id) if class_id >= 0 else np.nan,
+        # ペース参照
+        'pace_ref_front3f': float(pace_ref.get('front3f', np.nan)),
+        'pace_ref_back3f': float(pace_ref.get('back3f', np.nan)),
+        'pace_ref_pace_dev': float(pace_ref.get('pace_dev', np.nan)),
+        'pace_ref_f6': float(pace_ref.get('f6', np.nan)),
+        'pace_ref_race_count': float(pace_ref.get('race_count', np.nan)),
+        # 実測ラップ（あれば）
+        'front3f': _g('front3f'),
+        'back3f': _g('back3f'),
+        'pace_dev': _g('pace_dev'),
+        'f6': _g('f6'),
+        # ペースクラスタ
+        'pace_cluster': pace_cluster_label,
+        'is_tokyo1400': 1.0 if is_t1400 else 0.0,
+        # 枠・騎手
+        'gate_num': gate_num,
+        'gate_inner': gate_inner,
+        'jockey_style': str(meta.get('jockey_style', row_data.get('jockey_style', '')) or ''),
+        'jockey_hold_rate': _g('jockey_hold_rate'),
+        # 馬体重・輸送
+        'weight_kg': weight_kg,
+        'weight_delta_pct': weight_delta_pct,
+        'transport_flag': _g('transport_flag', 0.0),
+        'transport_distance_km': _g('transport_distance_km', np.nan),
+        # 調教
+        'final_lap_type': final_lap_type,
+        'final_lap_time': final_lap_time,
+        'mid_run_count': mid_run_count,
+        'aibou_flag': aibou_flag,
+        'training_score': training_score,
+        # 血統
+        'sire_line': sire_line,
+        'brood_sire': brood_sire,
+        'di_score': _g('di_score'),
+        # 騎手交代
+        'jockey_changed': _g('jockey_changed', 0.0),
+        'prev_jockey_win_rate': _g('prev_jockey_win_rate'),
+        'new_jockey_win_rate': _g('new_jockey_win_rate'),
+        # 重賞
+        'is_graded': is_graded,
+        'graded_grade': graded_grade,
+        'graded_stamina_index': graded_stamina,
+        'graded_speed_index': graded_speed,
+        # コースプロファイル
+        'style_bias_front': float((profile.get('style_bias', {}) or {}).get('FRONT', np.nan)),
+        'style_bias_middle': float((profile.get('style_bias', {}) or {}).get('MIDDLE', np.nan)),
+        'style_bias_rear': float((profile.get('style_bias', {}) or {}).get('REAR', np.nan)),
+        'profile_stamina': float(profile.get('stamina', np.nan)),
+        'profile_speed': float(profile.get('speed', np.nan)),
+        'profile_straight': float(profile.get('straight', np.nan)),
+        'profile_corner': float(profile.get('corner', np.nan)),
+        'profile_gate': float(profile.get('gate', np.nan)),
+    }
+    return fv
+
+
+def build_lgbm_place_skeleton(
+    df_train: 'pd.DataFrame',  # type: ignore[name-defined]
+    feature_cols: Optional[List[str]] = None,
+    target_col: str = 'place_flag',
+    cat_cols: Optional[List[str]] = None,
+    n_splits: int = 5,
+    lgbm_params: Optional[dict] = None,
+) -> dict:
+    """LightGBM 複勝予測モデルのスケルトン（AI特徴量エンジニアリング表準拠）。
+
+    TOKYO_TURF_1400_FULL_SPEC['feature_engineering'] に基づく特徴量列を使用。
+    時系列分割（GroupKFold）で学習し AUC を計算する。
+
+    Args:
+        df_train: 学習データ（各行が1頭分の出走データ）
+        feature_cols: 使用特徴量列リスト（None の場合はデフォルト列セット）
+        target_col: 目的変数列名（1=複勝圏内, 0=圏外）
+        cat_cols: カテゴリ列リスト
+        n_splits: 時系列 GroupKFold の分割数
+        lgbm_params: LightGBM ハイパーパラメータ（None の場合はデフォルト）
+
+    Returns:
+        dict: {'model': LGBMClassifier, 'auc': float, 'feature_importance': dict}
+    """
+    try:
+        import lightgbm as lgb  # type: ignore
+        from sklearn.model_selection import GroupKFold  # type: ignore
+        from sklearn.metrics import roc_auc_score  # type: ignore
+    except ImportError as e:
+        return {'error': f'LightGBM/sklearn が利用できません: {e}', 'model': None, 'auc': np.nan}
+
+    import pandas as _pd
+
+    if feature_cols is None:
+        # デフォルト特徴量列（TOKYO_TURF_1400_FULL_SPEC feature_engineering 準拠）
+        feature_cols = [
+            'distance_m', 'class_id', 'month', 'gate_num', 'gate_inner',
+            'pace_ref_front3f', 'pace_ref_back3f', 'pace_ref_pace_dev', 'pace_ref_f6',
+            'weight_kg', 'weight_delta_pct', 'transport_flag',
+            'final_lap_time', 'mid_run_count', 'aibou_flag', 'training_score',
+            'di_score', 'jockey_hold_rate', 'jockey_changed',
+            'style_bias_front', 'style_bias_middle', 'style_bias_rear',
+            'profile_stamina', 'profile_speed', 'profile_straight',
+            'is_graded', 'graded_stamina_index', 'graded_speed_index',
+        ]
+    if cat_cols is None:
+        cat_cols = ['venue', 'surface', 'going', 'rail_setting',
+                    'sire_line', 'brood_sire', 'pace_cluster', 'jockey_style']
+
+    # 利用可能な列のみ絞り込む
+    avail_feat = [c for c in feature_cols if c in df_train.columns]
+    avail_cat = [c for c in cat_cols if c in df_train.columns]
+
+    if target_col not in df_train.columns:
+        return {'error': f'目的変数列 {target_col!r} が見つかりません', 'model': None, 'auc': np.nan}
+    if not avail_feat:
+        return {'error': '有効な特徴量列がありません', 'model': None, 'auc': np.nan}
+
+    default_lgbm = {
+        'num_leaves': 64,
+        'learning_rate': 0.05,
+        'n_estimators': 800,
+        'objective': 'binary',
+        'metric': 'auc',
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'min_child_samples': 20,
+        'reg_alpha': 0.1,
+        'reg_lambda': 1.0,
+        'random_state': 42,
+        'n_jobs': -1,
+        'verbose': -1,
+    }
+    if lgbm_params:
+        default_lgbm.update(lgbm_params)
+
+    X = df_train[avail_feat].copy()
+    y = df_train[target_col].astype(int)
+    # カテゴリ列を category 型に変換
+    for c in avail_cat:
+        if c in X.columns:
+            X[c] = X[c].astype('category')
+
+    # race_id 列があれば GroupKFold のグループに使用
+    group_col = None
+    for gc in ['race_id', 'race_date', 'date']:
+        if gc in df_train.columns:
+            group_col = gc
+            break
+    groups = df_train[group_col].values if group_col else np.arange(len(df_train))
+
+    gkf = GroupKFold(n_splits=n_splits)
+    auc_scores = []
+    models = []
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups)):
+        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        model = lgb.LGBMClassifier(**default_lgbm)
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(period=-1)],
+            categorical_feature=avail_cat,
+        )
+        pred = model.predict_proba(X_val)[:, 1]
+        try:
+            auc = float(roc_auc_score(y_val, pred))
+        except Exception:
+            auc = np.nan
+        auc_scores.append(auc)
+        models.append(model)
+
+    best_idx = int(np.nanargmax(auc_scores)) if auc_scores else 0
+    best_model = models[best_idx] if models else None
+    mean_auc = float(np.nanmean(auc_scores)) if auc_scores else np.nan
+
+    feat_imp: dict = {}
+    if best_model is not None:
+        try:
+            imp = best_model.feature_importances_
+            feat_imp = {str(c): int(v) for c, v in zip(avail_feat, imp)}
+        except Exception:
+            pass
+
+    return {
+        'model': best_model,
+        'auc': mean_auc,
+        'auc_scores': auc_scores,
+        'feature_cols': avail_feat,
+        'cat_cols': avail_cat,
+        'feature_importance': feat_imp,
+        'lgbm_params': default_lgbm,
+    }
 
 
 def enrich_meta_with_course_profile(meta: Dict[str, str]) -> Dict[str, str]:
