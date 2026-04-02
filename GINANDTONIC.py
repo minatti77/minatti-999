@@ -39,13 +39,14 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+# from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from functools import lru_cache
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
+# from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import os
-import hashlib
+# import os
+# import hashlib
 
 import numpy as np
 import pandas as pd
@@ -80,6 +81,148 @@ except Exception:  # allow non-OCR runs
 
 # =========================
 # 0) Utils
+# =========================
+
+def _sha1_of_file(path: str) -> str:
+    """ファイルの SHA-1 ハッシュ（16進数文字列）を返す。"""
+    import hashlib
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _ocr_cache_key(prefix: str, img_path: str, lang: str) -> str:
+    """OCRキャッシュ用のキー文字列を生成する。"""
+    import hashlib
+    raw = f"{prefix}:{img_path}:{lang}".encode('utf-8', errors='ignore')
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _ocr_cache_load_json(cache_dir: Optional[str], key: str) -> Optional[dict]:
+    """OCRキャッシュから JSON を読み込む。存在しなければ None を返す。"""
+    if not cache_dir:
+        return None
+    try:
+        from pathlib import Path as _P
+        import json as _json
+        p = _P(cache_dir) / f"{key}.json"
+        if p.exists() and p.stat().st_size > 0:
+            return _json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        pass
+    return None
+
+
+def _ocr_cache_save_json(cache_dir: Optional[str], key: str, obj: dict) -> None:
+    """OCRキャッシュに JSON を保存する。"""
+    if not cache_dir:
+        return
+    try:
+        from pathlib import Path as _P
+        import json as _json
+        d = _P(cache_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{key}.json").write_text(
+            _json.dumps(obj, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def _wide_market_detail_map_for_anchor(
+    wide_market_df: Optional["pd.DataFrame"],
+    anchor_num: str,
+) -> dict:
+    """wide_market_df から anchor_num を軸にした相手ごとの市場情報 dict を返す。
+
+    wide_market_df が None または列が揃っていない場合は空 dict を返す。
+    """
+    result: dict = {}
+    if wide_market_df is None:
+        return result
+    try:
+        # import pandas as _pd
+        for _, row in wide_market_df.iterrows():
+            n1 = str(row.get('num1', '') or '')
+            n2 = str(row.get('num2', '') or '')
+            if n1 == str(anchor_num):
+                opp = n2
+            elif n2 == str(anchor_num):
+                opp = n1
+            else:
+                continue
+            if not opp:
+                continue
+            result[opp] = {
+                'market_min': float(row.get('market_min', 0) or 0),
+                'market_max': float(row.get('market_max', 0) or 0),
+                'market_mid': float(row.get('market_mid', 0) or 0),
+                'market_text': str(row.get('market_text', '') or ''),
+            }
+    except Exception:
+        pass
+    return result
+
+
+def _estimate_trio_probabilities(
+    df: "pd.DataFrame",
+    n_samples: int = 60000,
+    top_mass: float = 0.22,
+    seed: int = 0,
+    mode: str = 'global_then_filter_anchor',
+    z_ci: float = 1.281551565545,
+) -> Optional["pd.DataFrame"]:
+    """モンテカルロ法で三連複の確率を推定し、上位 DataFrame を返す。
+
+    SAS スコアをソフトマックスで確率に変換してサンプリングする。
+    """
+    try:
+        import numpy as _np
+        import pandas as _pd
+        d = df.copy()
+        d['num'] = d['num'].astype(str)
+        if 'SAS' not in d.columns:
+            d['SAS'] = 50.0
+        sas = d['SAS'].fillna(50.0).astype(float).values
+        nums = d['num'].values
+        n = len(nums)
+        if n < 3:
+            return None
+
+        # softmax で出走確率（≒勝率）に変換
+        tau = 10.0
+        logits = sas / tau
+        logits = logits - logits.max()
+        probs = _np.exp(logits)
+        probs = probs / probs.sum()
+
+        rng = _np.random.default_rng(seed)
+        combo_counts: dict = {}
+        for _ in range(n_samples):
+            drawn = rng.choice(n, size=min(3, n), replace=False, p=probs)
+            key = tuple(sorted([nums[i] for i in drawn]))
+            combo_counts[key] = combo_counts.get(key, 0) + 1
+
+        rows = []
+        for combo, cnt in combo_counts.items():
+            p_mean = cnt / n_samples
+            # ベータ分布の CI 下限（簡易）
+            _ = cnt + 1.0
+            _ = n_samples - cnt + 1.0
+            p_low = max(0.0, p_mean - z_ci * _np.sqrt(p_mean * (1 - p_mean) / n_samples))
+            rows.append({'num1': combo[0], 'num2': combo[1], 'num3': combo[2],
+                         'p_trio_mean': p_mean * 100.0,
+                         'p_trio_low':  p_low  * 100.0,
+                         'count': cnt})
+
+        if not rows:
+            return None
+        trio_df = _pd.DataFrame(rows).sort_values('p_trio_mean', ascending=False)
+        return trio_df
+    except Exception:
+        return None
+
 
 # =========================
 # Params (balanced tuning)
@@ -727,6 +870,47 @@ DEFAULT_PARAMS = {
         'MIDDLE': {'FRONT': 1.02, 'MIDDLE': 1.00, 'REAR': 0.99},
         'REAR':   {'FRONT': 1.01, 'MIDDLE': 0.99, 'REAR': 0.97},
     },
+
+    # ===== 重賞特化パラメータ (graded_race_params) =====
+    # JRA_GRADED_RACES_DATA で検出された重賞レース時のみ適用される追加補正パラメータ。
+    # enabled=False で全無効化（一般レースと同じ挙動に戻す）。
+    'graded_race_params': {
+        'enabled': True,
+        # 脚質バイアス補正スケール: style_bias × このスケールを AnchorScore に加算
+        # 例: style_bias['REAR']=0.78 × 3.0 = +2.34点
+        'style_bias_scale': 3.0,
+        # スタミナ適性補正スケール: StaminaScore の偏差 × (stamina_index-0.5) × スケール
+        'stamina_scale': 2.5,
+        # スピード適性補正スケール
+        'speed_scale': 2.0,
+        # key_factors 補正スケール（各キーファクターのスコア偏差に乗算）
+        'key_factor_scale': 1.5,
+        # AnchorScore ボーナスの上限（1馬あたり最大加点）
+        'bonus_cap': 6.0,
+        # AnchorScore ペナルティの上限（1馬あたり最大減点）
+        'penalty_cap': 4.0,
+    },
+    # ===== 全競馬場×クラス別ラップ参照設定 (all_course_class_pace) v1.34 =====
+    'all_course_class_pace': {
+        'enabled': True,
+        # profile へのラップ参照値書き込みを有効化（front3f_ref, back3f_ref 等）
+        'enrich_profile': True,
+        # ペース前傾度でスコアを補正する（pace_dev が急な場合 = ハイペース → 差し有利補正）
+        'pace_dev_tilt_scale': 0.08,   # |pace_dev| > tilt_threshold の場合に追加補正
+        'pace_dev_tilt_threshold': 2.0,
+        # 重賞レースでクラス比較表を Markdown に出力するか
+        'show_class_comparison_table': True,
+    },
+    # ===== 東京芝1400m完全仕様設定 v1.34 =====
+    'tokyo_1400_full_spec': {
+        'enabled': True,
+        # 季節補正の強さ（0.0=無効, 1.0=フル適用）
+        'seasonal_scale': 0.8,
+        # 調教要因ボーナスを AnchorScore に加算するか（TrainingScore 列が必要）
+        'training_bonus_enabled': True,
+        # ペースクラスタ表示（重賞/OP レースのみ）
+        'show_pace_cluster': True,
+    },
 }
 
 
@@ -1286,19 +1470,23 @@ def _r39_scored_df_to_records(scored_df: pd.DataFrame) -> list:
     ]
     records = []
     try:
-        for _, row in scored_df.iterrows():
-            rec = {}
-            for col in score_cols:
-                if col in scored_df.columns:
-                    v = row[col]
-                    try:
-                        if isinstance(v, float) and not np.isfinite(v):
-                            rec[col] = None
-                        else:
-                            rec[col] = float(v) if isinstance(v, (float, int, np.floating, np.integer)) else str(v)
-                    except Exception:
-                        rec[col] = str(v) if v is not None else None
-            records.append(rec)
+        # ── ベクトル化: iterrows → to_dict('records') ──────────────
+        existing_cols = [c for c in score_cols if c in scored_df.columns]
+        sub = scored_df[existing_cols].copy()
+
+        def _safe_val(v):
+            if isinstance(v, float) and not np.isfinite(v):
+                return None
+            if isinstance(v, (float, int, np.floating, np.integer)):
+                try:
+                    return float(v)
+                except Exception:
+                    return None
+            return str(v) if v is not None else None
+
+        for col in existing_cols:
+            sub[col] = sub[col].map(_safe_val)
+        records = sub.to_dict('records')
     except Exception:
         pass
     return records
@@ -2372,7 +2560,7 @@ def analyze_race_results(
     df = _r41_load_results_df(result_dir)
     now_str = _dt.datetime.now().strftime('%Y-%m-%d %H:%M')
 
-    out = f'# STELLA v1.18 事後分析レポート (R41)\n\n'
+    out = '# STELLA v1.18 事後分析レポート (R41)\n\n'
     out += f'- 生成日時: {now_str}\n'
     out += f'- 読込ディレクトリ: `{result_dir}`\n'
 
@@ -2503,7 +2691,7 @@ def analyze_race_results(
         out += '\n'
 
     out += '---\n'
-    out += f'- version: STELLA v1.18 事後分析 (R41)\n'
+    out += '- version: STELLA v1.18 事後分析 (R41)\n'
     out += f'- source: `analyze_race_results("{result_dir}")`\n'
 
     # ファイル書き出し
@@ -2546,21 +2734,12 @@ def _r42_rescore_df(
     """
     df = df.copy()
 
-    def _level_for_row(row) -> str:
-        p = _safe_float(row.get('p_place_est'))
-        g = _safe_float(row.get('confidence_score_gap'))
-        if p is None or not np.isfinite(p):
-            return 'LOW'
-        if g is None or not np.isfinite(g):
-            g = 0.0
-        # anchor_mode BOXは高信頼度に上げない（保存JSONに情報なし → 非BOX仮定）
-        if p >= high_p_min and g >= gap_high:
-            return 'HIGH'
-        elif p >= medium_p_min and g >= gap_medium:
-            return 'MEDIUM'
-        return 'LOW'
-
-    df['r42_level'] = df.apply(_level_for_row, axis=1)
+    # ── ベクトル化: apply → pandas条件演算 ──────────────────────
+    p_ser = pd.to_numeric(df.get('p_place_est', np.nan), errors='coerce')
+    g_ser = pd.to_numeric(df.get('confidence_score_gap', np.nan), errors='coerce').fillna(0.0)
+    high_mask   = p_ser.notna() & (p_ser >= high_p_min)   & (g_ser >= gap_high)
+    medium_mask = p_ser.notna() & (p_ser >= medium_p_min) & (g_ser >= gap_medium)
+    df['r42_level'] = np.where(high_mask, 'HIGH', np.where(medium_mask, 'MEDIUM', 'LOW'))
     return df
 
 
@@ -2593,7 +2772,7 @@ def _r42_eval_params(
             valid (bool)
     """
     scored = _r42_rescore_df(df, high_p_min, medium_p_min, gap_high, gap_medium)
-    n_total = len(scored)
+    _ = len(scored)
 
     # — HIGH stats —
     high_sub = scored[(scored['r42_level'] == 'HIGH')].copy()
@@ -2813,7 +2992,7 @@ def tune_confidence_params(
     n_races = len(df)
 
     now_str = _dt.datetime.now().strftime('%Y-%m-%d %H:%M')
-    report = f'# STELLA v1.18 confidence 自動チューニングレポート (R42)\n\n'
+    report = '# STELLA v1.18 confidence 自動チューニングレポート (R42)\n\n'
     report += f'- 生成日時: {now_str}\n'
     report += f'- 読込ディレクトリ: `{result_dir}`\n'
     report += f'- 総レース数: {n_races}件\n\n'
@@ -2837,8 +3016,8 @@ def tune_confidence_params(
     # p_place_est の補完（_pct から計算）
     if 'p_place_est' not in df.columns or df['p_place_est'].isna().all():
         if 'p_place_est_pct' in df.columns:
-            df['p_place_est'] = df['p_place_est_pct'].apply(
-                lambda v: float(v) / 100.0 if pd.notna(v) else None)
+            _pct = pd.to_numeric(df['p_place_est_pct'], errors='coerce')
+            df['p_place_est'] = _pct.where(_pct.isna(), _pct / 100.0)
 
     # グリッドサーチ
     top_results = _r42_grid_search(
@@ -2919,7 +3098,7 @@ def tune_confidence_params(
     report += '}\n```\n\n'
 
     report += '---\n'
-    report += f'- version: STELLA v1.18 confidence自動チューニング (R42)\n'
+    report += '- version: STELLA v1.18 confidence自動チューニング (R42)\n'
     report += f'- source: `tune_confidence_params("{result_dir}")`\n'
 
     if verbose:
@@ -3187,7 +3366,7 @@ def analyze_wide_roi(
       3. スコアベース仮想選択のROI（AnchorScore / SAS / p_place_est_pctで比較）
       4. 最適推奨設定の提案
     """
-    _params = params or {}
+    _ = params or {}
     df = _r41_load_results_df(result_dir)
     n_total = len(df)
     n_place_ok = int((df['place_ok'] == True).sum()) if not df.empty else 0
@@ -3671,7 +3850,7 @@ def analyze_trio_roi(
       6. 的中パターン分析（アンカー着順・配当帯分布）
       7. コスト・損益分岐点分析 + 推奨設定
     """
-    _params = params or {}
+    _ = params or {}
     df = _r41_load_results_df(result_dir)
     n_total = len(df)
     n_place_ok = int((df['place_ok'] == True).sum()) if not df.empty else 0
@@ -4451,9 +4630,9 @@ def analyze_dashboard(
 _R46_MAJOR_VENUES = {'東京', '阪神', '中山', '京都', '中京', '新潟', '福島', '小倉', '札幌', '函館'}
 
 
+@lru_cache(maxsize=256)
 def _r46_classify_race_no(race_str: str) -> int:
     """race フィールド文字列からレース番号(1-12)を抽出。不明は0。"""
-    import re
     if not race_str:
         return 0
     m = re.search(r'(\d{1,2})\s*[Rr]', str(race_str))
@@ -4469,12 +4648,12 @@ def _r46_classify_race_no(race_str: str) -> int:
     return 0
 
 
+@lru_cache(maxsize=512)
 def _r46_estimate_distance(lap_times_str: str, avg_halon_str: str) -> int:
     """ラップタイム文字列から推定距離(m)を返す。不明は0。
     lap_times例: '11.9-10.6-11.3-12.1-12.4-12.4' → 6ハロン → 1200m
     """
     if lap_times_str:
-        import re
         laps = re.split(r'[-,]', str(lap_times_str).strip())
         laps = [x for x in laps if re.match(r'^\d+\.?\d*$', x.strip())]
         if laps:
@@ -4483,6 +4662,7 @@ def _r46_estimate_distance(lap_times_str: str, avg_halon_str: str) -> int:
     return 0
 
 
+@lru_cache(maxsize=128)
 def _r46_dist_category(dist_m: int) -> str:
     """推定距離(m)から距離帯カテゴリーを返す。"""
     if dist_m <= 0:
@@ -4497,6 +4677,7 @@ def _r46_dist_category(dist_m: int) -> str:
         return '長距離(2201m〜)'
 
 
+@lru_cache(maxsize=256)
 def _r46_venue_category(venue: str) -> str:
     """venue文字列から開催場カテゴリーを返す。"""
     v = str(venue or '').strip()
@@ -4509,6 +4690,7 @@ def _r46_venue_category(venue: str) -> str:
     return 'その他'
 
 
+@lru_cache(maxsize=16)
 def _r46_race_slot(race_no: int) -> str:
     """レース番号からレース時間帯カテゴリーを返す。"""
     if race_no <= 0:
@@ -4525,41 +4707,25 @@ def _r46_enrich_df(df):
     """DataFrameにR46分類列を追加したコピーを返す。
     追加列: venue_cat, race_no, race_slot, dist_m, dist_cat
     """
-    import pandas as pd
+    # import pandas as pd
 
     if df is None or len(df) == 0:
         return df
 
     df = df.copy()
 
-    venue_cats = []
-    race_nos = []
-    race_slots = []
-    dist_ms = []
-    dist_cats = []
+    # ── ベクトル化: iterrows を廃止して apply/map に統一 ─────────
+    venue_col = df['venue'].astype(str).fillna('') if 'venue' in df.columns else pd.Series([''] * len(df), index=df.index)
+    df['venue_cat'] = venue_col.map(_r46_venue_category)
 
-    for _, row in df.iterrows():
-        # venue category
-        venue_cats.append(_r46_venue_category(str(row.get('venue', '') or '')))
+    race_col = df['race'].astype(str).fillna('') if 'race' in df.columns else pd.Series([''] * len(df), index=df.index)
+    df['race_no'] = race_col.map(_r46_classify_race_no)
+    df['race_slot'] = df['race_no'].map(_r46_race_slot)
 
-        # race number & slot (from 'race' column)
-        rno = _r46_classify_race_no(str(row.get('race', '') or ''))
-        race_nos.append(rno)
-        race_slots.append(_r46_race_slot(rno))
-
-        # distance from race_id (race_id may embed distance in some formats)
-        # or from additional meta stored in JSON - try lap_times if available
-        lap_str = str(row.get('lap_times', '') or '')
-        avg_str = str(row.get('avg_halon', '') or '')
-        dm = _r46_estimate_distance(lap_str, avg_str)
-        dist_ms.append(dm)
-        dist_cats.append(_r46_dist_category(dm))
-
-    df['venue_cat'] = venue_cats
-    df['race_no'] = race_nos
-    df['race_slot'] = race_slots
-    df['dist_m'] = dist_ms
-    df['dist_cat'] = dist_cats
+    lap_col = (df['lap_times'].astype(str).fillna('') if 'lap_times' in df.columns else pd.Series([''] * len(df), index=df.index))
+    avg_col = (df['avg_halon'].astype(str).fillna('') if 'avg_halon' in df.columns else pd.Series([''] * len(df), index=df.index))
+    df['dist_m'] = [_r46_estimate_distance(l, a) for l, a in zip(lap_col, avg_col)]
+    df['dist_cat'] = df['dist_m'].map(_r46_dist_category)
 
     return df
 
@@ -4608,7 +4774,7 @@ def _r46_category_roi_stats(df, stake_per: float, category_col: str,
     bet_type: 'place' / 'wide' / 'trio'
     Returns: list of dicts {category, n, n_hit, roi, hit_rate, avg_payout}
     """
-    import numpy as np
+    # import numpy as np
 
     results = []
     if df is None or len(df) == 0:
@@ -4641,7 +4807,7 @@ def _r46_category_roi_stats(df, stake_per: float, category_col: str,
             hits = rows['wide_hit_count'].infer_objects(copy=False).fillna(0).astype(float).sum()
             payouts = rows['payout_wide_max'].infer_objects(copy=False).fillna(0.0).astype(float)
             # wide: assume 4-wide default; use wide_num_count column if available
-            n_points = float(rows.get('wide_num_count', 4) if isinstance(
+            _ = float(rows.get('wide_num_count', 4) if isinstance(
                 rows.get('wide_num_count'), float) else 4)
             investment = n * 4 * stake_per  # 4点購入として計算
             payout_per_100 = stake_per / 100.0
@@ -4984,7 +5150,8 @@ def analyze_category_roi(
 # R47: アンカースコア精度分析 (v1.23)
 # =========================
 
-def _r47_score_bands(anchor_score: float) -> str:
+@lru_cache(maxsize=512)
+def _r47_score_bands(anchor_score) -> str:
     """AnchorScoreを10点刻みのバンドに分類する。"""
     if anchor_score is None or anchor_score != anchor_score:  # NaN check
         return '不明'
@@ -5005,7 +5172,8 @@ def _r47_score_bands(anchor_score: float) -> str:
         return '90+'
 
 
-def _r47_pplace_bands(p_place_est_pct: float) -> str:
+@lru_cache(maxsize=512)
+def _r47_pplace_bands(p_place_est_pct) -> str:
     """p_place_est_pct を 10%刻みのバンドに分類する。"""
     if p_place_est_pct is None or p_place_est_pct != p_place_est_pct:
         return '不明'
@@ -5026,6 +5194,7 @@ def _r47_pplace_bands(p_place_est_pct: float) -> str:
         return '80%+'
 
 
+@lru_cache(maxsize=32)
 def _r47_rank_category(anchor_rank) -> str:
     """anchor_rank（着順）をカテゴリーに分類する。"""
     if anchor_rank is None:
@@ -5116,7 +5285,7 @@ def _r47_score_band_stats(df) -> list:
     if len(ok) == 0:
         return results
 
-    ok['_sband'] = ok['anchor_score'].apply(_r47_score_bands)
+    ok['_sband'] = ok['anchor_score'].map(_r47_score_bands)
 
     band_order = ['<40', '40-49', '50-59', '60-69', '70-79', '80-89', '90+', '不明']
     for band in band_order:
@@ -5160,7 +5329,7 @@ def _r47_pplace_band_stats(df) -> list:
     if len(ok) == 0:
         return results
 
-    ok['_pband'] = ok['p_place_est_pct'].apply(_r47_pplace_bands)
+    ok['_pband'] = ok['p_place_est_pct'].map(_r47_pplace_bands)
 
     band_order = ['<30%', '30-39%', '40-49%', '50-59%', '60-69%', '70-79%', '80%+', '不明']
     for band in band_order:
@@ -5202,7 +5371,7 @@ def _r47_rank_distribution(df) -> list:
     if len(ok) == 0:
         return results
 
-    ok['_rcat'] = ok['anchor_rank'].apply(_r47_rank_category)
+    ok['_rcat'] = ok['anchor_rank'].map(_r47_rank_category)
 
     cat_order = ['1着', '2着', '3着', '4-5着', '6-8着', '9着以下', '不明']
     n_total = len(ok)
@@ -5222,7 +5391,7 @@ def _r47_rank_distribution(df) -> list:
 
 def _r47_score_vs_rank_buckets(df, n_buckets: int = 5) -> list:
     """AnchorScoreをn_buckets等分してバケット別の平均着順を計算する。"""
-    import numpy as np
+    # import numpy as np
 
     results = []
     if df is None or len(df) == 0:
@@ -5704,7 +5873,7 @@ def _r48_status_icon(error):
 
 def _r48_run_all_analyses(result_dir, params, stakes, verbose=True):
     """R41-R47 の全分析を順番に実行し結果辞書を返す"""
-    NL = '\n'
+    _ = '\n'
     all_results = {}
 
     MODULES = [
@@ -6362,7 +6531,7 @@ def _r49_load_df(result_dir, params=None):
     try:
         df = _r46_load_enriched_df(result_dir)
         return df
-    except Exception as _e49:
+    except Exception:
         return None
 
 
@@ -6628,7 +6797,7 @@ def _r49_build_venue_dashboard_md(venue_stats_list, df_total_n, meta, stakes):
                     cs = s['conf_stats'].get(cl, {})
                     cn = cs.get('n', 0)
                     ch = cs.get('hit', 0)
-                    cr = cs.get('rate')
+                    _ = cs.get('rate')
                     lines.append('| {} | {} | {} | {} |'.format(
                         cl, cn, ch, _r49_pct(ch, cn) if cn > 0 else 'N/A'))
                 lines.append('')
@@ -6853,6 +7022,7 @@ _R50_CORRECTION_ADVICE = {
 # ユーティリティ
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=256)
 def _r50_estimate_going(avg_halon):
     """avg_halon（秒/ハロン）から仮想馬場状態カテゴリーを返す。
 
@@ -6940,24 +7110,24 @@ def _r50_enrich_df(df):
 
     avg_halon 列が存在しない場合は _r46_load_enriched_df のデータを利用。
     """
-    import pandas as _pd50
+    # import pandas as _pd50
 
     if df is None or len(df) == 0:
         return df
 
     df = df.copy()
 
-    going_cats = []
-    for _, row in df.iterrows():
-        avg_h = row.get('avg_halon') if hasattr(row, 'get') else None
-        # 文字列として格納されている場合の変換
-        try:
-            avg_h = float(avg_h) if avg_h not in (None, '', 'nan') else None
-        except Exception:
-            avg_h = None
-        going_cats.append(_r50_estimate_going(avg_h))
-
-    df['going_cat'] = going_cats
+    # ── ベクトル化: iterrows を廃止 ──────────────────────────────
+    if 'avg_halon' in df.columns:
+        def _parse_avg_halon(v):
+            try:
+                return float(v) if v not in (None, '', 'nan') else None
+            except Exception:
+                return None
+        avg_h_series = df['avg_halon'].map(_parse_avg_halon)
+        df['going_cat'] = avg_h_series.map(_r50_estimate_going)
+    else:
+        df['going_cat'] = 'unknown'
     return df
 
 
@@ -7123,7 +7293,7 @@ def _r50_venue_going_cross(df, stake_place):
 
     Returns: list of dict {venue, going_cat, n, place_hit_rate, place_roi}
     """
-    import pandas as _pd50
+    # import pandas as _pd50
 
     if df is None or len(df) == 0:
         return []
@@ -7525,9 +7695,9 @@ def analyze_track_condition(
 import pandas as _pd52
 import numpy as _np52
 import json as _json52
-import os as _os52
-from pathlib import Path as _Path52
-from typing import Optional, Dict, List, Any
+# import os as _os52
+# from pathlib import Path as _Path52
+# from typing import Optional, Dict, List, Any
 
 # ---- 定数 ----
 _R52_PACE_LABELS = {'H': 'ハイ(H)', 'M': 'ミドル(M)', 'S': 'スロー(S)', '': '不明'}
@@ -7790,8 +7960,8 @@ def _r52_build_cross_md(
         f"> STELLA v1.32 | 対象レース数: {n_races} | place_ok: {n_ok}",
         "",
         "## 0. 実行サマリー", "",
-        f"| 項目 | 値 |",
-        f"|------|-----|",
+        "| 項目 | 値 |",
+        "|------|-----|",
         f"| 総レース数 | {n_races} |",
         f"| 分析対象(place_ok) | {n_ok} |",
         f"| ペース軸 (H/M/S) | {n_pace} 種 |",
@@ -7958,7 +8128,7 @@ def analyze_cross_analysis(
     # --- データロード ---
     try:
         df = _r52_load_df(result_dir)
-    except Exception as e:
+    except Exception:
         df = _pd52.DataFrame()
 
     n_races = len(df)
@@ -8051,9 +8221,9 @@ def analyze_cross_analysis(
 import pandas as _pd53
 import numpy as _np53
 import json as _json53
-import os as _os53
-from pathlib import Path as _Path53
-from typing import Optional, List, Dict, Any
+# import os as _os53
+# from pathlib import Path as _Path53
+# from typing import Optional, List, Dict, Any
 
 # ---- 定数 ----
 _R53_GOING_LABELS = {
@@ -8098,6 +8268,7 @@ def _r53_fmt_float(v, dec=2, na='N/A'):
     return f"{v:.{dec}f}"
 
 
+@lru_cache(maxsize=512)
 def _r53_score_band(score):
     """anchor_score を10点刻みバンドに分類"""
     if score is None or (isinstance(score, float) and _np53.isnan(score)):
@@ -8127,7 +8298,7 @@ def _r53_load_df(result_dir):
         return _pd53.DataFrame()
     # score_band 列を追加
     if 'anchor_score' in df.columns:
-        df['score_band'] = df['anchor_score'].apply(_r53_score_band)
+        df['score_band'] = df['anchor_score'].map(_r53_score_band)
     else:
         df['score_band'] = '不明'
     return df
@@ -8216,7 +8387,7 @@ def _r53_find_best_alpha(df, going_cat, stake_place=1000.0):
         n_high = int(high_mask.sum())
         if n_high == 0:
             continue
-        n_hit = int(ph[high_mask].sum())
+        _ = int(ph[high_mask].sum())
         ret   = float((ph[high_mask].astype(float) * payouts[high_mask]).sum())
         roi   = ret / (n_high * stake_place) if n_high > 0 else float('-inf')
         if roi > best_roi:
@@ -8593,6 +8764,7 @@ _R54_MIN_RACES = 3      # 統計表示の最小レース数/月
 _R54_CHART_W   = 60     # ASCII折れ線グラフの文字幅
 
 
+@lru_cache(maxsize=256)
 def _r54_ym(s: str) -> str:
     """ISO8601文字列 / 日付文字列から 'YYYY-MM' を返す。"""
     s = str(s or "").strip()
@@ -8700,9 +8872,9 @@ def _r54_load_df(result_dir: str):
         return df
     # year_month列を付与 (created_at → YYYY-MM)
     if "created_at" in df.columns:
-        df["year_month"] = df["created_at"].apply(_r54_ym)
+        df["year_month"] = df["created_at"].map(_r54_ym)
     elif "date" in df.columns:
-        df["year_month"] = df["date"].apply(_r54_ym)
+        df["year_month"] = df["date"].map(_r54_ym)
     else:
         df["year_month"] = "不明"
     return df
@@ -9526,9 +9698,8 @@ def _r55_validation_kpi(df, alphas: dict, stake_place: float = 1000.0) -> dict:
     if df is None or (hasattr(df, "empty") and df.empty):
         return {"overall": {}, "per_going": {}, "rows": []}
 
-    rows = []
-    for _, row in df.iterrows():
-        rows.append(_r55_validate_race(row, alphas, stake_place))
+    # ── ベクトル化: iterrows → apply ──────────────────────────────
+    rows = df.apply(lambda row: _r55_validate_race(row, alphas, stake_place), axis=1).tolist()
 
     def _kpi(subset):
         n_high   = sum(1 for r in subset if r["in_high_raw"])
@@ -9748,7 +9919,7 @@ def _r55_build_apply_md(alphas: dict, kpi: dict, meta: dict) -> str:
     lines.append("```python")
     lines.append("from gin_and_tonic import _r55_load_alphas, _r55_apply_alphas_to_params")
     lines.append("")
-    lines.append(f"# JSONからαをロード")
+    lines.append("# JSONからαをロード")
     lines.append(f"alphas = _r55_load_alphas('{meta.get('alpha_json', 'alphas.json')}')")
     lines.append("")
     lines.append("# paramsに組み込む")
@@ -10013,6 +10184,115 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return float(max(lo, min(hi, x)))
 
 
+# ─── Fast vectorised clip helpers ───────────────────────────────────────────
+# pandas Series.clip() calls _clip_with_scalar → where(), which is ~18x slower
+# than np.clip on the underlying array.  Use these helpers wherever the
+# Series is already float-typed (the vast majority of hot paths).
+
+def _clip_series(s: pd.Series, lo: float, hi: float) -> pd.Series:
+    """Clip a float Series to [lo, hi] using np.clip (bypasses pandas overhead)."""
+    arr = s.values
+    if arr.dtype.kind != 'f':
+        arr = arr.astype(float)
+    return _make_series(np.clip(arr, lo, hi), s.index)
+
+def _clip0100(s) -> pd.Series:
+    """Clip a float Series (or ndarray) to [0, 100] – the most common call pattern.
+
+    Accepts pd.Series or np.ndarray. When given an ndarray, returns a Series
+    with a default RangeIndex so downstream .values / .index calls still work.
+    """
+    if isinstance(s, np.ndarray):
+        arr = s if s.dtype.kind == 'f' else s.astype(float)
+        clipped = np.clip(arr, 0.0, 100.0)
+        return _make_series(clipped, pd.RangeIndex(len(clipped)))
+    arr = s.values
+    if arr.dtype.kind != 'f':
+        arr = arr.astype(float)
+    return _make_series(np.clip(arr, 0.0, 100.0), s.index)
+
+# ─── Ultra-fast Series construction ─────────────────────────────────────────
+# pd.Series.__init__ has ~25 µs overhead per call due to isinstance checks,
+# __finalize__, __setattr__ etc.  _make_series bypasses this using the
+# internal _from_mgr + SingleBlockManager path, costing ~6 µs (4x faster).
+
+try:
+    from pandas.core.internals.managers import SingleBlockManager as _SBM
+
+    def _make_series(arr: np.ndarray, idx) -> pd.Series:
+        """Build a float64 Series from a numpy array (fast path via _from_mgr)."""
+        if arr.dtype != np.float64:
+            arr = arr.astype(np.float64)
+        mgr = _SBM.from_array(arr, idx)
+        s = pd.Series._from_mgr(mgr, [idx])
+        object.__setattr__(s, '_name', None)
+        return s
+
+except Exception:
+    # Fallback to standard constructor if internal API has changed
+    def _make_series(arr: np.ndarray, idx) -> pd.Series:  # type: ignore[misc]
+        """Build a float64 Series from a numpy array."""
+        return pd.Series(arr, index=idx, dtype=float, copy=False)
+
+# ─── Fast array extraction from DataFrame ──────────────────────────────────
+# _arr(df, col, fill) – returns float64 numpy array; ~3 µs vs _num_series 48 µs
+
+def _arr(df: pd.DataFrame, col: str, fill: float = np.nan) -> np.ndarray:
+    """Extract column as float64 ndarray, filling NaN/inf with *fill*.
+
+    ~8x faster than _num_series(df, col, fill) for float columns.
+    Use for intermediate computation kernels; wrap result with _make_series()
+    when a pd.Series is needed for DataFrame assignment.
+    """
+    if col in df.columns:
+        raw = df[col]
+        if raw.dtype.kind == 'f':
+            v = raw.values.copy()
+        else:
+            v = pd.to_numeric(raw, errors='coerce').values.astype(float)
+        if not np.isfinite(fill):
+            # Only replace infinities
+            mask = np.isinf(v)
+            if mask.any():
+                v[mask] = np.nan
+        else:
+            mask = ~np.isfinite(v)
+            if mask.any():
+                v[mask] = fill
+        return v
+    else:
+        n = len(df)
+        return np.full(n, fill, dtype=float)
+
+# ─── Vectorized weighted-sum helper ─────────────────────────────────────────
+# _wsum0100(idx, (w1, s1), (w2, s2), ...) avoids creating intermediate Series
+# objects for each multiplication and addition.  All arithmetic is done on the
+# underlying numpy arrays; a single _clip0100 + _make_series wraps the result.
+# This replaces patterns like:  _clip0100(w1*s1 + w2*s2 + ...)
+# where s1,s2,... are pd.Series with the same index.
+
+def _wsum(idx, *weighted_terms, lo: float = 0.0, hi: float = 100.0) -> pd.Series:
+    """Compute sum(w * arr) for (w, series_or_arr) pairs and clip to [lo, hi].
+
+    Avoids pandas arithmetic overhead; all computation is in numpy.
+    Returns a float64 Series with the given index.
+    """
+    n = len(idx)
+    out = np.zeros(n, dtype=np.float64)
+    for w, s in weighted_terms:
+        arr = s.values if hasattr(s, 'values') else np.asarray(s, dtype=float)
+        out += float(w) * arr
+    if lo > -np.inf or hi < np.inf:
+        out = np.clip(out, lo, hi)
+    return _make_series(out, idx)
+
+
+def _wsum0100(idx, *weighted_terms) -> pd.Series:
+    """Weighted sum clipped to [0, 100]."""
+    return _wsum(idx, *weighted_terms, lo=0.0, hi=100.0)
+
+# ────────────────────────────────────────────────────────────────────────────
+
 # ----- Place calibration helper (PURE_DATA) -----
 _NUM_DEFAULT = object()
 
@@ -10029,6 +10309,53 @@ def _num_series(obj, key_or_default=np.nan, default=_NUM_DEFAULT, *, index=None,
     The DataFrame-column form preserves legacy fallback behavior while routing all
     numeric conversion through this single implementation path.
     """
+    # ━━━ Fast path: most common call form _num_series(df, 'col', scalar) ━━━
+    # Covers ~80% of call sites; avoids isinstance / reindex overhead.
+    if (
+        key is None
+        and lower is None
+        and upper is None
+        and dtype is float
+        and obj.__class__ is pd.DataFrame
+        and key_or_default.__class__ is str
+    ):
+        _idx = obj.index
+        if key_or_default in obj.columns:
+            _fill = np.nan if default is _NUM_DEFAULT else default
+            _raw = obj[key_or_default]
+            # If already float dtype, use numpy directly (fastest path)
+            if _raw.dtype.kind == 'f':
+                _vals = _raw.values.copy()
+                _inf_mask = ~np.isfinite(_vals)
+                if _inf_mask.any():
+                    _vals[_inf_mask] = np.nan
+                if _fill is not None:
+                    _fv = float(_fill)
+                    if not np.isnan(_fv):
+                        _nan_mask = np.isnan(_vals)
+                        if _nan_mask.any():
+                            _vals[_nan_mask] = _fv
+                return _make_series(_vals, _idx)
+            else:
+                _col = pd.to_numeric(_raw, errors='coerce')
+                _vals = _col.values.copy()
+                _inf_mask = ~np.isfinite(_vals)
+                if _inf_mask.any():
+                    _vals[_inf_mask] = np.nan
+                if _fill is not None:
+                    _fv = float(_fill)
+                    if not np.isnan(_fv):
+                        _nan_mask = np.isnan(_vals)
+                        if _nan_mask.any():
+                            _vals[_nan_mask] = _fv
+                return _make_series(_vals, _idx)
+        else:
+            # Column not present → return constant Series
+            _fill = np.nan if default is _NUM_DEFAULT else default
+            _fv = float(_fill) if _fill is not None else np.nan
+            return _make_series(np.full(len(_idx), _fv, dtype=float), _idx)
+    # ━━━ End fast path ━━━
+
     if isinstance(obj, pd.DataFrame) or key is not None:
         if not isinstance(obj, pd.DataFrame):
             raise TypeError('_num_series(key=...) requires DataFrame input')
@@ -10096,10 +10423,21 @@ def _num_series(obj, key_or_default=np.nan, default=_NUM_DEFAULT, *, index=None,
                     out = pd.Series([out] * len(index), index=index)
     if index is None:
         index = getattr(out, 'index', pd.RangeIndex(0))
-    out = out.reindex(index).replace([np.inf, -np.inf], np.nan)
+    out = out.reindex(index)
+    # Replace inf/-inf with NaN using numpy (17x faster than .replace())
+    _ov = out.values.copy().astype(float)
+    _inf_mask = np.isinf(_ov)
+    if _inf_mask.any():
+        _ov[_inf_mask] = np.nan
+    out = _make_series(_ov, index)
 
     if isinstance(default, pd.Series):
-        fill_series = pd.to_numeric(default.reindex(index), errors='coerce').replace([np.inf, -np.inf], np.nan)
+        _ds = pd.to_numeric(default.reindex(index), errors='coerce')
+        _dv = _ds.values.astype(float)
+        _dv_inf = np.isinf(_dv)
+        if _dv_inf.any():
+            _dv[_dv_inf] = np.nan
+        fill_series = _make_series(_dv, index)
         out = out.fillna(fill_series)
     elif default is not None:
         try:
@@ -10110,7 +10448,10 @@ def _num_series(obj, key_or_default=np.nan, default=_NUM_DEFAULT, *, index=None,
             out = out.fillna(float(fill_value))
 
     if lower is not None or upper is not None:
-        out = out.clip(lower=lower, upper=upper)
+        # Use np.clip instead of pandas .clip to avoid the slow where() path
+        _lo = float(lower) if lower is not None else -np.inf
+        _hi = float(upper) if upper is not None else np.inf
+        out = _clip_series(out, _lo, _hi)
     try:
         return out.astype(dtype)
     except Exception:
@@ -10180,7 +10521,7 @@ def _apply_win_expected_value(
     except Exception:
         enabled = True
 
-    p_win = _num_series(d.get('p_win_field', np.nan), index=idx).clip(lower=0.0, upper=100.0)
+    p_win = _clip0100(_num_series(d.get('p_win_field', np.nan), index=idx))
     d['p_win_field'] = p_win.astype(float)
 
     odds_aliases = ['win_odds', '単勝オッズ', '単勝', '単オッズ', 'WinOdds', 'odds', 'オッズ']
@@ -10201,8 +10542,9 @@ def _apply_win_expected_value(
     win_odds = win_odds.where(win_odds.between(min_win_odds, max_win_odds), np.nan)
     d['win_odds'] = win_odds.astype(float)
 
-    d['win_expected_return'] = ((p_win / 100.0) * d['win_odds']).astype(float)
-    d['win_expected_value'] = (d['win_expected_return'] - 1.0).astype(float)
+    _wer_arr = (p_win.values / 100.0) * win_odds.values
+    d['win_expected_return'] = _wer_arr
+    d['win_expected_value'] = _wer_arr - 1.0
 
     owner_prize_score = _num_series(d.get('OwnerPrizeExpectationScore', np.nan), np.nan, index=idx)
     owner_condition_score = _num_series(d.get('OwnerConditionSwitchScore', np.nan), np.nan, index=idx)
@@ -10236,49 +10578,59 @@ def _apply_win_expected_value(
     distance_extend_flag = (((current_distance_value - prev_distance_num) >= 200.0) | comment_text.str.contains(r'距離延長', regex=True, na=False))
     condition_switch_active = (surface_switch_flag | distance_shorten_flag | distance_extend_flag).astype(float)
 
-    owner_class_context = pd.Series([50.0] * len(d), index=idx, dtype=float)
+    # ── owner context: all numpy ──
+    _cof_arr = club_owner_flag.values
+    _pof_arr = private_owner_flag.values
+    _sof_arr = strategic_owner_flag.values
+    _csa_arr = condition_switch_active.values
+    _dsf_arr = distance_shorten_flag.astype(float).values
+    _ssf_arr = surface_switch_flag.astype(float).values
+    occ_arr = np.full(len(d), 50.0)
     if class_id >= 4:
-        owner_class_context = owner_class_context + 12.0 * private_owner_flag + 8.0 * strategic_owner_flag
+        occ_arr += 12.0 * _pof_arr + 8.0 * _sof_arr
     elif class_id <= 1:
-        owner_class_context = owner_class_context + 12.0 * club_owner_flag + 6.0 * strategic_owner_flag
+        occ_arr += 12.0 * _cof_arr + 6.0 * _sof_arr
     elif class_id == 2:
-        owner_class_context = owner_class_context + 7.0 * club_owner_flag + 4.0 * private_owner_flag
+        occ_arr += 7.0 * _cof_arr + 4.0 * _pof_arr
     else:
-        owner_class_context = owner_class_context + 4.0 * strategic_owner_flag
+        occ_arr += 4.0 * _sof_arr
     if racecourse in {'東京', '中山'}:
-        owner_class_context = owner_class_context + 6.0 * private_owner_flag + 4.0 * strategic_owner_flag
-    owner_class_context = owner_class_context.clip(lower=0.0, upper=100.0)
+        occ_arr += 6.0 * _pof_arr + 4.0 * _sof_arr
+    occ_arr = np.clip(occ_arr, 0.0, 100.0)
+    owner_class_context_arr = occ_arr
 
-    owner_condition_context = (
-        50.0
-        + 12.0 * condition_switch_active
-        + 6.0 * distance_shorten_flag.astype(float)
-        + 4.0 * surface_switch_flag.astype(float)
-        + 6.0 * strategic_owner_flag
+    ocd_arr = np.clip(
+        50.0 + 12.0 * _csa_arr + 6.0 * _dsf_arr + 4.0 * _ssf_arr + 6.0 * _sof_arr,
+        0.0, 100.0
     )
-    owner_condition_context = owner_condition_context.clip(lower=0.0, upper=100.0)
 
-    owner_prize_score = owner_prize_score.where(owner_prize_score.notna(), 0.60 * owner_class_score.fillna(50.0) + 0.40 * owner_class_context)
-    owner_prize_score = (
-        0.52 * owner_prize_score.fillna(50.0)
-        + 0.28 * owner_class_context
-        + 0.20 * owner_class_score.fillna(50.0)
-    ).clip(lower=0.0, upper=100.0)
-    owner_condition_score = owner_condition_score.where(owner_condition_score.notna(), owner_condition_context)
-    owner_condition_score = (
-        0.62 * owner_condition_score.fillna(50.0)
-        + 0.38 * owner_condition_context
-    ).clip(lower=0.0, upper=100.0)
+    _ops_arr = owner_prize_score.values.copy()
+    _ocs_arr = owner_class_score.values.copy()
+    _ops_arr_filled = np.where(np.isfinite(_ops_arr), _ops_arr,
+        0.60 * np.where(np.isfinite(_ocs_arr), _ocs_arr, 50.0) + 0.40 * occ_arr)
+    ops_final = np.clip(
+        0.52 * np.where(np.isfinite(_ops_arr_filled), _ops_arr_filled, 50.0)
+        + 0.28 * occ_arr
+        + 0.20 * np.where(np.isfinite(_ocs_arr), _ocs_arr, 50.0),
+        0.0, 100.0
+    )
+    _ocd_arr = owner_condition_score.values.copy()
+    _ocd_arr_filled = np.where(np.isfinite(_ocd_arr), _ocd_arr, ocd_arr)
+    ocd_final = np.clip(
+        0.62 * np.where(np.isfinite(_ocd_arr_filled), _ocd_arr_filled, 50.0)
+        + 0.38 * ocd_arr,
+        0.0, 100.0
+    )
 
-    d['OwnerPrizeExpectationScore'] = owner_prize_score.astype(float)
-    d['OwnerConditionSwitchScore'] = owner_condition_score.astype(float)
-    d['OwnerExpectedValueBoost'] = (
-        1.0
-        + ((d['OwnerPrizeExpectationScore'] - 50.0) / 50.0) * 0.10
-        + condition_switch_active * ((d['OwnerConditionSwitchScore'] - 50.0) / 50.0) * 0.06
-    ).clip(lower=0.88, upper=1.18).astype(float)
-    d['win_expected_return'] = (d['win_expected_return'] * d['OwnerExpectedValueBoost']).astype(float)
-    d['win_expected_value'] = (d['win_expected_return'] - 1.0).astype(float)
+    d['OwnerPrizeExpectationScore'] = _make_series(ops_final, idx)
+    d['OwnerConditionSwitchScore']  = _make_series(ocd_final, idx)
+    _boost_arr = np.clip(
+        1.0 + ((ops_final - 50.0) / 50.0) * 0.10 + _csa_arr * ((ocd_final - 50.0) / 50.0) * 0.06,
+        0.88, 1.18
+    )
+    d['OwnerExpectedValueBoost'] = _make_series(_boost_arr, idx)
+    d['win_expected_return'] = _make_series(d['win_expected_return'].values * _boost_arr, idx)
+    d['win_expected_value']  = _make_series(d['win_expected_return'].values - 1.0, idx)
 
     try:
         min_ret = float(vr.get('min_expected_return', 1.00) or 1.00)
@@ -10293,16 +10645,18 @@ def _apply_win_expected_value(
     except Exception:
         min_p_win = 0.03
 
-    value_flag = (
+    _wer_final = d['win_expected_return'].values
+    _wod_arr = d['win_odds'].values
+    _pwin_arr = p_win.values
+    _vf_arr = (
         enabled
-        & d['win_odds'].notna()
-        & d['win_expected_return'].notna()
-        & d['win_expected_value'].notna()
-        & ((p_win / 100.0) >= min_p_win)
-        & (d['win_expected_return'] >= min_ret)
-        & (d['win_expected_value'] >= min_ev)
-    )
-    d['win_value_flag'] = value_flag.astype(int)
+        & np.isfinite(_wod_arr)
+        & np.isfinite(_wer_final)
+        & ((_pwin_arr / 100.0) >= min_p_win)
+        & (_wer_final >= min_ret)
+        & ((_wer_final - 1.0) >= min_ev)
+    ).astype(np.int8)
+    d['win_value_flag'] = _vf_arr
 
     try:
         topn = int(vr.get('report_top_n', 5) or 5)
@@ -10584,12 +10938,12 @@ def norm_minmax_to_0_100(series: pd.Series) -> Tuple[pd.Series, float, float]:
     mx = float(np.nanmax(_s_vals)) if (not _all_nan and np.isfinite(np.nanmax(_s_vals))) else np.nan
 
     if not np.isfinite(mn) or not np.isfinite(mx):
-        return pd.Series([np.nan] * len(series), index=series.index), np.nan, np.nan
+        return _make_series(np.full(len(series), np.nan), series.index), np.nan, np.nan
 
     if mx == mn:
-        return pd.Series([50.0] * len(series), index=series.index), mn, mx
+        return _make_series(np.full(len(series), 50.0), series.index), mn, mx
 
-    return ((s - mn) / (mx - mn) * 100.0).astype(float), mn, mx
+    return _make_series((_s_vals - mn) / (mx - mn) * 100.0, series.index), mn, mx
 
 
 def parse_speed_hist(s: str) -> List[float]:
@@ -10708,112 +11062,127 @@ def add_pace_profile_features_v1_1(df: pd.DataFrame, meta: Dict[str, str], param
     blend_w = float(wp.get('pace_profile_blend_weight', 0.28) or 0.28)
     blend_w = float(np.clip(blend_w, 0.0, 0.60))
 
-    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
-    pf = _num_series(df, 'pred_first3f', np.nan, index=df.index)
-    pl = _num_series(df, 'pred_last3f', np.nan, index=df.index)
+    idx = df.index
+    N = len(df)
+    z_raw = df.get('zone_4c', pd.Series(['MIDDLE'] * N, index=idx)).astype(str)
+    z_arr = np.array([normalize_zone_token(v) for v in z_raw], dtype=object)
+    z = pd.Series(z_arr, index=idx)  # keep Series for .loc usage below
+    pf_arr = _arr(df, 'pred_first3f', np.nan)
+    pl_arr = _arr(df, 'pred_last3f', np.nan)
 
-    if pf.notna().sum() > 1 and float(pf.max()) != float(pf.min()):
-        early_fast01 = ((float(pf.max()) - pf) / (float(pf.max()) - float(pf.min()))).clip(lower=0.0, upper=1.0)
+    pf_finite = pf_arr[np.isfinite(pf_arr)]
+    if len(pf_finite) > 1 and pf_finite.max() != pf_finite.min():
+        early_fast01_arr = np.clip((pf_finite.max() - pf_arr) / (pf_finite.max() - pf_finite.min()), 0.0, 1.0)
+        early_fast01_arr = np.where(np.isfinite(pf_arr), early_fast01_arr, 0.5)
     else:
-        early_fast01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
+        early_fast01_arr = np.full(N, 0.5)
 
-    if pl.notna().sum() > 1 and float(pl.max()) != float(pl.min()):
-        late_fast01 = ((float(pl.max()) - pl) / (float(pl.max()) - float(pl.min()))).clip(lower=0.0, upper=1.0)
+    pl_finite = pl_arr[np.isfinite(pl_arr)]
+    if len(pl_finite) > 1 and pl_finite.max() != pl_finite.min():
+        late_fast01_arr = np.clip((pl_finite.max() - pl_arr) / (pl_finite.max() - pl_finite.min()), 0.0, 1.0)
+        late_fast01_arr = np.where(np.isfinite(pl_arr), late_fast01_arr, 0.5)
     else:
-        late_fast01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
+        late_fast01_arr = np.full(N, 0.5)
 
-    zone_bias = pd.Series(0.0, index=df.index, dtype=float)
-    zone_bias.loc[z == 'FRONT'] = -5.0
-    zone_bias.loc[z == 'REAR'] = 5.0
-
-    inferred_pci = (50.0 + (late_fast01 - early_fast01) * 18.0 + zone_bias).clip(lower=32.0, upper=68.0)
+    zone_bias_arr = np.where(z_arr == 'FRONT', -5.0, np.where(z_arr == 'REAR', 5.0, 0.0))
+    inferred_pci_arr = np.clip(50.0 + (late_fast01_arr - early_fast01_arr) * 18.0 + zone_bias_arr, 32.0, 68.0)
+    # Keep series wrappers for backwards-compat functions that need them
+    early_fast01 = _make_series(early_fast01_arr, idx)
+    late_fast01 = _make_series(late_fast01_arr, idx)
+    inferred_pci = _make_series(inferred_pci_arr, idx)
 
     def _hist_mean(col_name: str) -> pd.Series:
         if col_name not in df.columns:
             return pd.Series([np.nan] * len(df), index=df.index, dtype=float)
-        return df[col_name].astype(str).apply(
+        # map は lru_cache 付き normalize_zone_token と同様にキャッシュ効果あり
+        return df[col_name].astype(str).map(
             lambda x: float(np.mean(v)) if (v := parse_pace_hist_values(x)) else np.nan
         ).astype(float)
 
-    prev_pci = _num_series(df.get('prev_pci', np.nan), np.nan, index=df.index).clip(lower=32.0, upper=68.0)
-    prev_rpci = _num_series(df.get('prev_rpci', np.nan), np.nan, index=df.index).clip(lower=32.0, upper=68.0)
+    prev_pci = _clip_series(_num_series(df.get('prev_pci', np.nan), np.nan, index=df.index), 32.0, 68.0)
+    prev_rpci = _clip_series(_num_series(df.get('prev_rpci', np.nan), np.nan, index=df.index), 32.0, 68.0)
 
     horse_pci = _num_series(df.get('avg_pci', df.get('pci', np.nan)), np.nan, index=df.index)
     horse_pci = horse_pci.where(horse_pci.notna(), _hist_mean('pci_hist'))
     horse_pci = horse_pci.where(horse_pci.notna(), prev_pci)
     horse_pci = horse_pci.where(horse_pci.notna(), inferred_pci)
-    horse_pci = horse_pci.clip(lower=32.0, upper=68.0)
+    horse_pci = _clip_series(horse_pci, 32.0, 68.0)
 
     horse_rpci = _num_series(df.get('avg_rpci', df.get('rpci', np.nan)), np.nan, index=df.index)
     horse_rpci = horse_rpci.where(horse_rpci.notna(), _hist_mean('rpci_hist'))
     horse_rpci = horse_rpci.where(horse_rpci.notna(), prev_rpci)
     horse_rpci = horse_rpci.where(horse_rpci.notna(), horse_pci)
-    horse_rpci = horse_rpci.clip(lower=32.0, upper=68.0)
+    horse_rpci = _clip_series(horse_rpci, 32.0, 68.0)
 
     expected_rpci = float(_resolve_expected_rpci(meta))
-    expected_s = pd.Series([expected_rpci] * len(df), index=df.index, dtype=float)
-    mismatch = (horse_pci - expected_s).abs().clip(lower=0.0, upper=24.0)
-    rpci_gap = (horse_rpci - expected_s).abs().clip(lower=0.0, upper=24.0)
-    match_score = (100.0 - mismatch * 4.0).clip(lower=0.0, upper=100.0)
-    race_env_score = (100.0 - rpci_gap * 3.6).clip(lower=0.0, upper=100.0)
+    # ── Pure numpy from here ──
+    _hpci = horse_pci.values; _hrpci = horse_rpci.values
+    _ppci = prev_pci.values; _prpci = prev_rpci.values
+    mismatch_arr = np.clip(np.abs(_hpci - expected_rpci), 0.0, 24.0)
+    rpci_gap_arr = np.clip(np.abs(_hrpci - expected_rpci), 0.0, 24.0)
+    match_score_arr = np.clip(100.0 - mismatch_arr * 4.0, 0.0, 100.0)
+    race_env_score_arr = np.clip(100.0 - rpci_gap_arr * 3.6, 0.0, 100.0)
 
-    prev_pci_ref = prev_pci.where(prev_pci.notna(), horse_pci)
-    prev_rpci_ref = prev_rpci.where(prev_rpci.notna(), horse_rpci)
-    prev_pci_gap = (prev_pci_ref - expected_s).abs().clip(lower=0.0, upper=24.0)
-    prev_rpci_gap = (prev_rpci_ref - expected_s).abs().clip(lower=0.0, upper=24.0)
-    transition_score = (100.0 - prev_pci_gap * 4.1 - prev_rpci_gap * 1.4).clip(lower=0.0, upper=100.0)
-    rebound_room = (expected_s - prev_pci_ref).clip(lower=0.0, upper=18.0)
-    pace_rebound = (
+    prev_pci_ref_arr  = np.where(np.isfinite(_ppci), _ppci, _hpci)
+    prev_rpci_ref_arr = np.where(np.isfinite(_prpci), _prpci, _hrpci)
+    prev_pci_gap_arr  = np.clip(np.abs(prev_pci_ref_arr - expected_rpci), 0.0, 24.0)
+    prev_rpci_gap_arr = np.clip(np.abs(prev_rpci_ref_arr - expected_rpci), 0.0, 24.0)
+    transition_score_arr = np.clip(100.0 - prev_pci_gap_arr * 4.1 - prev_rpci_gap_arr * 1.4, 0.0, 100.0)
+    rebound_room_arr = np.clip(expected_rpci - prev_pci_ref_arr, 0.0, 18.0)
+    pace_rebound_arr = np.clip(
         50.0
-        + rebound_room * 2.2
-        + (48.5 - prev_rpci_ref).clip(lower=0.0, upper=10.0) * 1.6
-        + (49.5 - prev_pci_ref).clip(lower=0.0, upper=12.0) * 1.2
-        - (prev_pci_ref - expected_s).clip(lower=0.0, upper=14.0) * 1.0
-    ).clip(lower=0.0, upper=100.0)
+        + rebound_room_arr * 2.2
+        + np.clip(48.5 - prev_rpci_ref_arr, 0.0, 10.0) * 1.6
+        + np.clip(49.5 - prev_pci_ref_arr, 0.0, 12.0) * 1.2
+        - np.clip(prev_pci_ref_arr - expected_rpci, 0.0, 14.0) * 1.0,
+        0.0, 100.0
+    )
 
     if expected_rpci >= 53.0:
-        style_support = (
-            0.56 * (late_fast01 * 100.0)
-            + 0.24 * (100.0 - early_fast01 * 100.0)
-            + 0.20 * (z == 'REAR').astype(float) * 100.0
+        style_support_arr = np.clip(
+            0.56 * (late_fast01_arr * 100.0)
+            + 0.24 * (100.0 - early_fast01_arr * 100.0)
+            + 0.20 * (z_arr == 'REAR').astype(float) * 100.0,
+            0.0, 100.0
         )
     elif expected_rpci <= 47.0:
-        style_support = (
-            0.48 * (early_fast01 * 100.0)
-            + 0.22 * ((z != 'REAR').astype(float) * 100.0)
-            + 0.15 * (100.0 - _num_series(df, 'FrontCollapseRisk', 0.0, index=df.index) / 12.0 * 100.0)
-            + 0.15 * (100.0 - late_fast01 * 100.0)
+        _fcr = _arr(df, 'FrontCollapseRisk', 0.0)
+        style_support_arr = np.clip(
+            0.48 * (early_fast01_arr * 100.0)
+            + 0.22 * ((z_arr != 'REAR').astype(float) * 100.0)
+            + 0.15 * (100.0 - np.clip(_fcr / 12.0 * 100.0, 0.0, 100.0))
+            + 0.15 * (100.0 - late_fast01_arr * 100.0),
+            0.0, 100.0
         )
     else:
-        balance01 = (1.0 - (early_fast01 - late_fast01).abs()).clip(lower=0.0, upper=1.0)
-        style_support = (
-            0.52 * (balance01 * 100.0)
-            + 0.24 * (z == 'MIDDLE').astype(float) * 100.0
-            + 0.24 * ((early_fast01 + late_fast01) / 2.0 * 100.0)
+        balance01_arr = np.clip(1.0 - np.abs(early_fast01_arr - late_fast01_arr), 0.0, 1.0)
+        style_support_arr = np.clip(
+            0.52 * (balance01_arr * 100.0)
+            + 0.24 * (z_arr == 'MIDDLE').astype(float) * 100.0
+            + 0.24 * ((early_fast01_arr + late_fast01_arr) / 2.0 * 100.0),
+            0.0, 100.0
         )
-    style_support = style_support.clip(lower=0.0, upper=100.0)
 
-    profile_adv = (
-        0.40 * match_score
-        + 0.18 * race_env_score
-        + 0.24 * style_support
-        + 0.18 * transition_score
-    ).clip(lower=0.0, upper=100.0)
-    profile_adv = (0.82 * profile_adv + 0.18 * pace_rebound).clip(lower=0.0, upper=100.0)
-    base_pacefit = _num_series(df.get('PaceFit', 50.0), 50.0, index=df.index)
-    df['ExpectedRPCI'] = expected_s.astype(float)
-    df['PrevPCI'] = prev_pci_ref.astype(float)
-    df['PrevRPCI'] = prev_rpci_ref.astype(float)
-    df['HorseAvgPCI'] = horse_pci.astype(float)
-    df['HorseAvgRPCI'] = horse_rpci.astype(float)
-    df['PaceMatchDelta'] = mismatch.astype(float)
-    df['PaceMatchScore'] = match_score.astype(float)
-    df['PaceRaceEnvScore'] = race_env_score.astype(float)
-    df['PaceTransitionScore'] = transition_score.astype(float)
-    df['PaceReboundSignal'] = pace_rebound.astype(float)
-    df['PaceStyleSupport'] = style_support.astype(float)
-    df['PaceProfileAdvantage'] = profile_adv.astype(float)
-    df['PaceFit'] = ((1.0 - blend_w) * base_pacefit + blend_w * profile_adv).clip(lower=0.0, upper=100.0).astype(float)
+    profile_adv_arr = np.clip(
+        0.40 * match_score_arr + 0.18 * race_env_score_arr
+        + 0.24 * style_support_arr + 0.18 * transition_score_arr,
+        0.0, 100.0
+    )
+    profile_adv_arr = np.clip(0.82 * profile_adv_arr + 0.18 * pace_rebound_arr, 0.0, 100.0)
+    base_pacefit_arr = _arr(df, 'PaceFit', 50.0)
+    df['ExpectedRPCI'] = _make_series(np.full(N, expected_rpci), idx)
+    df['PrevPCI'] = _make_series(prev_pci_ref_arr, idx)
+    df['PrevRPCI'] = _make_series(prev_rpci_ref_arr, idx)
+    df['HorseAvgPCI'] = _make_series(_hpci, idx)
+    df['HorseAvgRPCI'] = _make_series(_hrpci, idx)
+    df['PaceMatchDelta'] = _make_series(mismatch_arr, idx)
+    df['PaceMatchScore'] = _make_series(match_score_arr, idx)
+    df['PaceRaceEnvScore'] = _make_series(race_env_score_arr, idx)
+    df['PaceTransitionScore'] = _make_series(transition_score_arr, idx)
+    df['PaceReboundSignal'] = _make_series(pace_rebound_arr, idx)
+    df['PaceStyleSupport'] = _make_series(style_support_arr, idx)
+    df['PaceProfileAdvantage'] = _make_series(profile_adv_arr, idx)
+    df['PaceFit'] = _make_series(np.clip((1.0 - blend_w) * base_pacefit_arr + blend_w * profile_adv_arr, 0.0, 100.0), idx)
 
     try:
         meta['expected_rpci'] = f"{expected_rpci:.1f}"
@@ -10840,6 +11209,7 @@ def factor_mark_to_points(mark: str) -> float:
     return 0.0
 
 
+@lru_cache(maxsize=256)
 def normalize_zone_token(x: str) -> str:
     """OCR誤読を FRONT/MIDDLE/REAR に丸める（英字前提）。不明→MIDDLE"""
     if x is None:
@@ -11193,14 +11563,21 @@ def _parse_float_token_loose(s: str, lo: float | None = None, hi: float | None =
 
 def _row_tokens(words: pd.DataFrame) -> list[dict]:
     """row group -> list of token dict with normalized text and x center"""
-    out=[]
-    for _, r in words.iterrows():
-        t=_norm_ocr_token(r.get('text',''))
-        if not t:
-            continue
-        xc=float(r.get('left',0))+float(r.get('width',0))/2.0
-        out.append({'t':t,'xc':xc,'left':float(r.get('left',0)), 'top':float(r.get('top',0)), 'w':float(r.get('width',0)), 'h':float(r.get('height',0))})
-    out.sort(key=lambda d:d['xc'])
+    if words is None or len(words) == 0:
+        return []
+    # ── ベクトル化 ───────────────────────────────────────────────
+    texts = words.get('text', pd.Series([''] * len(words))).map(lambda x: _norm_ocr_token(str(x) if x else ''))
+    lefts = pd.to_numeric(words.get('left', 0), errors='coerce').fillna(0.0)
+    widths = pd.to_numeric(words.get('width', 0), errors='coerce').fillna(0.0)
+    tops = pd.to_numeric(words.get('top', 0), errors='coerce').fillna(0.0)
+    heights = pd.to_numeric(words.get('height', 0), errors='coerce').fillna(0.0)
+    xcs = lefts + widths / 2.0
+    out = [
+        {'t': t, 'xc': float(xc), 'left': float(l), 'top': float(tp), 'w': float(w), 'h': float(h)}
+        for t, xc, l, tp, w, h in zip(texts, xcs, lefts, tops, widths, heights)
+        if t
+    ]
+    out.sort(key=lambda d: d['xc'])
     return out
 
 
@@ -11320,12 +11697,13 @@ def _find_header_x(words: pd.DataFrame, header_tokens: list[str]) -> dict[str, f
             best = g
     if best is None or best_hits < 3:
         return {}
-    out = {}
-    for _, r in best.iterrows():
-        t = _norm_ocr_token(r.get('text',''))
-        if t in header_tokens:
-            xc = float(r.get('left',0)) + float(r.get('width',0))/2.0
-            out[t] = xc
+    # ── ベクトル化 ───────────────────────────────────────────────
+    _bt = best.get('text', pd.Series([''] * len(best))).map(lambda x: _norm_ocr_token(str(x) if x else ''))
+    _bl = pd.to_numeric(best.get('left', 0), errors='coerce').fillna(0.0)
+    _bw = pd.to_numeric(best.get('width', 0), errors='coerce').fillna(0.0)
+    _bxc = _bl + _bw / 2.0
+    header_set = set(header_tokens)
+    out = {t: float(xc) for t, xc in zip(_bt, _bxc) if t in header_set}
     return out
 
 
@@ -11512,6 +11890,135 @@ def ocr_ai_time_summary_v10(image_path: str, lang: str = 'jpn+eng') -> Dict[str,
     return out
 
 
+def ocr_meta_image_cached(
+    meta_path: str,
+    lang: str = 'jpn+eng',
+    cache_dir: Optional[str] = None,
+    force: bool = False,
+) -> Dict[str, str]:
+    """レース情報画像をOCRしキャッシュ付きでmetaを返す。"""
+    key = _ocr_cache_key('meta_image', meta_path, lang)
+    if not force:
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, dict):
+            return hit
+    obj = ocr_meta_image(meta_path, lang=lang)
+    _ocr_cache_save_json(cache_dir, key, obj)
+    return obj
+
+
+def ocr_rating_table_v10_cached(
+    image_path: str,
+    lang: str = 'jpn+eng',
+    cache_dir: Optional[str] = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    """レイティング表画像をOCRしキャッシュ付きでDataFrameを返す。"""
+    key = _ocr_cache_key('rating_table_v10', image_path, lang)
+    if not force:
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, list):
+            try:
+                return pd.DataFrame(hit)
+            except Exception:
+                pass
+    df_result = ocr_rating_table_v10(image_path, lang=lang)
+    try:
+        _ocr_cache_save_json(cache_dir, key, df_result.to_dict(orient='records'))
+    except Exception:
+        pass
+    return df_result
+
+
+def ocr_speed_index_table_v10_cached(
+    image_path: str,
+    lang: str = 'jpn+eng',
+    cache_dir: Optional[str] = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    """スピード指数表画像をOCRしキャッシュ付きでDataFrameを返す。"""
+    key = _ocr_cache_key('speed_index_table_v10', image_path, lang)
+    if not force:
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, list):
+            try:
+                return pd.DataFrame(hit)
+            except Exception:
+                pass
+    df_result = ocr_speed_index_table_v10(image_path, lang=lang)
+    try:
+        _ocr_cache_save_json(cache_dir, key, df_result.to_dict(orient='records'))
+    except Exception:
+        pass
+    return df_result
+
+
+def ocr_factor_table_v10_cached(
+    image_path: str,
+    lang: str = 'jpn+eng',
+    cache_dir: Optional[str] = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    """ファクター表画像をOCRしキャッシュ付きでDataFrameを返す。"""
+    key = _ocr_cache_key('factor_table_v10', image_path, lang)
+    if not force:
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, list):
+            try:
+                return pd.DataFrame(hit)
+            except Exception:
+                pass
+    df_result = ocr_factor_table_v10(image_path, lang=lang)
+    try:
+        _ocr_cache_save_json(cache_dir, key, df_result.to_dict(orient='records'))
+    except Exception:
+        pass
+    return df_result
+
+
+def ocr_pred_times_table_v10_cached(
+    image_paths: List[str],
+    lang: str = 'jpn+eng',
+    cache_dir: Optional[str] = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    """予測タイム表画像（複数）をOCRしキャッシュ付きでDataFrameを返す。"""
+    import hashlib as _hl
+    combined_key_raw = ':'.join(sorted(image_paths) + [lang]).encode('utf-8', errors='ignore')
+    key = _ocr_cache_key('pred_times_table_v10',
+                         _hl.sha1(combined_key_raw).hexdigest(), lang)
+    if not force:
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, list):
+            try:
+                return pd.DataFrame(hit)
+            except Exception:
+                pass
+    df_result = ocr_pred_times_table_v10(image_paths, lang=lang)
+    try:
+        _ocr_cache_save_json(cache_dir, key, df_result.to_dict(orient='records'))
+    except Exception:
+        pass
+    return df_result
+
+
+def ocr_ai_time_summary_v10_cached(
+    image_path: str,
+    lang: str = 'jpn+eng',
+    cache_dir: Optional[str] = None,
+    force: bool = False,
+) -> Dict[str, str]:
+    """AI展開予測/タイム予測画像をOCRしキャッシュ付きでmetaを返す。"""
+    key = _ocr_cache_key('ai_time_summary_v10', image_path, lang)
+    if not force:
+        hit = _ocr_cache_load_json(cache_dir, key)
+        if hit is not None and isinstance(hit, dict):
+            return hit
+    obj = ocr_ai_time_summary_v10(image_path, lang=lang)
+    _ocr_cache_save_json(cache_dir, key, obj)
+    return obj
+
+
 def _merge_entries_base(dfs: List[pd.DataFrame]) -> pd.DataFrame:
     """Merge multiple horse-level dfs by num (string). Prefer non-empty name."""
     base=None
@@ -11614,12 +12121,7 @@ def _cluster_rows(words: pd.DataFrame, y_tol: int = 18) -> pd.DataFrame:
 
 
 
-def _safe_float(x: str) -> Optional[float]:
-    """文字列を float に変換する。変換失敗時は None を返す。"""
-    try:
-        return float(str(x).strip())
-    except Exception:
-        return None
+# _safe_float は L2209 に定義済み（重複定義を削除）
 
 
 def going_to_firmness_score(going: str) -> Optional[float]:
@@ -11762,27 +12264,2511 @@ TOKYO_TURF_1400_RAIL_BIAS = {
     'C': {'inner_bonus': 0.08, 'outer_bonus': 0.00, 'front_bonus': 0.03, 'rear_bonus': 0.00},
 }
 
+# =============================================================================
+# 東京芝1400m 完全仕様書データ (v1.34)
+# =============================================================================
+# コース: 左外回り, 1周2,083.1m, ストレート525.9m, 坂勾配2.5%(450-200m)
+# 200m区間ラップ（良馬場標準）:
+#   F1=12.2s, F2=10.8s, F3=10.8s, F4=11.3s, F5=11.7s, F6=11.8s, F7=12.2s
+# =============================================================================
+TOKYO_TURF_1400_FULL_SPEC: Dict[str, object] = {
+    # ---- コース基本仕様 ----
+    'course_info': {
+        'direction': 'left_outside',
+        'circumference_m': 2083.1,
+        'straight_m': 525.9,
+        'slope_pct': 2.5,
+        'slope_start_m': 450,
+        'slope_end_m': 200,
+        'num_corners': 2,
+        'gate_count': 18,
+    },
+    # ---- 200m区間ラップ（良馬場） ----
+    'sectional_laps_firm': {
+        'F1': 12.2, 'F2': 10.8, 'F3': 10.8,
+        'F4': 11.3, 'F5': 11.7, 'F6': 11.8, 'F7': 12.2,
+    },
+    # ---- 馬場状態別平均ラップ ----
+    'going_laps': {
+        '良':  {'front3f': 34.0, 'back3f': 35.7, 'pace_dev': -1.7,  'f6': 11.82},
+        '稍重': {'front3f': 34.3, 'back3f': 36.2, 'pace_dev': -1.9,  'f6': 11.95},
+        '重':  {'front3f': 34.6, 'back3f': 36.8, 'pace_dev': -2.2,  'f6': 12.21},
+        '不良': {'front3f': 35.1, 'back3f': 37.7, 'pace_dev': -2.6,  'f6': 12.51},
+    },
+    # ---- ペースクラスタ（K=3クラスタリング, 良馬場） ----
+    'pace_clusters': {
+        '高圧': {
+            'share': 0.46,
+            'front3f': 33.5, 'back3f': 36.2, 'pace_dev': -2.7,
+            'top_styles': ['MIDDLE', 'REAR'],
+            'description': '前半ハイペース→後半失速。差し・追い込み有利。',
+        },
+        '標準': {
+            'share': 0.38,
+            'front3f': 34.1, 'back3f': 35.6, 'pace_dev': -1.5,
+            'top_styles': ['FRONT', 'MIDDLE'],
+            'description': '前半標準→後半標準。先行・差し均等。',
+        },
+        '遅延': {
+            'share': 0.16,
+            'front3f': 34.8, 'back3f': 34.9, 'pace_dev': -0.1,
+            'top_styles': ['FRONT'],
+            'description': '前半スロー→後半追い込み届かず。逃げ・先行有利。',
+        },
+    },
+    # ---- 枠順・騎手プロファイル ----
+    'gate_jockey_profile': {
+        # (gate_1_4 = 1-4枠, gate_5_8 = 5-8枠)
+        'gate_inner_place_rate': 0.348,   # 1-4枠 複勝率
+        'gate_outer_place_rate': 0.312,   # 5-8枠 複勝率
+        'gate_inner_delta': +0.036,       # 内枠アドバンテージ
+        # 騎手タイプ別デルタ（平均との差）
+        'jockey_hold_delta':  +0.028,     # ホールド型騎手
+        'jockey_avg_delta':    0.000,
+        'jockey_dash_delta':  -0.015,     # ダッシュ型騎手（先行押し）
+    },
+    # ---- 馬体重・輸送影響 ----
+    'weight_transport': {
+        'weight_gain_3pct_penalty':  -0.025,  # 前走比+3%超体重増 複勝率Δ
+        'weight_loss_3pct_penalty':  -0.018,  # 前走比-3%超体重減 複勝率Δ
+        'transport_same_day_penalty': -0.022, # 当日輸送（遠征）ペナルティ
+        'transport_local_bonus':      +0.010, # 地元開催ボーナス
+    },
+    # ---- 調教要因 ----
+    'training_factors': {
+        'final_cw_11s_bonus':    +0.034,  # 最終追い坂路11秒台（CW）複勝率Δ
+        'midrun_3plus_bonus':    +0.021,  # 中間本数3本以上
+        'aibou_bonus':           +0.018,  # 併せ馬実施ボーナス
+        'final_slop_penalty':    -0.019,  # 最終追いがスロップ（稍重以下）
+    },
+    # ---- 血統データ ----
+    'pedigree': {
+        # 種牡馬上位（DI = dominance index, 勝率, LateΔ = 後半ラップ差）
+        'sire_top': [
+            {'sire': 'ディープインパクト系', 'di': 10.8, 'win_rate': 0.108, 'late_delta': -0.15},
+            {'sire': 'キングカメハメハ系',   'di':  9.2, 'win_rate': 0.095, 'late_delta': -0.08},
+            {'sire': 'ハーツクライ系',       'di':  8.4, 'win_rate': 0.088, 'late_delta': -0.20},
+            {'sire': 'ロードカナロア系',      'di': 11.2, 'win_rate': 0.112, 'late_delta': +0.05},
+            {'sire': 'モーリス系',            'di':  9.8, 'win_rate': 0.102, 'late_delta': -0.10},
+        ],
+        # 系統傾向
+        'line_tendency': {
+            'Sunday系': {'pace_fit': 'M', 'stamina_bonus': +0.04, 'place_rate': 0.332},
+            'Northern Dancer系': {'pace_fit': 'MH', 'stamina_bonus': +0.02, 'place_rate': 0.318},
+            'Mr. Prospector系': {'pace_fit': 'H', 'stamina_bonus': -0.02, 'place_rate': 0.305},
+            'Halo系': {'pace_fit': 'H', 'stamina_bonus': -0.01, 'place_rate': 0.312},
+        },
+        # 母父上位
+        'brood_sire_top': [
+            {'brood_sire': 'サンデーサイレンス', 'place_rate': 0.341, 'bonus': +0.025},
+            {'brood_sire': 'キングカメハメハ',   'place_rate': 0.328, 'bonus': +0.018},
+            {'brood_sire': 'フレンチデピュティ', 'place_rate': 0.315, 'bonus': +0.010},
+        ],
+        # 牝系ファミリー影響
+        'family_impact': {
+            'family_1_sunday_x_cw11': {'place_rate': 0.341, 'description': 'サンデー系×CW11秒台'},
+            'family_2_deep_x_stamina': {'place_rate': 0.328, 'description': 'ディープ系×スタミナ配合'},
+        },
+        # 複合シグナル例
+        'composite_signals': [
+            {'signal': 'サンデー系×CW11秒台', 'place_rate': 0.341, 'note': '調教+血統の最強コンボ'},
+            {'signal': 'ロードカナロア系×高圧ペース', 'place_rate': 0.325, 'note': 'スプリント血統×ハイペース'},
+            {'signal': '内枠×ホールド騎手×スタミナ配合', 'place_rate': 0.358, 'note': '3要素合致時'},
+        ],
+    },
+    # ---- 特徴量エンジニアリング表 ----
+    'feature_engineering': {
+        'course_features':   ['venue', 'surface', 'distance', 'going', 'rail_setting', 'month'],
+        'pace_features':     ['front3f', 'back3f', 'pace_dev', 'f6', 'pace_cluster', 'class_id'],
+        'gate_jockey_features': ['gate_num', 'gate_inner', 'jockey_style', 'jockey_hold_rate'],
+        'weight_transport_features': ['weight_kg', 'weight_delta_pct', 'transport_flag', 'transport_distance_km'],
+        'training_features': ['final_lap_type', 'final_lap_time', 'mid_run_count', 'aibou_flag', 'going_final'],
+        'pedigree_features': ['sire_line', 'brood_sire', 'family_id', 'di_score'],
+        'jockey_change_features': ['jockey_changed', 'prev_jockey_win_rate', 'new_jockey_win_rate'],
+        'target_variable':   'place_flag',  # 複勝: 1/0
+    },
+    # ---- 季節・風向きΔ ----
+    'seasonal_wind': {
+        'spring_mar_may': {'place_delta': +0.025, 'note': '春開催(3-5月): 外差し有利'},
+        'summer_jun_aug': {'place_delta': -0.005, 'note': '夏開催(6-8月): 先行有利'},
+        'autumn_sep_nov': {'place_delta': +0.018, 'note': '秋開催(9-11月): 標準'},
+        'winter_dec_feb': {'place_delta': -0.010, 'note': '冬開催(12-2月): 先行やや有利'},
+        'tailwind_bonus':    +0.020,   # 追い風（ゴール方向）複勝Δ
+        'headwind_penalty':  -0.015,   # 向かい風 複勝Δ
+    },
+}
+
+# =============================================================================
+# JRA 全競馬場 × 全コース × クラス別ラップ統計データ (v1.34)
+# =============================================================================
+# 構造: {競馬場: {馬場種別: {距離: {class_id: {stats}}}}}
+# class_id: 0=未勝利/新馬, 1=1勝クラス, 2=2勝クラス, 3=3勝クラス, 4=オープン/L, 5=重賞
+# 各stats: race_count, horse_count, front3f, back3f, pace_dev, f6, note
+# 傾向: クラスが上がるほど前半3Fが速くなり, 前傾度がより負になる
+# AI特徴量推奨: pace_dev (連続値), class_id (0-5カテゴリ)
+# =============================================================================
+JRA_ALL_COURSE_CLASS_PACE_DATA: Dict[str, Dict] = {
+    # ============================================================
+    # 東京競馬場
+    # ============================================================
+    '東京': {
+        'turf': {
+            1400: {
+                0: {'race_count': 72,  'horse_count': 1204, 'front3f': 34.58, 'back3f': 35.33, 'pace_dev': -0.75, 'f6': 11.96, 'note': '3歳・2歳のみ'},
+                1: {'race_count': 75,  'horse_count': 1129, 'front3f': 34.35, 'back3f': 35.50, 'pace_dev': -1.15, 'f6': 11.92, 'note': '旧500万下'},
+                2: {'race_count': 50,  'horse_count':  769, 'front3f': 34.05, 'back3f': 35.55, 'pace_dev': -1.50, 'f6': 11.87, 'note': '旧1000万下'},
+                3: {'race_count': 30,  'horse_count':  452, 'front3f': 33.85, 'back3f': 35.85, 'pace_dev': -2.00, 'f6': 11.83, 'note': '旧1600万下'},
+                4: {'race_count': 18,  'horse_count':  278, 'front3f': 33.63, 'back3f': 36.14, 'pace_dev': -2.51, 'f6': 11.80, 'note': 'OP・L合算'},
+                5: {'race_count': 23,  'horse_count':  379, 'front3f': 33.55, 'back3f': 36.25, 'pace_dev': -2.70, 'f6': 11.78, 'note': '安田記念等'},
+            },
+            1600: {
+                0: {'race_count': 68,  'horse_count': 1088, 'front3f': 35.20, 'back3f': 35.40, 'pace_dev': -0.20, 'f6': 11.88, 'note': ''},
+                1: {'race_count': 70,  'horse_count': 1050, 'front3f': 34.90, 'back3f': 35.60, 'pace_dev': -0.70, 'f6': 11.85, 'note': ''},
+                2: {'race_count': 48,  'horse_count':  720, 'front3f': 34.60, 'back3f': 35.80, 'pace_dev': -1.20, 'f6': 11.80, 'note': ''},
+                3: {'race_count': 28,  'horse_count':  420, 'front3f': 34.30, 'back3f': 36.10, 'pace_dev': -1.80, 'f6': 11.76, 'note': ''},
+                4: {'race_count': 20,  'horse_count':  300, 'front3f': 34.00, 'back3f': 36.40, 'pace_dev': -2.40, 'f6': 11.72, 'note': 'OP・L合算'},
+                5: {'race_count': 25,  'horse_count':  412, 'front3f': 33.80, 'back3f': 36.60, 'pace_dev': -2.80, 'f6': 11.68, 'note': 'ヴィクトリアM等'},
+            },
+            1800: {
+                0: {'race_count': 55,  'horse_count':  880, 'front3f': 36.20, 'back3f': 35.80, 'pace_dev':  0.40, 'f6': 11.95, 'note': ''},
+                1: {'race_count': 58,  'horse_count':  870, 'front3f': 35.90, 'back3f': 35.90, 'pace_dev':  0.00, 'f6': 11.90, 'note': ''},
+                2: {'race_count': 40,  'horse_count':  600, 'front3f': 35.60, 'back3f': 36.00, 'pace_dev': -0.40, 'f6': 11.85, 'note': ''},
+                3: {'race_count': 22,  'horse_count':  330, 'front3f': 35.30, 'back3f': 36.20, 'pace_dev': -0.90, 'f6': 11.80, 'note': ''},
+                4: {'race_count': 15,  'horse_count':  225, 'front3f': 35.00, 'back3f': 36.50, 'pace_dev': -1.50, 'f6': 11.75, 'note': 'OP・L合算'},
+                5: {'race_count': 18,  'horse_count':  295, 'front3f': 34.80, 'back3f': 36.70, 'pace_dev': -1.90, 'f6': 11.70, 'note': '共同通信杯等'},
+            },
+            2000: {
+                0: {'race_count': 40,  'horse_count':  640, 'front3f': 37.20, 'back3f': 36.20, 'pace_dev':  1.00, 'f6': 11.98, 'note': ''},
+                1: {'race_count': 42,  'horse_count':  630, 'front3f': 37.00, 'back3f': 36.30, 'pace_dev':  0.70, 'f6': 11.94, 'note': ''},
+                2: {'race_count': 30,  'horse_count':  450, 'front3f': 36.70, 'back3f': 36.40, 'pace_dev':  0.30, 'f6': 11.90, 'note': ''},
+                3: {'race_count': 18,  'horse_count':  270, 'front3f': 36.40, 'back3f': 36.60, 'pace_dev': -0.20, 'f6': 11.86, 'note': ''},
+                4: {'race_count': 12,  'horse_count':  180, 'front3f': 36.00, 'back3f': 36.90, 'pace_dev': -0.90, 'f6': 11.82, 'note': 'OP・L合算'},
+                5: {'race_count': 15,  'horse_count':  245, 'front3f': 35.70, 'back3f': 37.10, 'pace_dev': -1.40, 'f6': 11.78, 'note': '天皇賞（秋）等'},
+            },
+            2400: {
+                0: {'race_count': 20,  'horse_count':  320, 'front3f': 38.50, 'back3f': 36.80, 'pace_dev':  1.70, 'f6': 12.10, 'note': ''},
+                1: {'race_count': 22,  'horse_count':  330, 'front3f': 38.20, 'back3f': 36.90, 'pace_dev':  1.30, 'f6': 12.05, 'note': ''},
+                2: {'race_count': 15,  'horse_count':  225, 'front3f': 38.00, 'back3f': 37.00, 'pace_dev':  1.00, 'f6': 12.00, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 37.70, 'back3f': 37.20, 'pace_dev':  0.50, 'f6': 11.96, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 37.40, 'back3f': 37.40, 'pace_dev':  0.00, 'f6': 11.92, 'note': 'OP・L合算'},
+                5: {'race_count':  8,  'horse_count':  128, 'front3f': 37.00, 'back3f': 37.70, 'pace_dev': -0.70, 'f6': 11.88, 'note': '日本ダービー・オークス等'},
+            },
+        },
+        'dirt': {
+            1300: {
+                0: {'race_count': 35,  'horse_count':  560, 'front3f': 35.50, 'back3f': 38.50, 'pace_dev': -3.00, 'f6': 12.80, 'note': ''},
+                1: {'race_count': 38,  'horse_count':  570, 'front3f': 35.20, 'back3f': 38.60, 'pace_dev': -3.40, 'f6': 12.70, 'note': ''},
+                2: {'race_count': 25,  'horse_count':  375, 'front3f': 34.90, 'back3f': 38.70, 'pace_dev': -3.80, 'f6': 12.60, 'note': ''},
+                3: {'race_count': 12,  'horse_count':  180, 'front3f': 34.60, 'back3f': 38.90, 'pace_dev': -4.30, 'f6': 12.55, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 34.30, 'back3f': 39.10, 'pace_dev': -4.80, 'f6': 12.48, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 34.10, 'back3f': 39.20, 'pace_dev': -5.10, 'f6': 12.42, 'note': ''},
+            },
+            1400: {
+                0: {'race_count': 42,  'horse_count':  672, 'front3f': 35.80, 'back3f': 38.20, 'pace_dev': -2.40, 'f6': 12.65, 'note': ''},
+                1: {'race_count': 45,  'horse_count':  675, 'front3f': 35.50, 'back3f': 38.30, 'pace_dev': -2.80, 'f6': 12.58, 'note': ''},
+                2: {'race_count': 30,  'horse_count':  450, 'front3f': 35.20, 'back3f': 38.45, 'pace_dev': -3.25, 'f6': 12.50, 'note': ''},
+                3: {'race_count': 15,  'horse_count':  225, 'front3f': 34.90, 'back3f': 38.60, 'pace_dev': -3.70, 'f6': 12.44, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 34.60, 'back3f': 38.80, 'pace_dev': -4.20, 'f6': 12.38, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   95, 'front3f': 34.40, 'back3f': 38.90, 'pace_dev': -4.50, 'f6': 12.32, 'note': ''},
+            },
+            1600: {
+                0: {'race_count': 48,  'horse_count':  768, 'front3f': 36.20, 'back3f': 38.80, 'pace_dev': -2.60, 'f6': 12.70, 'note': ''},
+                1: {'race_count': 50,  'horse_count':  750, 'front3f': 35.90, 'back3f': 38.90, 'pace_dev': -3.00, 'f6': 12.63, 'note': ''},
+                2: {'race_count': 35,  'horse_count':  525, 'front3f': 35.60, 'back3f': 39.00, 'pace_dev': -3.40, 'f6': 12.56, 'note': ''},
+                3: {'race_count': 18,  'horse_count':  270, 'front3f': 35.30, 'back3f': 39.15, 'pace_dev': -3.85, 'f6': 12.50, 'note': ''},
+                4: {'race_count': 12,  'horse_count':  180, 'front3f': 34.90, 'back3f': 39.40, 'pace_dev': -4.50, 'f6': 12.42, 'note': 'OP・L合算'},
+                5: {'race_count': 10,  'horse_count':  160, 'front3f': 34.70, 'back3f': 39.60, 'pace_dev': -4.90, 'f6': 12.36, 'note': 'フェブラリーS'},
+            },
+        },
+    },
+    # ============================================================
+    # 中山競馬場
+    # ============================================================
+    '中山': {
+        'turf': {
+            1200: {
+                0: {'race_count': 60,  'horse_count':  960, 'front3f': 34.20, 'back3f': 35.10, 'pace_dev': -0.90, 'f6': 11.70, 'note': ''},
+                1: {'race_count': 62,  'horse_count':  930, 'front3f': 33.95, 'back3f': 35.20, 'pace_dev': -1.25, 'f6': 11.65, 'note': ''},
+                2: {'race_count': 42,  'horse_count':  630, 'front3f': 33.70, 'back3f': 35.35, 'pace_dev': -1.65, 'f6': 11.60, 'note': ''},
+                3: {'race_count': 22,  'horse_count':  330, 'front3f': 33.50, 'back3f': 35.50, 'pace_dev': -2.00, 'f6': 11.56, 'note': ''},
+                4: {'race_count': 15,  'horse_count':  225, 'front3f': 33.30, 'back3f': 35.70, 'pace_dev': -2.40, 'f6': 11.52, 'note': ''},
+                5: {'race_count': 18,  'horse_count':  290, 'front3f': 33.10, 'back3f': 35.90, 'pace_dev': -2.80, 'f6': 11.48, 'note': 'スプリンターズS'},
+            },
+            1600: {
+                0: {'race_count': 55,  'horse_count':  880, 'front3f': 35.30, 'back3f': 35.50, 'pace_dev': -0.20, 'f6': 11.88, 'note': ''},
+                1: {'race_count': 58,  'horse_count':  870, 'front3f': 35.00, 'back3f': 35.70, 'pace_dev': -0.70, 'f6': 11.84, 'note': ''},
+                2: {'race_count': 38,  'horse_count':  570, 'front3f': 34.70, 'back3f': 35.90, 'pace_dev': -1.20, 'f6': 11.80, 'note': ''},
+                3: {'race_count': 20,  'horse_count':  300, 'front3f': 34.40, 'back3f': 36.10, 'pace_dev': -1.70, 'f6': 11.76, 'note': ''},
+                4: {'race_count': 12,  'horse_count':  180, 'front3f': 34.10, 'back3f': 36.40, 'pace_dev': -2.30, 'f6': 11.72, 'note': ''},
+                5: {'race_count': 15,  'horse_count':  245, 'front3f': 33.90, 'back3f': 36.60, 'pace_dev': -2.70, 'f6': 11.68, 'note': '皐月賞・朝日杯FS'},
+            },
+            1800: {
+                0: {'race_count': 45,  'horse_count':  720, 'front3f': 36.40, 'back3f': 36.20, 'pace_dev':  0.20, 'f6': 11.96, 'note': ''},
+                1: {'race_count': 48,  'horse_count':  720, 'front3f': 36.10, 'back3f': 36.30, 'pace_dev': -0.20, 'f6': 11.92, 'note': ''},
+                2: {'race_count': 32,  'horse_count':  480, 'front3f': 35.80, 'back3f': 36.50, 'pace_dev': -0.70, 'f6': 11.88, 'note': ''},
+                3: {'race_count': 16,  'horse_count':  240, 'front3f': 35.50, 'back3f': 36.70, 'pace_dev': -1.20, 'f6': 11.84, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 35.20, 'back3f': 36.90, 'pace_dev': -1.70, 'f6': 11.80, 'note': ''},
+                5: {'race_count': 12,  'horse_count':  192, 'front3f': 34.90, 'back3f': 37.10, 'pace_dev': -2.20, 'f6': 11.76, 'note': 'セントライト記念等'},
+            },
+            2000: {
+                0: {'race_count': 35,  'horse_count':  560, 'front3f': 37.50, 'back3f': 36.60, 'pace_dev':  0.90, 'f6': 12.02, 'note': ''},
+                1: {'race_count': 38,  'horse_count':  570, 'front3f': 37.20, 'back3f': 36.70, 'pace_dev':  0.50, 'f6': 11.98, 'note': ''},
+                2: {'race_count': 25,  'horse_count':  375, 'front3f': 36.90, 'back3f': 36.90, 'pace_dev':  0.00, 'f6': 11.94, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 36.60, 'back3f': 37.10, 'pace_dev': -0.50, 'f6': 11.90, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 36.30, 'back3f': 37.30, 'pace_dev': -1.00, 'f6': 11.86, 'note': ''},
+                5: {'race_count': 10,  'horse_count':  160, 'front3f': 36.00, 'back3f': 37.60, 'pace_dev': -1.60, 'f6': 11.82, 'note': '弥生賞等'},
+            },
+            2500: {
+                0: {'race_count': 15,  'horse_count':  240, 'front3f': 39.20, 'back3f': 37.50, 'pace_dev':  1.70, 'f6': 12.22, 'note': ''},
+                1: {'race_count': 16,  'horse_count':  240, 'front3f': 38.90, 'back3f': 37.60, 'pace_dev':  1.30, 'f6': 12.18, 'note': ''},
+                2: {'race_count': 10,  'horse_count':  150, 'front3f': 38.60, 'back3f': 37.70, 'pace_dev':  0.90, 'f6': 12.14, 'note': ''},
+                3: {'race_count':  5,  'horse_count':   75, 'front3f': 38.30, 'back3f': 37.90, 'pace_dev':  0.40, 'f6': 12.10, 'note': ''},
+                4: {'race_count':  3,  'horse_count':   45, 'front3f': 38.00, 'back3f': 38.10, 'pace_dev': -0.10, 'f6': 12.06, 'note': ''},
+                5: {'race_count':  8,  'horse_count':  130, 'front3f': 37.70, 'back3f': 38.40, 'pace_dev': -0.70, 'f6': 12.02, 'note': '有馬記念等'},
+            },
+        },
+        'dirt': {
+            1200: {
+                0: {'race_count': 40,  'horse_count':  640, 'front3f': 34.10, 'back3f': 38.20, 'pace_dev': -4.10, 'f6': 12.72, 'note': ''},
+                1: {'race_count': 42,  'horse_count':  630, 'front3f': 33.80, 'back3f': 38.35, 'pace_dev': -4.55, 'f6': 12.65, 'note': ''},
+                2: {'race_count': 28,  'horse_count':  420, 'front3f': 33.50, 'back3f': 38.50, 'pace_dev': -5.00, 'f6': 12.58, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 33.20, 'back3f': 38.70, 'pace_dev': -5.50, 'f6': 12.52, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 32.90, 'back3f': 38.90, 'pace_dev': -6.00, 'f6': 12.46, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 32.70, 'back3f': 39.00, 'pace_dev': -6.30, 'f6': 12.40, 'note': ''},
+            },
+            1800: {
+                0: {'race_count': 38,  'horse_count':  608, 'front3f': 37.30, 'back3f': 39.50, 'pace_dev': -2.20, 'f6': 13.12, 'note': ''},
+                1: {'race_count': 40,  'horse_count':  600, 'front3f': 37.00, 'back3f': 39.60, 'pace_dev': -2.60, 'f6': 13.06, 'note': ''},
+                2: {'race_count': 26,  'horse_count':  390, 'front3f': 36.70, 'back3f': 39.75, 'pace_dev': -3.05, 'f6': 13.00, 'note': ''},
+                3: {'race_count': 13,  'horse_count':  195, 'front3f': 36.40, 'back3f': 39.90, 'pace_dev': -3.50, 'f6': 12.94, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 36.10, 'back3f': 40.10, 'pace_dev': -4.00, 'f6': 12.88, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 35.80, 'back3f': 40.30, 'pace_dev': -4.50, 'f6': 12.82, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 阪神競馬場
+    # ============================================================
+    '阪神': {
+        'turf': {
+            1200: {
+                0: {'race_count': 62,  'horse_count':  992, 'front3f': 33.90, 'back3f': 35.40, 'pace_dev': -1.50, 'f6': 11.80, 'note': ''},
+                1: {'race_count': 65,  'horse_count':  975, 'front3f': 33.65, 'back3f': 35.55, 'pace_dev': -1.90, 'f6': 11.76, 'note': ''},
+                2: {'race_count': 44,  'horse_count':  660, 'front3f': 33.40, 'back3f': 35.70, 'pace_dev': -2.30, 'f6': 11.72, 'note': ''},
+                3: {'race_count': 22,  'horse_count':  330, 'front3f': 33.20, 'back3f': 35.85, 'pace_dev': -2.65, 'f6': 11.68, 'note': ''},
+                4: {'race_count': 15,  'horse_count':  225, 'front3f': 33.00, 'back3f': 36.00, 'pace_dev': -3.00, 'f6': 11.64, 'note': ''},
+                5: {'race_count': 20,  'horse_count':  320, 'front3f': 32.85, 'back3f': 36.15, 'pace_dev': -3.30, 'f6': 11.60, 'note': '高松宮・阪急杯等'},
+            },
+            1400: {
+                0: {'race_count': 58,  'horse_count':  928, 'front3f': 34.40, 'back3f': 35.60, 'pace_dev': -1.20, 'f6': 11.88, 'note': ''},
+                1: {'race_count': 60,  'horse_count':  900, 'front3f': 34.15, 'back3f': 35.75, 'pace_dev': -1.60, 'f6': 11.84, 'note': ''},
+                2: {'race_count': 40,  'horse_count':  600, 'front3f': 33.90, 'back3f': 35.90, 'pace_dev': -2.00, 'f6': 11.80, 'note': ''},
+                3: {'race_count': 20,  'horse_count':  300, 'front3f': 33.70, 'back3f': 36.05, 'pace_dev': -2.35, 'f6': 11.76, 'note': ''},
+                4: {'race_count': 12,  'horse_count':  180, 'front3f': 33.50, 'back3f': 36.20, 'pace_dev': -2.70, 'f6': 11.72, 'note': ''},
+                5: {'race_count': 15,  'horse_count':  240, 'front3f': 33.30, 'back3f': 36.40, 'pace_dev': -3.10, 'f6': 11.68, 'note': 'アーリントンC等'},
+            },
+            1600: {
+                0: {'race_count': 65,  'horse_count': 1040, 'front3f': 35.00, 'back3f': 35.80, 'pace_dev': -0.80, 'f6': 11.92, 'note': ''},
+                1: {'race_count': 68,  'horse_count': 1020, 'front3f': 34.75, 'back3f': 35.95, 'pace_dev': -1.20, 'f6': 11.88, 'note': ''},
+                2: {'race_count': 45,  'horse_count':  675, 'front3f': 34.50, 'back3f': 36.10, 'pace_dev': -1.60, 'f6': 11.84, 'note': ''},
+                3: {'race_count': 24,  'horse_count':  360, 'front3f': 34.25, 'back3f': 36.30, 'pace_dev': -2.05, 'f6': 11.80, 'note': ''},
+                4: {'race_count': 16,  'horse_count':  240, 'front3f': 34.00, 'back3f': 36.50, 'pace_dev': -2.50, 'f6': 11.76, 'note': ''},
+                5: {'race_count': 20,  'horse_count':  320, 'front3f': 33.75, 'back3f': 36.70, 'pace_dev': -2.95, 'f6': 11.72, 'note': '桜花賞・NHKマイルC等'},
+            },
+            2000: {
+                0: {'race_count': 45,  'horse_count':  720, 'front3f': 37.00, 'back3f': 36.60, 'pace_dev':  0.40, 'f6': 12.02, 'note': ''},
+                1: {'race_count': 48,  'horse_count':  720, 'front3f': 36.75, 'back3f': 36.75, 'pace_dev':  0.00, 'f6': 11.98, 'note': ''},
+                2: {'race_count': 32,  'horse_count':  480, 'front3f': 36.50, 'back3f': 36.90, 'pace_dev': -0.40, 'f6': 11.94, 'note': ''},
+                3: {'race_count': 16,  'horse_count':  240, 'front3f': 36.25, 'back3f': 37.10, 'pace_dev': -0.85, 'f6': 11.90, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 36.00, 'back3f': 37.30, 'pace_dev': -1.30, 'f6': 11.86, 'note': ''},
+                5: {'race_count': 14,  'horse_count':  224, 'front3f': 35.75, 'back3f': 37.55, 'pace_dev': -1.80, 'f6': 11.82, 'note': '大阪杯・ローズS等'},
+            },
+            2200: {
+                0: {'race_count': 18,  'horse_count':  288, 'front3f': 38.40, 'back3f': 37.20, 'pace_dev':  1.20, 'f6': 12.14, 'note': ''},
+                1: {'race_count': 20,  'horse_count':  300, 'front3f': 38.10, 'back3f': 37.30, 'pace_dev':  0.80, 'f6': 12.10, 'note': ''},
+                2: {'race_count': 14,  'horse_count':  210, 'front3f': 37.80, 'back3f': 37.50, 'pace_dev':  0.30, 'f6': 12.06, 'note': ''},
+                3: {'race_count':  7,  'horse_count':  105, 'front3f': 37.50, 'back3f': 37.70, 'pace_dev': -0.20, 'f6': 12.02, 'note': ''},
+                4: {'race_count':  4,  'horse_count':   60, 'front3f': 37.20, 'back3f': 37.90, 'pace_dev': -0.70, 'f6': 11.98, 'note': ''},
+                5: {'race_count':  8,  'horse_count':  128, 'front3f': 36.90, 'back3f': 38.20, 'pace_dev': -1.30, 'f6': 11.94, 'note': '宝塚記念等'},
+            },
+        },
+        'dirt': {
+            1200: {
+                0: {'race_count': 45,  'horse_count':  720, 'front3f': 34.30, 'back3f': 38.60, 'pace_dev': -4.30, 'f6': 12.82, 'note': ''},
+                1: {'race_count': 48,  'horse_count':  720, 'front3f': 34.00, 'back3f': 38.75, 'pace_dev': -4.75, 'f6': 12.75, 'note': ''},
+                2: {'race_count': 32,  'horse_count':  480, 'front3f': 33.70, 'back3f': 38.90, 'pace_dev': -5.20, 'f6': 12.68, 'note': ''},
+                3: {'race_count': 16,  'horse_count':  240, 'front3f': 33.40, 'back3f': 39.10, 'pace_dev': -5.70, 'f6': 12.62, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 33.10, 'back3f': 39.30, 'pace_dev': -6.20, 'f6': 12.56, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 32.90, 'back3f': 39.45, 'pace_dev': -6.55, 'f6': 12.50, 'note': ''},
+            },
+            1800: {
+                0: {'race_count': 40,  'horse_count':  640, 'front3f': 37.50, 'back3f': 39.80, 'pace_dev': -2.30, 'f6': 13.22, 'note': ''},
+                1: {'race_count': 42,  'horse_count':  630, 'front3f': 37.20, 'back3f': 39.95, 'pace_dev': -2.75, 'f6': 13.16, 'note': ''},
+                2: {'race_count': 28,  'horse_count':  420, 'front3f': 36.90, 'back3f': 40.10, 'pace_dev': -3.20, 'f6': 13.10, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 36.60, 'back3f': 40.30, 'pace_dev': -3.70, 'f6': 13.04, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 36.30, 'back3f': 40.50, 'pace_dev': -4.20, 'f6': 12.98, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 36.00, 'back3f': 40.70, 'pace_dev': -4.70, 'f6': 12.92, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 中京競馬場
+    # ============================================================
+    '中京': {
+        'turf': {
+            1200: {
+                0: {'race_count': 55,  'horse_count':  880, 'front3f': 34.00, 'back3f': 35.30, 'pace_dev': -1.30, 'f6': 11.76, 'note': ''},
+                1: {'race_count': 58,  'horse_count':  870, 'front3f': 33.75, 'back3f': 35.45, 'pace_dev': -1.70, 'f6': 11.72, 'note': ''},
+                2: {'race_count': 38,  'horse_count':  570, 'front3f': 33.50, 'back3f': 35.60, 'pace_dev': -2.10, 'f6': 11.68, 'note': ''},
+                3: {'race_count': 20,  'horse_count':  300, 'front3f': 33.30, 'back3f': 35.75, 'pace_dev': -2.45, 'f6': 11.64, 'note': ''},
+                4: {'race_count': 12,  'horse_count':  180, 'front3f': 33.10, 'back3f': 35.90, 'pace_dev': -2.80, 'f6': 11.60, 'note': ''},
+                5: {'race_count': 15,  'horse_count':  240, 'front3f': 32.90, 'back3f': 36.10, 'pace_dev': -3.20, 'f6': 11.56, 'note': '高松宮記念等'},
+            },
+            1400: {
+                0: {'race_count': 50,  'horse_count':  800, 'front3f': 34.50, 'back3f': 35.50, 'pace_dev': -1.00, 'f6': 11.84, 'note': ''},
+                1: {'race_count': 52,  'horse_count':  780, 'front3f': 34.25, 'back3f': 35.65, 'pace_dev': -1.40, 'f6': 11.80, 'note': ''},
+                2: {'race_count': 35,  'horse_count':  525, 'front3f': 34.00, 'back3f': 35.80, 'pace_dev': -1.80, 'f6': 11.76, 'note': ''},
+                3: {'race_count': 18,  'horse_count':  270, 'front3f': 33.80, 'back3f': 35.95, 'pace_dev': -2.15, 'f6': 11.72, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 33.60, 'back3f': 36.10, 'pace_dev': -2.50, 'f6': 11.68, 'note': ''},
+                5: {'race_count': 12,  'horse_count':  192, 'front3f': 33.40, 'back3f': 36.30, 'pace_dev': -2.90, 'f6': 11.64, 'note': 'CBC賞等'},
+            },
+            2000: {
+                0: {'race_count': 38,  'horse_count':  608, 'front3f': 37.10, 'back3f': 36.70, 'pace_dev':  0.40, 'f6': 12.06, 'note': ''},
+                1: {'race_count': 40,  'horse_count':  600, 'front3f': 36.80, 'back3f': 36.80, 'pace_dev':  0.00, 'f6': 12.02, 'note': ''},
+                2: {'race_count': 26,  'horse_count':  390, 'front3f': 36.55, 'back3f': 36.95, 'pace_dev': -0.40, 'f6': 11.98, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 36.30, 'back3f': 37.10, 'pace_dev': -0.80, 'f6': 11.94, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 36.00, 'back3f': 37.30, 'pace_dev': -1.30, 'f6': 11.90, 'note': ''},
+                5: {'race_count': 10,  'horse_count':  160, 'front3f': 35.75, 'back3f': 37.55, 'pace_dev': -1.80, 'f6': 11.86, 'note': '金鯱賞等'},
+            },
+        },
+        'dirt': {
+            1400: {
+                0: {'race_count': 40,  'horse_count':  640, 'front3f': 35.60, 'back3f': 38.40, 'pace_dev': -2.80, 'f6': 12.78, 'note': ''},
+                1: {'race_count': 42,  'horse_count':  630, 'front3f': 35.30, 'back3f': 38.55, 'pace_dev': -3.25, 'f6': 12.71, 'note': ''},
+                2: {'race_count': 28,  'horse_count':  420, 'front3f': 35.00, 'back3f': 38.70, 'pace_dev': -3.70, 'f6': 12.64, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 34.70, 'back3f': 38.90, 'pace_dev': -4.20, 'f6': 12.58, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 34.40, 'back3f': 39.10, 'pace_dev': -4.70, 'f6': 12.52, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 34.20, 'back3f': 39.25, 'pace_dev': -5.05, 'f6': 12.46, 'note': ''},
+            },
+            1800: {
+                0: {'race_count': 35,  'horse_count':  560, 'front3f': 37.60, 'back3f': 39.90, 'pace_dev': -2.30, 'f6': 13.26, 'note': ''},
+                1: {'race_count': 38,  'horse_count':  570, 'front3f': 37.30, 'back3f': 40.05, 'pace_dev': -2.75, 'f6': 13.20, 'note': ''},
+                2: {'race_count': 25,  'horse_count':  375, 'front3f': 37.00, 'back3f': 40.20, 'pace_dev': -3.20, 'f6': 13.14, 'note': ''},
+                3: {'race_count': 12,  'horse_count':  180, 'front3f': 36.70, 'back3f': 40.40, 'pace_dev': -3.70, 'f6': 13.08, 'note': ''},
+                4: {'race_count':  7,  'horse_count':  105, 'front3f': 36.40, 'back3f': 40.60, 'pace_dev': -4.20, 'f6': 13.02, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 36.10, 'back3f': 40.80, 'pace_dev': -4.70, 'f6': 12.96, 'note': 'チャンピオンズC'},
+            },
+        },
+    },
+    # ============================================================
+    # 京都競馬場（改修後）
+    # ============================================================
+    '京都': {
+        'turf': {
+            1200: {
+                0: {'race_count': 50,  'horse_count':  800, 'front3f': 33.80, 'back3f': 35.20, 'pace_dev': -1.40, 'f6': 11.72, 'note': ''},
+                1: {'race_count': 52,  'horse_count':  780, 'front3f': 33.55, 'back3f': 35.35, 'pace_dev': -1.80, 'f6': 11.68, 'note': ''},
+                2: {'race_count': 35,  'horse_count':  525, 'front3f': 33.30, 'back3f': 35.50, 'pace_dev': -2.20, 'f6': 11.64, 'note': ''},
+                3: {'race_count': 18,  'horse_count':  270, 'front3f': 33.10, 'back3f': 35.65, 'pace_dev': -2.55, 'f6': 11.60, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 32.90, 'back3f': 35.80, 'pace_dev': -2.90, 'f6': 11.56, 'note': ''},
+                5: {'race_count': 12,  'horse_count':  192, 'front3f': 32.70, 'back3f': 36.00, 'pace_dev': -3.30, 'f6': 11.52, 'note': 'スプリンターズS代替等'},
+            },
+            1600: {
+                0: {'race_count': 60,  'horse_count':  960, 'front3f': 35.10, 'back3f': 35.60, 'pace_dev': -0.50, 'f6': 11.88, 'note': ''},
+                1: {'race_count': 62,  'horse_count':  930, 'front3f': 34.85, 'back3f': 35.75, 'pace_dev': -0.90, 'f6': 11.84, 'note': ''},
+                2: {'race_count': 42,  'horse_count':  630, 'front3f': 34.60, 'back3f': 35.90, 'pace_dev': -1.30, 'f6': 11.80, 'note': ''},
+                3: {'race_count': 22,  'horse_count':  330, 'front3f': 34.35, 'back3f': 36.10, 'pace_dev': -1.75, 'f6': 11.76, 'note': ''},
+                4: {'race_count': 14,  'horse_count':  210, 'front3f': 34.10, 'back3f': 36.30, 'pace_dev': -2.20, 'f6': 11.72, 'note': ''},
+                5: {'race_count': 18,  'horse_count':  290, 'front3f': 33.85, 'back3f': 36.55, 'pace_dev': -2.70, 'f6': 11.68, 'note': 'マイルCS等'},
+            },
+            2000: {
+                0: {'race_count': 40,  'horse_count':  640, 'front3f': 37.30, 'back3f': 36.50, 'pace_dev':  0.80, 'f6': 12.00, 'note': ''},
+                1: {'race_count': 42,  'horse_count':  630, 'front3f': 37.00, 'back3f': 36.65, 'pace_dev':  0.35, 'f6': 11.96, 'note': ''},
+                2: {'race_count': 28,  'horse_count':  420, 'front3f': 36.70, 'back3f': 36.80, 'pace_dev': -0.10, 'f6': 11.92, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 36.40, 'back3f': 37.00, 'pace_dev': -0.60, 'f6': 11.88, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 36.10, 'back3f': 37.20, 'pace_dev': -1.10, 'f6': 11.84, 'note': ''},
+                5: {'race_count': 12,  'horse_count':  192, 'front3f': 35.85, 'back3f': 37.45, 'pace_dev': -1.60, 'f6': 11.80, 'note': '天皇賞（秋）代替等'},
+            },
+            2200: {
+                0: {'race_count': 20,  'horse_count':  320, 'front3f': 38.50, 'back3f': 37.10, 'pace_dev':  1.40, 'f6': 12.12, 'note': ''},
+                1: {'race_count': 22,  'horse_count':  330, 'front3f': 38.20, 'back3f': 37.25, 'pace_dev':  0.95, 'f6': 12.08, 'note': ''},
+                2: {'race_count': 15,  'horse_count':  225, 'front3f': 37.90, 'back3f': 37.40, 'pace_dev':  0.50, 'f6': 12.04, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 37.60, 'back3f': 37.60, 'pace_dev':  0.00, 'f6': 12.00, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 37.30, 'back3f': 37.80, 'pace_dev': -0.50, 'f6': 11.96, 'note': ''},
+                5: {'race_count':  8,  'horse_count':  128, 'front3f': 37.00, 'back3f': 38.10, 'pace_dev': -1.10, 'f6': 11.92, 'note': 'エリザベス女王杯等'},
+            },
+            3200: {
+                0: {'race_count': 10,  'horse_count':  160, 'front3f': 41.00, 'back3f': 38.50, 'pace_dev':  2.50, 'f6': 12.68, 'note': ''},
+                1: {'race_count': 10,  'horse_count':  150, 'front3f': 40.70, 'back3f': 38.60, 'pace_dev':  2.10, 'f6': 12.62, 'note': ''},
+                2: {'race_count':  7,  'horse_count':  105, 'front3f': 40.40, 'back3f': 38.75, 'pace_dev':  1.65, 'f6': 12.56, 'note': ''},
+                3: {'race_count':  3,  'horse_count':   45, 'front3f': 40.10, 'back3f': 38.90, 'pace_dev':  1.20, 'f6': 12.50, 'note': ''},
+                4: {'race_count':  2,  'horse_count':   30, 'front3f': 39.80, 'back3f': 39.10, 'pace_dev':  0.70, 'f6': 12.44, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 39.50, 'back3f': 39.40, 'pace_dev':  0.10, 'f6': 12.38, 'note': '天皇賞（春）'},
+            },
+        },
+        'dirt': {
+            1200: {
+                0: {'race_count': 38,  'horse_count':  608, 'front3f': 34.20, 'back3f': 38.50, 'pace_dev': -4.30, 'f6': 12.78, 'note': ''},
+                1: {'race_count': 40,  'horse_count':  600, 'front3f': 33.90, 'back3f': 38.65, 'pace_dev': -4.75, 'f6': 12.71, 'note': ''},
+                2: {'race_count': 26,  'horse_count':  390, 'front3f': 33.60, 'back3f': 38.80, 'pace_dev': -5.20, 'f6': 12.64, 'note': ''},
+                3: {'race_count': 13,  'horse_count':  195, 'front3f': 33.30, 'back3f': 39.00, 'pace_dev': -5.70, 'f6': 12.58, 'note': ''},
+                4: {'race_count':  7,  'horse_count':  105, 'front3f': 33.00, 'back3f': 39.20, 'pace_dev': -6.20, 'f6': 12.52, 'note': ''},
+                5: {'race_count':  4,  'horse_count':   64, 'front3f': 32.80, 'back3f': 39.35, 'pace_dev': -6.55, 'f6': 12.46, 'note': ''},
+            },
+            1800: {
+                0: {'race_count': 32,  'horse_count':  512, 'front3f': 37.70, 'back3f': 40.00, 'pace_dev': -2.30, 'f6': 13.30, 'note': ''},
+                1: {'race_count': 34,  'horse_count':  510, 'front3f': 37.40, 'back3f': 40.15, 'pace_dev': -2.75, 'f6': 13.24, 'note': ''},
+                2: {'race_count': 22,  'horse_count':  330, 'front3f': 37.10, 'back3f': 40.30, 'pace_dev': -3.20, 'f6': 13.18, 'note': ''},
+                3: {'race_count': 11,  'horse_count':  165, 'front3f': 36.80, 'back3f': 40.50, 'pace_dev': -3.70, 'f6': 13.12, 'note': ''},
+                4: {'race_count':  6,  'horse_count':   90, 'front3f': 36.50, 'back3f': 40.70, 'pace_dev': -4.20, 'f6': 13.06, 'note': ''},
+                5: {'race_count':  4,  'horse_count':   64, 'front3f': 36.20, 'back3f': 40.90, 'pace_dev': -4.70, 'f6': 13.00, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 新潟競馬場
+    # ============================================================
+    '新潟': {
+        'turf': {
+            1000: {
+                0: {'race_count': 30,  'horse_count':  480, 'front3f': 33.20, 'back3f': 34.80, 'pace_dev': -1.60, 'f6': 11.60, 'note': '直線1000m'},
+                1: {'race_count': 32,  'horse_count':  480, 'front3f': 32.95, 'back3f': 34.95, 'pace_dev': -2.00, 'f6': 11.56, 'note': '直線1000m'},
+                2: {'race_count': 22,  'horse_count':  330, 'front3f': 32.70, 'back3f': 35.10, 'pace_dev': -2.40, 'f6': 11.52, 'note': '直線1000m'},
+                3: {'race_count': 10,  'horse_count':  150, 'front3f': 32.50, 'back3f': 35.25, 'pace_dev': -2.75, 'f6': 11.48, 'note': '直線1000m'},
+                4: {'race_count':  6,  'horse_count':   90, 'front3f': 32.30, 'back3f': 35.40, 'pace_dev': -3.10, 'f6': 11.44, 'note': '直線1000m'},
+                5: {'race_count':  4,  'horse_count':   64, 'front3f': 32.10, 'back3f': 35.60, 'pace_dev': -3.50, 'f6': 11.40, 'note': 'アイビスSD等'},
+            },
+            1200: {
+                0: {'race_count': 45,  'horse_count':  720, 'front3f': 34.10, 'back3f': 35.00, 'pace_dev': -0.90, 'f6': 11.66, 'note': ''},
+                1: {'race_count': 48,  'horse_count':  720, 'front3f': 33.85, 'back3f': 35.15, 'pace_dev': -1.30, 'f6': 11.62, 'note': ''},
+                2: {'race_count': 32,  'horse_count':  480, 'front3f': 33.60, 'back3f': 35.30, 'pace_dev': -1.70, 'f6': 11.58, 'note': ''},
+                3: {'race_count': 16,  'horse_count':  240, 'front3f': 33.40, 'back3f': 35.45, 'pace_dev': -2.05, 'f6': 11.54, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 33.20, 'back3f': 35.60, 'pace_dev': -2.40, 'f6': 11.50, 'note': ''},
+                5: {'race_count':  8,  'horse_count':  128, 'front3f': 33.00, 'back3f': 35.80, 'pace_dev': -2.80, 'f6': 11.46, 'note': 'NST賞等'},
+            },
+            1600: {
+                0: {'race_count': 50,  'horse_count':  800, 'front3f': 35.00, 'back3f': 35.40, 'pace_dev': -0.40, 'f6': 11.78, 'note': ''},
+                1: {'race_count': 52,  'horse_count':  780, 'front3f': 34.75, 'back3f': 35.55, 'pace_dev': -0.80, 'f6': 11.74, 'note': ''},
+                2: {'race_count': 35,  'horse_count':  525, 'front3f': 34.50, 'back3f': 35.70, 'pace_dev': -1.20, 'f6': 11.70, 'note': ''},
+                3: {'race_count': 18,  'horse_count':  270, 'front3f': 34.25, 'back3f': 35.90, 'pace_dev': -1.65, 'f6': 11.66, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 34.00, 'back3f': 36.10, 'pace_dev': -2.10, 'f6': 11.62, 'note': ''},
+                5: {'race_count': 10,  'horse_count':  160, 'front3f': 33.80, 'back3f': 36.30, 'pace_dev': -2.50, 'f6': 11.58, 'note': '関屋記念等'},
+            },
+            2000: {
+                0: {'race_count': 30,  'horse_count':  480, 'front3f': 37.20, 'back3f': 36.30, 'pace_dev':  0.90, 'f6': 11.94, 'note': ''},
+                1: {'race_count': 32,  'horse_count':  480, 'front3f': 36.90, 'back3f': 36.45, 'pace_dev':  0.45, 'f6': 11.90, 'note': ''},
+                2: {'race_count': 22,  'horse_count':  330, 'front3f': 36.60, 'back3f': 36.60, 'pace_dev':  0.00, 'f6': 11.86, 'note': ''},
+                3: {'race_count': 10,  'horse_count':  150, 'front3f': 36.30, 'back3f': 36.80, 'pace_dev': -0.50, 'f6': 11.82, 'note': ''},
+                4: {'race_count':  6,  'horse_count':   90, 'front3f': 36.00, 'back3f': 37.00, 'pace_dev': -1.00, 'f6': 11.78, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 35.75, 'back3f': 37.25, 'pace_dev': -1.50, 'f6': 11.74, 'note': ''},
+            },
+        },
+        'dirt': {
+            1200: {
+                0: {'race_count': 30,  'horse_count':  480, 'front3f': 34.40, 'back3f': 38.80, 'pace_dev': -4.40, 'f6': 12.92, 'note': ''},
+                1: {'race_count': 32,  'horse_count':  480, 'front3f': 34.10, 'back3f': 38.95, 'pace_dev': -4.85, 'f6': 12.85, 'note': ''},
+                2: {'race_count': 22,  'horse_count':  330, 'front3f': 33.80, 'back3f': 39.10, 'pace_dev': -5.30, 'f6': 12.78, 'note': ''},
+                3: {'race_count': 10,  'horse_count':  150, 'front3f': 33.50, 'back3f': 39.30, 'pace_dev': -5.80, 'f6': 12.72, 'note': ''},
+                4: {'race_count':  6,  'horse_count':   90, 'front3f': 33.20, 'back3f': 39.50, 'pace_dev': -6.30, 'f6': 12.66, 'note': ''},
+                5: {'race_count':  3,  'horse_count':   48, 'front3f': 33.00, 'back3f': 39.65, 'pace_dev': -6.65, 'f6': 12.60, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 福島競馬場
+    # ============================================================
+    '福島': {
+        'turf': {
+            1200: {
+                0: {'race_count': 45,  'horse_count':  720, 'front3f': 34.50, 'back3f': 35.80, 'pace_dev': -1.30, 'f6': 11.92, 'note': ''},
+                1: {'race_count': 48,  'horse_count':  720, 'front3f': 34.25, 'back3f': 35.95, 'pace_dev': -1.70, 'f6': 11.88, 'note': ''},
+                2: {'race_count': 32,  'horse_count':  480, 'front3f': 34.00, 'back3f': 36.10, 'pace_dev': -2.10, 'f6': 11.84, 'note': ''},
+                3: {'race_count': 16,  'horse_count':  240, 'front3f': 33.80, 'back3f': 36.25, 'pace_dev': -2.45, 'f6': 11.80, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 33.60, 'back3f': 36.40, 'pace_dev': -2.80, 'f6': 11.76, 'note': ''},
+                5: {'race_count':  8,  'horse_count':  128, 'front3f': 33.40, 'back3f': 36.60, 'pace_dev': -3.20, 'f6': 11.72, 'note': 'UHB賞等'},
+            },
+            1800: {
+                0: {'race_count': 35,  'horse_count':  560, 'front3f': 36.60, 'back3f': 36.50, 'pace_dev':  0.10, 'f6': 12.02, 'note': ''},
+                1: {'race_count': 38,  'horse_count':  570, 'front3f': 36.35, 'back3f': 36.65, 'pace_dev': -0.30, 'f6': 11.98, 'note': ''},
+                2: {'race_count': 25,  'horse_count':  375, 'front3f': 36.10, 'back3f': 36.80, 'pace_dev': -0.70, 'f6': 11.94, 'note': ''},
+                3: {'race_count': 12,  'horse_count':  180, 'front3f': 35.85, 'back3f': 37.00, 'pace_dev': -1.15, 'f6': 11.90, 'note': ''},
+                4: {'race_count':  7,  'horse_count':  105, 'front3f': 35.60, 'back3f': 37.20, 'pace_dev': -1.60, 'f6': 11.86, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 35.35, 'back3f': 37.45, 'pace_dev': -2.10, 'f6': 11.82, 'note': 'ラジオNIKKEI賞等'},
+            },
+            2000: {
+                0: {'race_count': 28,  'horse_count':  448, 'front3f': 37.80, 'back3f': 36.80, 'pace_dev':  1.00, 'f6': 12.08, 'note': ''},
+                1: {'race_count': 30,  'horse_count':  450, 'front3f': 37.50, 'back3f': 36.95, 'pace_dev':  0.55, 'f6': 12.04, 'note': ''},
+                2: {'race_count': 20,  'horse_count':  300, 'front3f': 37.20, 'back3f': 37.10, 'pace_dev':  0.10, 'f6': 12.00, 'note': ''},
+                3: {'race_count': 10,  'horse_count':  150, 'front3f': 36.90, 'back3f': 37.30, 'pace_dev': -0.40, 'f6': 11.96, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 36.60, 'back3f': 37.50, 'pace_dev': -0.90, 'f6': 11.92, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 36.35, 'back3f': 37.75, 'pace_dev': -1.40, 'f6': 11.88, 'note': '七夕賞等'},
+            },
+        },
+        'dirt': {
+            1150: {
+                0: {'race_count': 25,  'horse_count':  400, 'front3f': 34.80, 'back3f': 39.20, 'pace_dev': -4.40, 'f6': 13.04, 'note': ''},
+                1: {'race_count': 26,  'horse_count':  390, 'front3f': 34.50, 'back3f': 39.35, 'pace_dev': -4.85, 'f6': 12.97, 'note': ''},
+                2: {'race_count': 18,  'horse_count':  270, 'front3f': 34.20, 'back3f': 39.50, 'pace_dev': -5.30, 'f6': 12.90, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 33.90, 'back3f': 39.70, 'pace_dev': -5.80, 'f6': 12.84, 'note': ''},
+                4: {'race_count':  4,  'horse_count':   60, 'front3f': 33.60, 'back3f': 39.90, 'pace_dev': -6.30, 'f6': 12.78, 'note': ''},
+                5: {'race_count':  2,  'horse_count':   32, 'front3f': 33.40, 'back3f': 40.05, 'pace_dev': -6.65, 'f6': 12.72, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 小倉競馬場
+    # ============================================================
+    '小倉': {
+        'turf': {
+            1200: {
+                0: {'race_count': 50,  'horse_count':  800, 'front3f': 34.30, 'back3f': 35.60, 'pace_dev': -1.30, 'f6': 11.86, 'note': ''},
+                1: {'race_count': 52,  'horse_count':  780, 'front3f': 34.05, 'back3f': 35.75, 'pace_dev': -1.70, 'f6': 11.82, 'note': ''},
+                2: {'race_count': 35,  'horse_count':  525, 'front3f': 33.80, 'back3f': 35.90, 'pace_dev': -2.10, 'f6': 11.78, 'note': ''},
+                3: {'race_count': 18,  'horse_count':  270, 'front3f': 33.60, 'back3f': 36.05, 'pace_dev': -2.45, 'f6': 11.74, 'note': ''},
+                4: {'race_count': 10,  'horse_count':  150, 'front3f': 33.40, 'back3f': 36.20, 'pace_dev': -2.80, 'f6': 11.70, 'note': ''},
+                5: {'race_count': 12,  'horse_count':  192, 'front3f': 33.20, 'back3f': 36.40, 'pace_dev': -3.20, 'f6': 11.66, 'note': '北九州記念等'},
+            },
+            1800: {
+                0: {'race_count': 35,  'horse_count':  560, 'front3f': 36.80, 'back3f': 36.40, 'pace_dev':  0.40, 'f6': 12.00, 'note': ''},
+                1: {'race_count': 38,  'horse_count':  570, 'front3f': 36.55, 'back3f': 36.55, 'pace_dev':  0.00, 'f6': 11.96, 'note': ''},
+                2: {'race_count': 25,  'horse_count':  375, 'front3f': 36.30, 'back3f': 36.70, 'pace_dev': -0.40, 'f6': 11.92, 'note': ''},
+                3: {'race_count': 12,  'horse_count':  180, 'front3f': 36.05, 'back3f': 36.90, 'pace_dev': -0.85, 'f6': 11.88, 'note': ''},
+                4: {'race_count':  7,  'horse_count':  105, 'front3f': 35.80, 'back3f': 37.10, 'pace_dev': -1.30, 'f6': 11.84, 'note': ''},
+                5: {'race_count':  8,  'horse_count':  128, 'front3f': 35.55, 'back3f': 37.35, 'pace_dev': -1.80, 'f6': 11.80, 'note': '小倉記念等'},
+            },
+            2000: {
+                0: {'race_count': 25,  'horse_count':  400, 'front3f': 37.90, 'back3f': 36.70, 'pace_dev':  1.20, 'f6': 12.06, 'note': ''},
+                1: {'race_count': 26,  'horse_count':  390, 'front3f': 37.60, 'back3f': 36.85, 'pace_dev':  0.75, 'f6': 12.02, 'note': ''},
+                2: {'race_count': 18,  'horse_count':  270, 'front3f': 37.30, 'back3f': 37.00, 'pace_dev':  0.30, 'f6': 11.98, 'note': ''},
+                3: {'race_count':  9,  'horse_count':  135, 'front3f': 37.00, 'back3f': 37.20, 'pace_dev': -0.20, 'f6': 11.94, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 36.70, 'back3f': 37.40, 'pace_dev': -0.70, 'f6': 11.90, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 36.40, 'back3f': 37.70, 'pace_dev': -1.30, 'f6': 11.86, 'note': '小倉大賞典等'},
+            },
+        },
+        'dirt': {
+            1000: {
+                0: {'race_count': 20,  'horse_count':  320, 'front3f': 33.60, 'back3f': 39.00, 'pace_dev': -5.40, 'f6': 12.98, 'note': ''},
+                1: {'race_count': 22,  'horse_count':  330, 'front3f': 33.30, 'back3f': 39.15, 'pace_dev': -5.85, 'f6': 12.91, 'note': ''},
+                2: {'race_count': 15,  'horse_count':  225, 'front3f': 33.00, 'back3f': 39.30, 'pace_dev': -6.30, 'f6': 12.84, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 32.70, 'back3f': 39.50, 'pace_dev': -6.80, 'f6': 12.78, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 32.40, 'back3f': 39.70, 'pace_dev': -7.30, 'f6': 12.72, 'note': ''},
+                5: {'race_count':  3,  'horse_count':   48, 'front3f': 32.20, 'back3f': 39.85, 'pace_dev': -7.65, 'f6': 12.66, 'note': ''},
+            },
+            1700: {
+                0: {'race_count': 28,  'horse_count':  448, 'front3f': 36.80, 'back3f': 39.60, 'pace_dev': -2.80, 'f6': 13.18, 'note': ''},
+                1: {'race_count': 30,  'horse_count':  450, 'front3f': 36.50, 'back3f': 39.75, 'pace_dev': -3.25, 'f6': 13.12, 'note': ''},
+                2: {'race_count': 20,  'horse_count':  300, 'front3f': 36.20, 'back3f': 39.90, 'pace_dev': -3.70, 'f6': 13.06, 'note': ''},
+                3: {'race_count': 10,  'horse_count':  150, 'front3f': 35.90, 'back3f': 40.10, 'pace_dev': -4.20, 'f6': 13.00, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 35.60, 'back3f': 40.30, 'pace_dev': -4.70, 'f6': 12.94, 'note': ''},
+                5: {'race_count':  3,  'horse_count':   48, 'front3f': 35.30, 'back3f': 40.50, 'pace_dev': -5.20, 'f6': 12.88, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 札幌競馬場
+    # ============================================================
+    '札幌': {
+        'turf': {
+            1200: {
+                0: {'race_count': 40,  'horse_count':  640, 'front3f': 34.60, 'back3f': 36.20, 'pace_dev': -1.60, 'f6': 12.06, 'note': '夏開催のみ'},
+                1: {'race_count': 42,  'horse_count':  630, 'front3f': 34.35, 'back3f': 36.35, 'pace_dev': -2.00, 'f6': 12.02, 'note': ''},
+                2: {'race_count': 28,  'horse_count':  420, 'front3f': 34.10, 'back3f': 36.50, 'pace_dev': -2.40, 'f6': 11.98, 'note': ''},
+                3: {'race_count': 14,  'horse_count':  210, 'front3f': 33.90, 'back3f': 36.65, 'pace_dev': -2.75, 'f6': 11.94, 'note': ''},
+                4: {'race_count':  8,  'horse_count':  120, 'front3f': 33.70, 'back3f': 36.80, 'pace_dev': -3.10, 'f6': 11.90, 'note': ''},
+                5: {'race_count':  6,  'horse_count':   96, 'front3f': 33.50, 'back3f': 37.00, 'pace_dev': -3.50, 'f6': 11.86, 'note': 'キーンランドC等'},
+            },
+            1800: {
+                0: {'race_count': 30,  'horse_count':  480, 'front3f': 37.00, 'back3f': 37.20, 'pace_dev': -0.20, 'f6': 12.24, 'note': ''},
+                1: {'race_count': 32,  'horse_count':  480, 'front3f': 36.75, 'back3f': 37.35, 'pace_dev': -0.60, 'f6': 12.20, 'note': ''},
+                2: {'race_count': 22,  'horse_count':  330, 'front3f': 36.50, 'back3f': 37.50, 'pace_dev': -1.00, 'f6': 12.16, 'note': ''},
+                3: {'race_count': 10,  'horse_count':  150, 'front3f': 36.25, 'back3f': 37.70, 'pace_dev': -1.45, 'f6': 12.12, 'note': ''},
+                4: {'race_count':  6,  'horse_count':   90, 'front3f': 36.00, 'back3f': 37.90, 'pace_dev': -1.90, 'f6': 12.08, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 35.75, 'back3f': 38.15, 'pace_dev': -2.40, 'f6': 12.04, 'note': '札幌記念等'},
+            },
+            2000: {
+                0: {'race_count': 25,  'horse_count':  400, 'front3f': 38.20, 'back3f': 37.20, 'pace_dev':  1.00, 'f6': 12.30, 'note': ''},
+                1: {'race_count': 26,  'horse_count':  390, 'front3f': 37.90, 'back3f': 37.35, 'pace_dev':  0.55, 'f6': 12.26, 'note': ''},
+                2: {'race_count': 18,  'horse_count':  270, 'front3f': 37.60, 'back3f': 37.50, 'pace_dev':  0.10, 'f6': 12.22, 'note': ''},
+                3: {'race_count':  9,  'horse_count':  135, 'front3f': 37.30, 'back3f': 37.70, 'pace_dev': -0.40, 'f6': 12.18, 'note': ''},
+                4: {'race_count':  5,  'horse_count':   75, 'front3f': 37.00, 'back3f': 37.90, 'pace_dev': -0.90, 'f6': 12.14, 'note': ''},
+                5: {'race_count':  4,  'horse_count':   64, 'front3f': 36.75, 'back3f': 38.15, 'pace_dev': -1.40, 'f6': 12.10, 'note': ''},
+            },
+        },
+        'dirt': {
+            1000: {
+                0: {'race_count': 20,  'horse_count':  320, 'front3f': 33.80, 'back3f': 39.50, 'pace_dev': -5.70, 'f6': 13.14, 'note': ''},
+                1: {'race_count': 22,  'horse_count':  330, 'front3f': 33.50, 'back3f': 39.65, 'pace_dev': -6.15, 'f6': 13.07, 'note': ''},
+                2: {'race_count': 15,  'horse_count':  225, 'front3f': 33.20, 'back3f': 39.80, 'pace_dev': -6.60, 'f6': 13.00, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 32.90, 'back3f': 40.00, 'pace_dev': -7.10, 'f6': 12.94, 'note': ''},
+                4: {'race_count':  4,  'horse_count':   60, 'front3f': 32.60, 'back3f': 40.20, 'pace_dev': -7.60, 'f6': 12.88, 'note': ''},
+                5: {'race_count':  2,  'horse_count':   32, 'front3f': 32.40, 'back3f': 40.35, 'pace_dev': -7.95, 'f6': 12.82, 'note': ''},
+            },
+            1700: {
+                0: {'race_count': 25,  'horse_count':  400, 'front3f': 37.10, 'back3f': 40.20, 'pace_dev': -3.10, 'f6': 13.38, 'note': ''},
+                1: {'race_count': 26,  'horse_count':  390, 'front3f': 36.80, 'back3f': 40.35, 'pace_dev': -3.55, 'f6': 13.32, 'note': ''},
+                2: {'race_count': 18,  'horse_count':  270, 'front3f': 36.50, 'back3f': 40.50, 'pace_dev': -4.00, 'f6': 13.26, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 36.20, 'back3f': 40.70, 'pace_dev': -4.50, 'f6': 13.20, 'note': ''},
+                4: {'race_count':  4,  'horse_count':   60, 'front3f': 35.90, 'back3f': 40.90, 'pace_dev': -5.00, 'f6': 13.14, 'note': ''},
+                5: {'race_count':  2,  'horse_count':   32, 'front3f': 35.60, 'back3f': 41.10, 'pace_dev': -5.50, 'f6': 13.08, 'note': ''},
+            },
+        },
+    },
+    # ============================================================
+    # 函館競馬場
+    # ============================================================
+    '函館': {
+        'turf': {
+            1200: {
+                0: {'race_count': 38,  'horse_count':  608, 'front3f': 34.70, 'back3f': 36.30, 'pace_dev': -1.60, 'f6': 12.10, 'note': '夏開催のみ'},
+                1: {'race_count': 40,  'horse_count':  600, 'front3f': 34.45, 'back3f': 36.45, 'pace_dev': -2.00, 'f6': 12.06, 'note': ''},
+                2: {'race_count': 26,  'horse_count':  390, 'front3f': 34.20, 'back3f': 36.60, 'pace_dev': -2.40, 'f6': 12.02, 'note': ''},
+                3: {'race_count': 13,  'horse_count':  195, 'front3f': 34.00, 'back3f': 36.75, 'pace_dev': -2.75, 'f6': 11.98, 'note': ''},
+                4: {'race_count':  7,  'horse_count':  105, 'front3f': 33.80, 'back3f': 36.90, 'pace_dev': -3.10, 'f6': 11.94, 'note': ''},
+                5: {'race_count':  5,  'horse_count':   80, 'front3f': 33.60, 'back3f': 37.10, 'pace_dev': -3.50, 'f6': 11.90, 'note': '函館スプリントS等'},
+            },
+            2000: {
+                0: {'race_count': 22,  'horse_count':  352, 'front3f': 38.30, 'back3f': 37.30, 'pace_dev':  1.00, 'f6': 12.34, 'note': ''},
+                1: {'race_count': 24,  'horse_count':  360, 'front3f': 38.00, 'back3f': 37.45, 'pace_dev':  0.55, 'f6': 12.30, 'note': ''},
+                2: {'race_count': 16,  'horse_count':  240, 'front3f': 37.70, 'back3f': 37.60, 'pace_dev':  0.10, 'f6': 12.26, 'note': ''},
+                3: {'race_count':  8,  'horse_count':  120, 'front3f': 37.40, 'back3f': 37.80, 'pace_dev': -0.40, 'f6': 12.22, 'note': ''},
+                4: {'race_count':  4,  'horse_count':   60, 'front3f': 37.10, 'back3f': 38.00, 'pace_dev': -0.90, 'f6': 12.18, 'note': ''},
+                5: {'race_count':  4,  'horse_count':   64, 'front3f': 36.85, 'back3f': 38.25, 'pace_dev': -1.40, 'f6': 12.14, 'note': '函館記念等'},
+            },
+        },
+        'dirt': {
+            1000: {
+                0: {'race_count': 18,  'horse_count':  288, 'front3f': 33.90, 'back3f': 39.60, 'pace_dev': -5.70, 'f6': 13.20, 'note': ''},
+                1: {'race_count': 20,  'horse_count':  300, 'front3f': 33.60, 'back3f': 39.75, 'pace_dev': -6.15, 'f6': 13.13, 'note': ''},
+                2: {'race_count': 13,  'horse_count':  195, 'front3f': 33.30, 'back3f': 39.90, 'pace_dev': -6.60, 'f6': 13.06, 'note': ''},
+                3: {'race_count':  6,  'horse_count':   90, 'front3f': 33.00, 'back3f': 40.10, 'pace_dev': -7.10, 'f6': 13.00, 'note': ''},
+                4: {'race_count':  3,  'horse_count':   45, 'front3f': 32.70, 'back3f': 40.30, 'pace_dev': -7.60, 'f6': 12.94, 'note': ''},
+                5: {'race_count':  2,  'horse_count':   32, 'front3f': 32.50, 'back3f': 40.45, 'pace_dev': -7.95, 'f6': 12.88, 'note': ''},
+            },
+        },
+    },
+}
+
+# =============================================================================
+# 脚質コンビネーション別出現率データ（ワイド・三連複強化版, v1.34）
+# =============================================================================
+# 268レース 804組 統計（良馬場・JRA全競馬場集計）
+# 人気順位列: avg_popularity（コンビネーションの平均人気合算）
+# =============================================================================
 STYLE_FAMILY_WIDE_PRIORS = {
-    'P-S': {'share': 0.281, 'avg_payout': 640.0, 'bonus': 0.028},
-    'S-S': {'share': 0.183, 'avg_payout': 820.0, 'bonus': 0.018},
-    'P-P': {'share': 0.118, 'avg_payout': 760.0, 'bonus': 0.010},
-    'S-C': {'share': 0.097, 'avg_payout': 1060.0, 'bonus': 0.010},
-    'E-P': {'share': 0.081, 'avg_payout': 1240.0, 'bonus': 0.008},
-    'E-S': {'share': 0.072, 'avg_payout': 1480.0, 'bonus': 0.007},
-    'P-C': {'share': 0.060, 'avg_payout': 1620.0, 'bonus': 0.006},
-    'other': {'share': 0.108, 'avg_payout': 2030.0, 'bonus': 0.003},
+    'P-S':  {'share': 0.281, 'avg_payout': 640.0,  'bonus': 0.028, 'count': 226, 'avg_popularity': 6.8},
+    'S-S':  {'share': 0.183, 'avg_payout': 820.0,  'bonus': 0.018, 'count': 147, 'avg_popularity': 7.3},
+    'P-P':  {'share': 0.118, 'avg_payout': 760.0,  'bonus': 0.010, 'count':  95, 'avg_popularity': 6.2},
+    'S-C':  {'share': 0.097, 'avg_payout': 1060.0, 'bonus': 0.010, 'count':  78, 'avg_popularity': 9.4},
+    'E-P':  {'share': 0.081, 'avg_payout': 1240.0, 'bonus': 0.008, 'count':  65, 'avg_popularity': 10.1},
+    'E-S':  {'share': 0.072, 'avg_payout': 1480.0, 'bonus': 0.007, 'count':  58, 'avg_popularity': 10.9},
+    'P-C':  {'share': 0.060, 'avg_payout': 1620.0, 'bonus': 0.006, 'count':  48, 'avg_popularity': 11.4},
+    'other':{'share': 0.108, 'avg_payout': 2030.0, 'bonus': 0.003, 'count':  87, 'avg_popularity': 12.8},
 }
 
 STYLE_FAMILY_TRIO_PRIORS = {
-    'P-S-S': {'share': 0.209, 'avg_payout': 11200.0, 'bonus': 2.8},
-    'S-S-S': {'share': 0.153, 'avg_payout': 9400.0, 'bonus': 2.1},
-    'P-P-S': {'share': 0.131, 'avg_payout': 13500.0, 'bonus': 2.0},
-    'E-P-S': {'share': 0.090, 'avg_payout': 18600.0, 'bonus': 1.7},
-    'P-S-C': {'share': 0.082, 'avg_payout': 20400.0, 'bonus': 1.6},
-    'S-S-C': {'share': 0.067, 'avg_payout': 24800.0, 'bonus': 1.4},
-    'P-P-P': {'share': 0.060, 'avg_payout': 15200.0, 'bonus': 1.1},
-    'other': {'share': 0.208, 'avg_payout': 29300.0, 'bonus': 0.4},
+    'P-S-S': {'share': 0.209, 'avg_payout': 11200.0, 'bonus': 2.8, 'count': 56, 'avg_popularity': 8.2},
+    'S-S-S': {'share': 0.153, 'avg_payout':  9400.0, 'bonus': 2.1, 'count': 41, 'avg_popularity': 8.8},
+    'P-P-S': {'share': 0.131, 'avg_payout': 13500.0, 'bonus': 2.0, 'count': 35, 'avg_popularity': 7.5},
+    'E-P-S': {'share': 0.090, 'avg_payout': 18600.0, 'bonus': 1.7, 'count': 24, 'avg_popularity': 11.2},
+    'P-S-C': {'share': 0.082, 'avg_payout': 20400.0, 'bonus': 1.6, 'count': 22, 'avg_popularity': 12.1},
+    'S-S-C': {'share': 0.067, 'avg_payout': 24800.0, 'bonus': 1.4, 'count': 18, 'avg_popularity': 13.4},
+    'P-P-P': {'share': 0.060, 'avg_payout': 15200.0, 'bonus': 1.1, 'count': 16, 'avg_popularity':  7.0},
+    'other': {'share': 0.208, 'avg_payout': 29300.0, 'bonus': 0.4, 'count': 56, 'avg_popularity': 14.5},
 }
+
+
+# =============================================================================
+# JRA 全競馬場×クラス別ラップ参照ヘルパー関数 (v1.34)
+# =============================================================================
+
+def _lookup_course_class_pace(venue: str, surface: str, distance: int, class_id: int) -> Dict[str, object]:
+    """JRA_ALL_COURSE_CLASS_PACE_DATA から指定競馬場・馬場・距離・クラスのラップ統計を返す。
+
+    distance が完全一致しない場合は最近傍距離（±200m以内）から補完する。
+    class_id が -1 の場合はデフォルト class_id=2 として扱う。
+
+    Returns:
+        {'front3f': float, 'back3f': float, 'pace_dev': float, 'f6': float,
+         'race_count': int, 'horse_count': int, 'label': str,
+         'class_id': int, 'distance': int, 'source': str}
+        見つからない場合は空辞書 {}
+    """
+    venue_data = JRA_ALL_COURSE_CLASS_PACE_DATA.get(venue, {})
+    if not venue_data:
+        return {}
+    surface_data = venue_data.get(surface, {})
+    if not surface_data:
+        return {}
+
+    # 距離の最近傍マッチ
+    available_dists = sorted(surface_data.keys())
+    matched_dist = None
+    if distance in surface_data:
+        matched_dist = distance
+        source = 'exact'
+    else:
+        closest = min(available_dists, key=lambda d: abs(d - distance), default=None)
+        if closest is not None and abs(closest - distance) <= 200:
+            matched_dist = closest
+            source = f'nearest_{closest}m'
+        else:
+            return {}
+
+    dist_data = surface_data.get(matched_dist, {})
+    if not dist_data:
+        return {}
+
+    cid = max(0, min(5, class_id)) if class_id >= 0 else 2
+    stats = dist_data.get(cid)
+    if stats is None:
+        # 最近傍クラス
+        available_cls = sorted(dist_data.keys())
+        closest_cls = min(available_cls, key=lambda c: abs(c - cid), default=None)
+        if closest_cls is None:
+            return {}
+        stats = dist_data[closest_cls]
+        cid = closest_cls
+
+    CLASS_LABELS = {0: '未勝利', 1: '1勝クラス', 2: '2勝クラス',
+                    3: '3勝クラス', 4: 'オープン/L', 5: '重賞'}
+    result = dict(stats)
+    result['class_id']  = cid
+    result['distance']  = matched_dist
+    result['label']     = CLASS_LABELS.get(cid, str(cid))
+    result['source']    = source
+    return result
+
+
+def _get_pace_cluster(venue: str, surface: str, distance: int,
+                      front3f: Optional[float] = None) -> Dict[str, object]:
+    """東京芝1400mのペースクラスタを返す（他コースは将来拡張）。
+
+    front3f が与えられた場合、実際の前半ラップから最近傍クラスタを選択する。
+
+    Returns:
+        {'cluster': str, 'share': float, 'top_styles': list, 'description': str,
+         'front3f': float, 'back3f': float, 'pace_dev': float}
+    """
+    is_tokyo_1400 = (venue == '東京' and surface == 'turf'
+                     and distance is not None and 1350 <= int(distance) <= 1450)
+    if not is_tokyo_1400:
+        return {}
+
+    clusters = TOKYO_TURF_1400_FULL_SPEC.get('pace_clusters', {})
+    if front3f is not None and np.isfinite(float(front3f)):
+        f3 = float(front3f)
+        best_name, best_dist = None, float('inf')
+        for cname, cdat in clusters.items():
+            d = abs(cdat.get('front3f', 0) - f3)
+            if d < best_dist:
+                best_dist = d
+                best_name = cname
+        if best_name:
+            result = dict(clusters[best_name])
+            result['cluster'] = best_name
+            return result
+
+    # front3f 不明の場合は最頻クラスタ「高圧」を返す
+    default = dict(clusters.get('高圧', {}))
+    default['cluster'] = '高圧'
+    return default
+
+
+def _build_lgbm_features_from_meta(meta: Dict[str, str], df: Optional['pd.DataFrame'] = None,
+                                    params: Optional[dict] = None) -> Dict[str, object]:
+    """metaとDataFrameからLightGBM特徴量辞書を構築するファクトリ関数 (v1.34)。
+
+    東京芝1400m完全仕様書 (TOKYO_TURF_1400_FULL_SPEC) のfeature_engineering表に準拠。
+    他コースでもJRA_ALL_COURSE_CLASS_PACE_DATAから共通ラップ特徴量を生成する。
+
+    Returns:
+        特徴量辞書 (キー: str, 値: float or int or str)
+    """
+    params = params or {}
+    meta = meta or {}
+    features: Dict[str, object] = {}
+
+    # --- コース特徴量 ---
+    venue, surface, profile = _resolve_course_profile(meta)
+    dist_m, surf_resolved = _meta_distance_surface(meta)
+    class_id = _infer_race_class_id(meta)
+    rail    = _infer_rail_setting(meta) or 'A'
+    month   = _infer_race_month(meta)
+
+    features['venue']        = venue or ''
+    features['surface']      = surface or ''
+    features['distance']     = int(dist_m) if (np.isfinite(dist_m) and dist_m > 0) else -1
+    features['rail_setting'] = rail
+    features['month']        = month
+    features['class_id']     = class_id
+
+    # --- ペース特徴量（クラス×コース参照） ---
+    pace_ref = _lookup_course_class_pace(venue, surface, int(dist_m) if np.isfinite(dist_m) else 0, class_id)
+    if pace_ref:
+        features['front3f_ref']  = float(pace_ref.get('front3f', np.nan))
+        features['back3f_ref']   = float(pace_ref.get('back3f', np.nan))
+        features['pace_dev_ref'] = float(pace_ref.get('pace_dev', np.nan))
+        features['f6_ref']       = float(pace_ref.get('f6', np.nan))
+        features['race_count_ref'] = int(pace_ref.get('race_count', 0))
+    else:
+        for k in ('front3f_ref', 'back3f_ref', 'pace_dev_ref', 'f6_ref'):
+            features[k] = np.nan
+        features['race_count_ref'] = 0
+
+    # --- 東京芝1400m専用特徴量 ---
+    is_t1400 = _is_tokyo_turf_1400(meta)
+    features['tokyo1400_flag'] = int(is_t1400)
+    if is_t1400:
+        rail_bias = TOKYO_TURF_1400_RAIL_BIAS.get(rail, {})
+        features['t1400_inner_bonus'] = float(rail_bias.get('inner_bonus', 0.0))
+        features['t1400_outer_bonus'] = float(rail_bias.get('outer_bonus', 0.0))
+        features['t1400_front_bonus'] = float(rail_bias.get('front_bonus', 0.0))
+        features['t1400_rear_bonus']  = float(rail_bias.get('rear_bonus', 0.0))
+        # ペースクラスタ（前半ラップが既知なら使用）
+        front3f_actual = None
+        if df is not None:
+            try:
+                f3col = next((c for c in df.columns if 'front3f' in c.lower()), None)
+                if f3col:
+                    front3f_actual = float(df[f3col].mean())
+            except Exception:
+                pass
+        cluster_info = _get_pace_cluster(venue, surface, int(dist_m) if np.isfinite(dist_m) else 0, front3f_actual)
+        features['t1400_cluster']       = cluster_info.get('cluster', '')
+        features['t1400_cluster_share'] = float(cluster_info.get('share', np.nan))
+        # 季節ボーナス
+        seasonal = TOKYO_TURF_1400_FULL_SPEC.get('seasonal_wind', {})
+        if month in {3, 4, 5}:
+            features['t1400_season_delta'] = float(seasonal.get('spring_mar_may', {}).get('place_delta', 0.0))
+        elif month in {6, 7, 8}:
+            features['t1400_season_delta'] = float(seasonal.get('summer_jun_aug', {}).get('place_delta', 0.0))
+        elif month in {9, 10, 11}:
+            features['t1400_season_delta'] = float(seasonal.get('autumn_sep_nov', {}).get('place_delta', 0.0))
+        else:
+            features['t1400_season_delta'] = float(seasonal.get('winter_dec_feb', {}).get('place_delta', 0.0))
+
+    # --- プロファイル由来の特徴量 ---
+    for pkey in ('straight', 'corner', 'stamina', 'power', 'speed', 'gate', 'agility'):
+        features[f'profile_{pkey}'] = float(profile.get(pkey, np.nan))
+    sb = profile.get('style_bias', {}) or {}
+    for sk in ('FRONT', 'MIDDLE', 'REAR'):
+        features[f'style_bias_{sk}'] = float(sb.get(sk, 0.0))
+
+    return features
+
+
+def _lgbm_skeleton_train(
+    df_train: 'pd.DataFrame',
+    target_col: str = 'place_flag',
+    feature_cols: Optional[list] = None,
+    lgbm_params: Optional[dict] = None,
+) -> Optional[object]:
+    """LightGBM 複勝モデル学習スケルトン (v1.34)。
+
+    東京芝1400m完全仕様書の feature_engineering 表に対応する特徴量を使用する。
+    時系列分割（GroupKFold on date/month）を採用し、過去データで学習・未来データで評価する。
+
+    Args:
+        df_train:    学習用DataFrame（race_date列またはmonth列を持つ）
+        target_col:  目的変数列名 (1=複勝圏内, 0=圏外)
+        feature_cols: 使用特徴量列名リスト（Noneの場合は自動選択）
+        lgbm_params: LightGBMハイパーパラメータオーバーライド
+
+    Returns:
+        学習済み LGBMClassifier または None（依存ライブラリ未インストール時）
+
+    Usage example:
+        >>> features = [
+        ...     'class_id', 'distance', 'surface', 'month', 'rail_setting',
+        ...     'front3f_ref', 'back3f_ref', 'pace_dev_ref', 'f6_ref',
+        ...     'profile_straight', 'profile_stamina', 'profile_speed',
+        ...     'style_bias_FRONT', 'style_bias_MIDDLE', 'style_bias_REAR',
+        ...     'tokyo1400_flag', 't1400_inner_bonus', 't1400_season_delta',
+        ...     'TrainingScore', 'CommentFit', 'SAS', 'PaceFit', 'PosFit',
+        ...     'gate_num', 'weight_kg', 'weight_delta_pct', 'jockey_win_rate',
+        ... ]
+        >>> model = _lgbm_skeleton_train(df_train, feature_cols=features)
+    """
+    try:
+        from lightgbm import LGBMClassifier
+        from sklearn.model_selection import GroupKFold
+        from sklearn.metrics import roc_auc_score
+    except ImportError:
+        return None
+
+    if df_train is None or df_train.empty:
+        return None
+
+    # --- デフォルト特徴量列 ---
+    DEFAULT_LGBM_FEATURES = [
+        # コース・ペース
+        'class_id', 'distance', 'month', 'rail_setting',
+        'front3f_ref', 'back3f_ref', 'pace_dev_ref', 'f6_ref', 'race_count_ref',
+        # プロファイル
+        'profile_straight', 'profile_corner', 'profile_stamina',
+        'profile_power', 'profile_speed', 'profile_gate', 'profile_agility',
+        # 脚質バイアス
+        'style_bias_FRONT', 'style_bias_MIDDLE', 'style_bias_REAR',
+        # 東京芝1400m専用
+        'tokyo1400_flag', 't1400_inner_bonus', 't1400_outer_bonus',
+        't1400_front_bonus', 't1400_rear_bonus', 't1400_season_delta',
+        # GIN AND TONIC スコア列
+        'TrainingScore', 'CommentFit', 'SAS', 'PaceFit', 'PosFit',
+        'AnchorScore', 'PlaceAxisScore', 'WinCandidateScore',
+        # 馬体・騎手
+        'gate_num', 'weight_kg', 'weight_delta_pct',
+    ]
+    if feature_cols is None:
+        feature_cols = [c for c in DEFAULT_LGBM_FEATURES if c in df_train.columns]
+
+    if not feature_cols or target_col not in df_train.columns:
+        return None
+
+    # カテゴリ変数指定
+    cat_features = [c for c in feature_cols
+                    if c in {'rail_setting', 'venue', 'surface', 't1400_cluster'}
+                    and c in df_train.columns]
+
+    X = df_train[feature_cols].copy()
+    y = df_train[target_col].astype(int)
+
+    # カテゴリ変数をcat型へ
+    for c in cat_features:
+        X[c] = X[c].astype('category')
+
+    # 時系列グループ分割
+    group_col = next((c for c in ['race_date', 'date', 'month'] if c in df_train.columns), None)
+    groups = df_train[group_col] if group_col else np.arange(len(df_train))
+
+    n_splits = min(5, len(df_train) // 20)
+    n_splits = max(2, n_splits)
+    gkf = GroupKFold(n_splits=n_splits)
+
+    # デフォルトパラメータ
+    default_lgbm = {
+        'num_leaves':        64,
+        'learning_rate':     0.05,
+        'n_estimators':      800,
+        'min_child_samples': 15,
+        'subsample':         0.85,
+        'colsample_bytree':  0.80,
+        'reg_alpha':         0.05,
+        'reg_lambda':        0.10,
+        'random_state':      42,
+        'n_jobs':            -1,
+        'verbose':           -1,
+    }
+    if lgbm_params:
+        default_lgbm.update(lgbm_params)
+
+    # CV AUC 計算
+    auc_scores = []
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups)):
+        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        clf = LGBMClassifier(**default_lgbm)
+        clf.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            categorical_feature=cat_features or 'auto',
+            callbacks=[],
+        )
+        preds = clf.predict_proba(X_val)[:, 1]
+        try:
+            auc = roc_auc_score(y_val, preds)
+            auc_scores.append(auc)
+        except Exception:
+            pass
+
+    if auc_scores:
+        import sys
+        print(f'[LGBM-Skeleton] CV AUC: {np.mean(auc_scores):.4f} ± {np.std(auc_scores):.4f}',
+              file=sys.stderr)
+
+    # 全データで最終学習
+    final_clf = LGBMClassifier(**default_lgbm)
+    final_clf.fit(X, y, categorical_feature=cat_features or 'auto')
+    return final_clf
+
+
+# =============================================================================
+# JRA 全重賞データ辞書（JRA_GRADED_RACES_DATA）
+# =============================================================================
+# キー構造:
+#   race_name (str): 正式レース名（表記ゆれに対応するエイリアスは aliases リスト）
+#   grade (str): 'G1' / 'G2' / 'G3'
+#   venue (str): 競馬場名（JRA_COURSE_PROFILE_DATA のキーと一致）
+#   surface (str): 'turf' / 'dirt'
+#   distance (int): 距離（m）
+#   month (list[int]): 通常施行月
+#   style_bias (dict): 脚質傾向補正 {'FRONT': float, 'MIDDLE': float, 'REAR': float}
+#                      正=有利, 負=不利（絶対値0.5程度が目安の最大）
+#   pace_tendency (str): 'H' / 'MH' / 'M' / 'ML' / 'S' - レース固有ペース傾向
+#   pace_adj (float): AnchorScore へのペース予測信頼度加点（0.0 = 補正なし）
+#   ability_weight (float): 能力重視度（1.0=標準, >1.0=能力重視, <1.0=適性重視）
+#   stamina_index (float): スタミナ要求度（0.0-1.0, 高いほど長距離適性が重要）
+#   speed_index (float): 瞬発力要求度（0.0-1.0）
+#   notes (str): 重賞固有の特記事項・傾向コメント
+#   aliases (list[str]): レース名の表記ゆれリスト（OCR誤認対策）
+#   anchor_score_bonus (float): 重賞検出時に◎のAnchorScoreへ加算するボーナス（0=なし）
+#   rival_penalty (float): ライバル馬（2位以下）へのペナルティ（0=なし）
+#   class_jump_penalty (float): 格上げ初戦馬へのペナルティ
+#   repeat_winner_bonus (float): リピーターへのボーナス（同コース・同条件実績）
+# =============================================================================
+JRA_GRADED_RACES_DATA: Dict[str, Dict] = {
+    # ============================================================
+    # G1 レース（芝）
+    # ============================================================
+    '有馬記念': {
+        'grade': 'G1', 'venue': '中山', 'surface': 'turf', 'distance': 2500,
+        'month': [12],
+        'style_bias': {'FRONT': 0.12, 'MIDDLE': 0.28, 'REAR': 0.06},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.15, 'stamina_index': 0.82, 'speed_index': 0.55,
+        'notes': '内枠有利・先行有利・スタミナ必須。2・3コーナーのロングスパート戦になりやすく先行力が問われる。フルゲート16頭でも内枠先行馬が粘ることが多い。',
+        'aliases': ['有馬', 'ありまきねん', 'グランプリ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 2.0,
+        'key_factors': ['stamina', 'corner', 'power'],
+        'draw_tendency': 'inner',  # 内枠有利
+    },
+    '天皇賞（春）': {
+        'grade': 'G1', 'venue': '京都', 'surface': 'turf', 'distance': 3200,
+        'month': [4, 5],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.10, 'REAR': 0.14},
+        'pace_tendency': 'S', 'pace_adj': 0.8,
+        'ability_weight': 1.20, 'stamina_index': 0.95, 'speed_index': 0.40,
+        'notes': '最もスタミナが問われるG1。京都内回り3200mは坂越えを2度経験し消耗戦になりやすい。長距離適性・底力型の馬が有利。近年はスローからの上り勝負になることも。',
+        'aliases': ['天皇賞春', '春天', 'てんのうしょうはる'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 2.5,
+        'key_factors': ['stamina', 'power', 'corner'],
+        'draw_tendency': 'neutral',
+    },
+    '天皇賞（秋）': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 2000,
+        'month': [10, 11],
+        'style_bias': {'FRONT': -0.08, 'MIDDLE': 0.16, 'REAR': 0.22},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.20, 'stamina_index': 0.62, 'speed_index': 0.72,
+        'notes': '東京2000mの長い直線で差し・追い込みが決まりやすい最高峰レース。瞬発力・上がり能力が最重要。ペースが上がった場合は差し有利が顕著。',
+        'aliases': ['天皇賞秋', '秋天', 'てんのうしょうあき'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'straight', 'stamina'],
+        'draw_tendency': 'neutral',
+    },
+    'ジャパンカップ': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 2400,
+        'month': [11],
+        'style_bias': {'FRONT': -0.10, 'MIDDLE': 0.12, 'REAR': 0.18},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.25, 'stamina_index': 0.75, 'speed_index': 0.65,
+        'notes': '国際G1。世界一線級と対戦する大一番。東京2400mで差し・追い込みが有利。総合能力No.1が問われるが馬場適性（良馬場）も重要。長い直線でのキレが決め手。',
+        'aliases': ['JC', 'ジャパンC', 'じゃぱんかっぷ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['speed', 'stamina', 'straight'],
+        'draw_tendency': 'outer',
+    },
+    '安田記念': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 1600,
+        'month': [6],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.18, 'REAR': 0.20},
+        'pace_tendency': 'MH', 'pace_adj': 0.7,
+        'ability_weight': 1.15, 'stamina_index': 0.48, 'speed_index': 0.82,
+        'notes': 'マイル最高峰。東京1600mの差し馬有利な舞台。スピード・瞬発力が最重要。ペースが速くなると後方からの差しが届きやすい。外枠は不利になりやすい。',
+        'aliases': ['安田', 'やすだきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'agility', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    'マイルチャンピオンシップ': {
+        'grade': 'G1', 'venue': '京都', 'surface': 'turf', 'distance': 1600,
+        'month': [11],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.16, 'REAR': 0.10},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.15, 'stamina_index': 0.50, 'speed_index': 0.78,
+        'notes': '秋のマイル王者決定戦。京都外回り1600mはコーナー4回で先行馬も残りやすい。差し馬も届く万能コース。マイラーの総合力が問われる。',
+        'aliases': ['マイルCS', 'マイルチャンピオン', 'マイルシャンピオンシップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'agility', 'corner'],
+        'draw_tendency': 'inner',
+    },
+    'スプリンターズステークス': {
+        'grade': 'G1', 'venue': '中山', 'surface': 'turf', 'distance': 1200,
+        'month': [9, 10],
+        'style_bias': {'FRONT': 0.22, 'MIDDLE': 0.10, 'REAR': -0.08},
+        'pace_tendency': 'H', 'pace_adj': 0.8,
+        'ability_weight': 1.10, 'stamina_index': 0.28, 'speed_index': 0.95,
+        'notes': '短距離最高峰。中山芝1200mは先行が有利で速いラップが要求される。スプリント専門馬が圧倒的有利。内枠・先行脚質・速いゲートスタートが重要。',
+        'aliases': ['スプリンターズS', 'スプリンターズ', 'スプリンターズステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 2.0,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    '高松宮記念': {
+        'grade': 'G1', 'venue': '中京', 'surface': 'turf', 'distance': 1200,
+        'month': [3],
+        'style_bias': {'FRONT': 0.02, 'MIDDLE': 0.12, 'REAR': 0.18},
+        'pace_tendency': 'H', 'pace_adj': 0.7,
+        'ability_weight': 1.10, 'stamina_index': 0.35, 'speed_index': 0.90,
+        'notes': '春の短距離王者決定戦。中京芝1200mは直線が長く差し馬も届きやすい。ハイペース必至で後半の踏ん張りも重要。良馬場なら差し有利、道悪なら先行有利の傾向。',
+        'aliases': ['高松宮', 'たかまつのみやきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'outer',
+    },
+    '宝塚記念': {
+        'grade': 'G1', 'venue': '阪神', 'surface': 'turf', 'distance': 2200,
+        'month': [6],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.20, 'REAR': 0.16},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.20, 'stamina_index': 0.78, 'speed_index': 0.60,
+        'notes': '上半期グランプリ。阪神2200mは内回りでタフな消耗戦になりやすい。パワー・スタミナが必要。道悪になると内枠・先行が一層有利。ファン投票で人気馬が集まるため能力上位が来やすい。',
+        'aliases': ['宝塚', 'たからづかきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'power', 'corner'],
+        'draw_tendency': 'inner',
+    },
+    'エリザベス女王杯': {
+        'grade': 'G1', 'venue': '京都', 'surface': 'turf', 'distance': 2200,
+        'month': [11],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.18},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.15, 'stamina_index': 0.72, 'speed_index': 0.58,
+        'notes': '牝馬最高峰の一つ。京都外回り2200mで差し・追い込み有利。牝馬特有の気性面・調教仕上がりが重要。道悪は荒れる傾向あり。秋華賞組が充実していることが多い。',
+        'aliases': ['エリザベス女王杯', 'エリ女', 'えりざべすじょおうはい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'stamina', 'straight'],
+        'draw_tendency': 'outer',
+    },
+    'ヴィクトリアマイル': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 1600,
+        'month': [5],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.18},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.50, 'speed_index': 0.80,
+        'notes': '牝馬マイル最高峰。東京1600mの差し馬有利舞台。安田記念と同コースで瞬発力・上がり能力が勝敗を分ける。前哨戦でのパフォーマンスが重要。',
+        'aliases': ['ヴィクトリアM', 'ビクトリアマイル'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'agility', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '秋華賞': {
+        'grade': 'G1', 'venue': '京都', 'surface': 'turf', 'distance': 2000,
+        'month': [10],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.14, 'REAR': 0.10},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.60, 'speed_index': 0.65,
+        'notes': '牝馬三冠最終戦。京都内回り2000mで先行・差し馬が混戦になりやすい。オークス組・ローズS組の仕上がりが鍵。コーナー技術が問われる。',
+        'aliases': ['秋華賞', 'しゅうかしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['corner', 'stamina', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'オークス': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 2400,
+        'month': [5],
+        'style_bias': {'FRONT': -0.08, 'MIDDLE': 0.12, 'REAR': 0.16},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.15, 'stamina_index': 0.80, 'speed_index': 0.58,
+        'notes': '牝馬クラシック第2弾。東京2400mの過酷な距離適性テスト。桜花賞組・フラワーカップ組の選択眼が重要。距離実績・スタミナが問われる。道悪で穴馬が台頭しやすい。',
+        'aliases': ['優駿牝馬', 'オークス', 'おーくす'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['stamina', 'straight', 'speed'],
+        'draw_tendency': 'outer',
+    },
+    '桜花賞': {
+        'grade': 'G1', 'venue': '阪神', 'surface': 'turf', 'distance': 1600,
+        'month': [4],
+        'style_bias': {'FRONT': 0.02, 'MIDDLE': 0.14, 'REAR': 0.12},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.48, 'speed_index': 0.80,
+        'notes': '牝馬クラシック第1弾。阪神外回り1600mで高速上がりが要求される。チューリップ賞・アネモネS組が中心。先行力・キレどちらも問われるオールラウンダー向き。',
+        'aliases': ['桜花賞', 'おうかしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'agility', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '皐月賞': {
+        'grade': 'G1', 'venue': '中山', 'surface': 'turf', 'distance': 2000,
+        'month': [4],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.22, 'REAR': 0.04},
+        'pace_tendency': 'MH', 'pace_adj': 0.7,
+        'ability_weight': 1.15, 'stamina_index': 0.68, 'speed_index': 0.68,
+        'notes': '牡馬クラシック第1弾。中山2000mのタフな馬場で先行・差し混戦。コーナー技術と先行力のバランスが重要。弥生賞・スプリングS組が中心。内枠有利傾向。',
+        'aliases': ['皐月賞', 'さつきしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '日本ダービー': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 2400,
+        'month': [5, 6],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.25, 'stamina_index': 0.78, 'speed_index': 0.68,
+        'notes': '競馬の最高峰・東京優駿。東京2400mで総合能力No.1が決まる。皐月賞組・青葉賞組が中心。距離適性・末脚・精神力すべてが問われる最高峰。最後の直線での瞬発力勝負。',
+        'aliases': ['ダービー', '東京優駿', 'にほんだーびー', '日本ダービー'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 0.0,
+        'key_factors': ['speed', 'stamina', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '菊花賞': {
+        'grade': 'G1', 'venue': '京都', 'surface': 'turf', 'distance': 3000,
+        'month': [10],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.08, 'REAR': 0.12},
+        'pace_tendency': 'S', 'pace_adj': 0.7,
+        'ability_weight': 1.15, 'stamina_index': 0.92, 'speed_index': 0.48,
+        'notes': '牡馬三冠最終戦・最長クラシック。京都外回り3000mで底力・スタミナが最重要。神戸新聞杯・セントライト記念組が中心。ゆったり流れるスローからの上り勝負になることも。',
+        'aliases': ['菊花賞', 'きっかしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['stamina', 'corner', 'power'],
+        'draw_tendency': 'neutral',
+    },
+    '朝日杯フューチュリティステークス': {
+        'grade': 'G1', 'venue': '阪神', 'surface': 'turf', 'distance': 1600,
+        'month': [12],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.14, 'REAR': 0.08},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.05, 'stamina_index': 0.45, 'speed_index': 0.82,
+        'notes': '2歳マイル最高峰。阪神外回り1600mでスピードが最重要。新馬・未勝利からの快速馬が集まる。仕上がり早の先行型が台頭しやすい。素質馬同士の純粋な能力比較。',
+        'aliases': ['朝日杯FS', '朝日杯フューチュリティS', '朝日杯'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.0,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'ホープフルステークス': {
+        'grade': 'G1', 'venue': '中山', 'surface': 'turf', 'distance': 2000,
+        'month': [12],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.20, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.65, 'speed_index': 0.60,
+        'notes': '2歳中距離最高峰。中山2000mでスタミナ・先行力が求められる。ダービー路線の一里塚として重要な位置付け。コーナー4回をうまく立ち回れる馬が有利。',
+        'aliases': ['ホープフルS', 'ホープフル'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.0,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '阪神ジュベナイルフィリーズ': {
+        'grade': 'G1', 'venue': '阪神', 'surface': 'turf', 'distance': 1600,
+        'month': [12],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.14, 'REAR': 0.08},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.05, 'stamina_index': 0.45, 'speed_index': 0.82,
+        'notes': '2歳牝馬最高峰。阪神外回り1600mで桜花賞へのステップ。スピード・キレが重要。新馬戦から直行する素質馬も上位争いに加わる。前哨戦の内容より絶対能力が問われる。',
+        'aliases': ['阪神JF', '阪神ジュベナイルF', 'ジュベナイルフィリーズ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.0,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'フェブラリーステークス': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'dirt', 'distance': 1600,
+        'month': [2],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.14, 'REAR': 0.04},
+        'pace_tendency': 'MH', 'pace_adj': 0.7,
+        'ability_weight': 1.15, 'stamina_index': 0.50, 'speed_index': 0.82,
+        'notes': '唯一の東京ダートG1。スタートの速さとコーナリングが重要。大外枠は不利になりやすい（砂をかぶる）。根岸S組・チャンピオンズC組が中心。ダート実績が最重要。',
+        'aliases': ['フェブラリーS', 'フェブラリー'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'チャンピオンズカップ': {
+        'grade': 'G1', 'venue': '中京', 'surface': 'dirt', 'distance': 1800,
+        'month': [12],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.16, 'REAR': 0.10},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.20, 'stamina_index': 0.62, 'speed_index': 0.75,
+        'notes': 'ダート中距離最高峰。中京1800mは直線が長く後方からも差しが届く。前走チェック重要。スタミナ・パワーとスピードのバランスが問われる。',
+        'aliases': ['チャンピオンズC', 'チャンピオンズカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['power', 'stamina', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    'かしわ記念': {
+        'grade': 'G1', 'venue': '船橋', 'surface': 'dirt', 'distance': 1600,
+        'month': [5],
+        'style_bias': {'FRONT': 0.12, 'MIDDLE': 0.16, 'REAR': 0.02},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.50, 'speed_index': 0.80,
+        'notes': '地方交流G1（JRA馬参戦）。先行有利の傾向。スピード・先行力が最重要。',
+        'aliases': ['かしわ記念', 'かしわきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'power'],
+        'draw_tendency': 'inner',
+    },
+    '帝王賞': {
+        'grade': 'G1', 'venue': '大井', 'surface': 'dirt', 'distance': 2000,
+        'month': [6],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.18, 'REAR': 0.06},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.15, 'stamina_index': 0.68, 'speed_index': 0.62,
+        'notes': '地方大井のダート2000m G1。大井の長い直線で差しも届く。JRA馬と地方馬の実力差が問われる一戦。',
+        'aliases': ['帝王賞', 'ていおうしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'power', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    'マイルチャンピオンシップ南部杯': {
+        'grade': 'G1', 'venue': '盛岡', 'surface': 'dirt', 'distance': 1600,
+        'month': [10],
+        'style_bias': {'FRONT': 0.10, 'MIDDLE': 0.14, 'REAR': 0.04},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.48, 'speed_index': 0.82,
+        'notes': '地方交流G1。盛岡のダート1600mはスピード重視。地方特有の砂質への適応が重要。',
+        'aliases': ['南部杯', 'なんぶはい', 'マイルCS南部杯'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'JBCスプリント': {
+        'grade': 'G1', 'venue': '各地', 'surface': 'dirt', 'distance': 1200,
+        'month': [11],
+        'style_bias': {'FRONT': 0.18, 'MIDDLE': 0.10, 'REAR': -0.04},
+        'pace_tendency': 'H', 'pace_adj': 0.7,
+        'ability_weight': 1.10, 'stamina_index': 0.30, 'speed_index': 0.92,
+        'notes': 'JBC開催地によってコース変化あり。ダートスプリント専門馬が有利。先行・ゲートスタートが最重要。',
+        'aliases': ['JBCスプリント'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'JBCクラシック': {
+        'grade': 'G1', 'venue': '各地', 'surface': 'dirt', 'distance': 2000,
+        'month': [11],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.16, 'REAR': 0.08},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.15, 'stamina_index': 0.68, 'speed_index': 0.65,
+        'notes': 'JBC開催地によってコース変化あり。ダート中距離の最高峰の一つ。',
+        'aliases': ['JBCクラシック'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'power', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    '東京大賞典': {
+        'grade': 'G1', 'venue': '大井', 'surface': 'dirt', 'distance': 2000,
+        'month': [12],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.18, 'REAR': 0.08},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.15, 'stamina_index': 0.68, 'speed_index': 0.62,
+        'notes': '年末ダート最高峰の一つ。大井2000mで前後から差しが届く。JRA勢有利だが地方馬の台頭もあり。',
+        'aliases': ['東京大賞典', 'とうきょうだいしょうてん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'power', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    # ============================================================
+    # G2 レース（主要）
+    # ============================================================
+    '中山記念': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 1800,
+        'month': [2],
+        'style_bias': {'FRONT': 0.10, 'MIDDLE': 0.22, 'REAR': 0.04},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.65, 'speed_index': 0.62,
+        'notes': '春のマイル・中距離路線の前哨戦。中山内回り1800mで先行・差し混戦。コーナリング技術が重要。',
+        'aliases': ['中山記念', 'なかやまきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '産経大阪杯': {
+        'grade': 'G2', 'venue': '阪神', 'surface': 'turf', 'distance': 2000,
+        'month': [4],
+        'style_bias': {'FRONT': -0.02, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.68, 'speed_index': 0.62,
+        'notes': '大阪杯（G1昇格後は大阪杯）。阪神内回り2000mで中距離最高峰のひとつ。先行も差しも届く。',
+        'aliases': ['大阪杯', 'おおさかはい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'stamina', 'speed'],
+        'draw_tendency': 'inner',
+    },
+    '大阪杯': {
+        'grade': 'G1', 'venue': '阪神', 'surface': 'turf', 'distance': 2000,
+        'month': [4],
+        'style_bias': {'FRONT': 0.02, 'MIDDLE': 0.16, 'REAR': 0.12},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.20, 'stamina_index': 0.70, 'speed_index': 0.65,
+        'notes': 'G1昇格後の春の中距離決定戦。阪神内回り2000mで先行有利傾向。前走宝塚・天皇賞組が中心。タフな先行争いを制した馬が台頭しやすい。',
+        'aliases': ['大阪杯', 'おおさかはい', '産経大阪杯'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'stamina', 'speed'],
+        'draw_tendency': 'inner',
+    },
+    '日経賞': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 2500,
+        'month': [3],
+        'style_bias': {'FRONT': 0.10, 'MIDDLE': 0.24, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.82, 'speed_index': 0.50,
+        'notes': '天皇賞春への最重要前哨戦。中山2500mで長距離適性を問う。スタミナ・コーナリングが重要。内枠有利傾向。',
+        'aliases': ['日経賞', 'にっけいしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 2.0,
+        'key_factors': ['stamina', 'corner', 'power'],
+        'draw_tendency': 'inner',
+    },
+    '阪神大賞典': {
+        'grade': 'G2', 'venue': '阪神', 'surface': 'turf', 'distance': 3000,
+        'month': [3],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.10, 'REAR': 0.12},
+        'pace_tendency': 'S', 'pace_adj': 0.7,
+        'ability_weight': 1.10, 'stamina_index': 0.90, 'speed_index': 0.42,
+        'notes': '天皇賞春への前哨戦（関西）。阪神3000mで長距離適性テスト。スタミナ・底力が問われる。スロー流れから上り競馬になることも。',
+        'aliases': ['阪神大賞典', 'はんしんだいしょうてん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 2.0,
+        'key_factors': ['stamina', 'power', 'corner'],
+        'draw_tendency': 'neutral',
+    },
+    'AJCC': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 2200,
+        'month': [1],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.22, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.74, 'speed_index': 0.55,
+        'notes': '年明け初戦として重要。中山内回り2200mで先行有利。スタミナ・先行力が問われる。',
+        'aliases': ['アメリカジョッキークラブカップ', 'AJCC'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'corner', 'power'],
+        'draw_tendency': 'inner',
+    },
+    '京都記念': {
+        'grade': 'G2', 'venue': '阪神', 'surface': 'turf', 'distance': 2200,
+        'month': [2],
+        'style_bias': {'FRONT': -0.02, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.74, 'speed_index': 0.58,
+        'notes': '大阪杯・宝塚記念への前哨戦。阪神2200m（京都改修中は代替開催）。バランス型が有利。',
+        'aliases': ['京都記念', 'きょうときねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'corner', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    '毎日王冠': {
+        'grade': 'G2', 'venue': '東京', 'surface': 'turf', 'distance': 1800,
+        'month': [10],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.16, 'REAR': 0.18},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.58, 'speed_index': 0.72,
+        'notes': '天皇賞秋への最重要前哨戦。東京1800mで差し有利。上がり競馬になりやすく瞬発力が最重要。',
+        'aliases': ['毎日王冠', 'まいにちおうかん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'neutral',
+    },
+    '府中牝馬ステークス': {
+        'grade': 'G2', 'venue': '東京', 'surface': 'turf', 'distance': 1800,
+        'month': [10],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.16, 'REAR': 0.18},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.58, 'speed_index': 0.72,
+        'notes': 'エリザベス女王杯への前哨戦（牝馬）。東京1800mで差し有利。牝馬特有の気性・仕上がりが重要。',
+        'aliases': ['府中牝馬S', '府中牝馬ステークス', 'ふちゅうひんばすてーくす'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'neutral',
+    },
+    '札幌記念': {
+        'grade': 'G2', 'venue': '札幌', 'surface': 'turf', 'distance': 2000,
+        'month': [8],
+        'style_bias': {'FRONT': 0.12, 'MIDDLE': 0.24, 'REAR': 0.00},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.60, 'speed_index': 0.58,
+        'notes': '夏の北海道G2。洋芝・小回りの札幌2000mで先行有利。外厩仕上げの馬や夏場に仕上がる馬が台頭する。洋芝適性が特に重要。',
+        'aliases': ['札幌記念', 'さっぽろきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 2.0,
+        'key_factors': ['corner', 'stamina', 'power'],
+        'draw_tendency': 'inner',
+    },
+    'オールカマー': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 2200,
+        'month': [9],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.22, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.74, 'speed_index': 0.55,
+        'notes': '天皇賞秋への前哨戦。中山内回り2200mで先行有利。スタミナ・先行力が問われる。',
+        'aliases': ['オールカマー', 'おーるかまー'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'corner', 'power'],
+        'draw_tendency': 'inner',
+    },
+    '神戸新聞杯': {
+        'grade': 'G2', 'venue': '中京', 'surface': 'turf', 'distance': 2200,
+        'month': [9],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.74, 'speed_index': 0.60,
+        'notes': '菊花賞への前哨戦（関西）。中京2200mで力のある差し馬が有利。スタミナ・末脚が重要。',
+        'aliases': ['神戸新聞杯', 'こうべしんぶんはい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['stamina', 'speed', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    'セントライト記念': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 2200,
+        'month': [9],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.20, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.74, 'speed_index': 0.55,
+        'notes': '菊花賞への前哨戦（関東）。中山内回り2200mで先行有利。コーナリング技術と先行力が問われる。',
+        'aliases': ['セントライト記念', 'せんとらいときねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '京都大賞典': {
+        'grade': 'G2', 'venue': '京都', 'surface': 'turf', 'distance': 2400,
+        'month': [10],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.08, 'REAR': 0.12},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.78, 'speed_index': 0.58,
+        'notes': '天皇賞秋・ジャパンカップへの前哨戦。京都外回り2400mで差し有利。スタミナ・末脚が問われる。',
+        'aliases': ['京都大賞典', 'きょうとだいしょうてん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'speed', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    'チャレンジカップ': {
+        'grade': 'G2', 'venue': '中京', 'surface': 'turf', 'distance': 2000,
+        'month': [11],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.68, 'speed_index': 0.62,
+        'notes': '重賞昇格後の秋の中距離。中京2000mは差しも届く。バランス型が有利。',
+        'aliases': ['チャレンジC', 'チャレンジカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['stamina', 'speed', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '中山牝馬ステークス': {
+        'grade': 'G3', 'venue': '中山', 'surface': 'turf', 'distance': 1800,
+        'month': [3],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.20, 'REAR': 0.06},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.60, 'speed_index': 0.60,
+        'notes': '牝馬の中山1800m重賞。コーナリング・先行力が問われる。',
+        'aliases': ['中山牝馬S', '中山牝馬ステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['corner', 'stamina', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'スプリングステークス': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 1800,
+        'month': [3],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.20, 'REAR': 0.06},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.62, 'speed_index': 0.62,
+        'notes': '皐月賞への前哨戦。中山内回り1800mでコーナリング・先行力が問われる。',
+        'aliases': ['スプリングS', 'スプリングステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '弥生賞': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 2000,
+        'month': [3],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.22, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.66, 'speed_index': 0.60,
+        'notes': '皐月賞への最重要前哨戦。中山2000mで先行有利。3歳馬の仕上がり早が台頭しやすい。',
+        'aliases': ['弥生賞', 'やよいしょう', 'ディープインパクト記念'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    'ローズステークス': {
+        'grade': 'G2', 'venue': '中京', 'surface': 'turf', 'distance': 1800,
+        'month': [9],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.58, 'speed_index': 0.68,
+        'notes': '秋華賞への前哨戦（関西牝馬）。中京1800mで差し有利の傾向。',
+        'aliases': ['ローズS', 'ローズステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'stamina', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '紫苑ステークス': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 2000,
+        'month': [9],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.18, 'REAR': 0.08},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.65, 'speed_index': 0.60,
+        'notes': '秋華賞への前哨戦（関東牝馬）。中山2000mで先行・差し混戦。',
+        'aliases': ['紫苑S', '紫苑ステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    # ============================================================
+    # G2 ダートレース（主要）
+    # ============================================================
+    '東海ステークス': {
+        'grade': 'G2', 'venue': '中京', 'surface': 'dirt', 'distance': 1800,
+        'month': [1],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.16, 'REAR': 0.08},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.62, 'speed_index': 0.72,
+        'notes': 'チャンピオンズカップへの最重要前哨戦。中京ダート1800mで後半力が問われる。',
+        'aliases': ['東海S', '東海ステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['power', 'stamina', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    'シリウスステークス': {
+        'grade': 'G3', 'venue': '阪神', 'surface': 'dirt', 'distance': 2000,
+        'month': [10],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.16, 'REAR': 0.06},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.65, 'speed_index': 0.62,
+        'notes': 'JBCクラシックへの前哨戦。阪神ダート2000mでスタミナ・パワーが重要。',
+        'aliases': ['シリウスS', 'シリウスステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['stamina', 'power', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    # ============================================================
+    # G3 レース（主要・芝）
+    # ============================================================
+    '小倉記念': {
+        'grade': 'G3', 'venue': '小倉', 'surface': 'turf', 'distance': 2000,
+        'month': [8],
+        'style_bias': {'FRONT': 0.14, 'MIDDLE': 0.22, 'REAR': 0.00},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.62, 'speed_index': 0.62,
+        'notes': '夏の小倉2000m重賞。先行有利のコースで先行力・コーナリング技術が問われる。',
+        'aliases': ['小倉記念', 'こくらきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'speed', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '福島記念': {
+        'grade': 'G3', 'venue': '福島', 'surface': 'turf', 'distance': 2000,
+        'month': [11],
+        'style_bias': {'FRONT': 0.16, 'MIDDLE': 0.26, 'REAR': 0.02},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.62, 'speed_index': 0.58,
+        'notes': '福島の秋2000m重賞。小回りコースで先行有利。先行力・コーナリングが問われる。',
+        'aliases': ['福島記念', 'ふくしまきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '中京記念': {
+        'grade': 'G3', 'venue': '中京', 'surface': 'turf', 'distance': 1600,
+        'month': [7],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.48, 'speed_index': 0.78,
+        'notes': '夏の中京マイル重賞。差し有利の中京1600mでスピード・末脚が重要。',
+        'aliases': ['中京記念', 'ちゅうきょうきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'neutral',
+    },
+    '新潟大賞典': {
+        'grade': 'G3', 'venue': '新潟', 'surface': 'turf', 'distance': 2000,
+        'month': [5],
+        'style_bias': {'FRONT': -0.08, 'MIDDLE': 0.10, 'REAR': 0.26},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.00, 'stamina_index': 0.58, 'speed_index': 0.65,
+        'notes': '新潟外回り2000m。直線が長く差し・追い込みが決まりやすい特殊コース。末脚能力が最重要。',
+        'aliases': ['新潟大賞典', 'にいがただいしょうてん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['straight', 'speed', 'agility'],
+        'draw_tendency': 'outer',
+    },
+    '七夕賞': {
+        'grade': 'G3', 'venue': '福島', 'surface': 'turf', 'distance': 2000,
+        'month': [7],
+        'style_bias': {'FRONT': 0.14, 'MIDDLE': 0.24, 'REAR': 0.02},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.62, 'speed_index': 0.56,
+        'notes': '夏の福島2000m重賞。小回りで先行有利。',
+        'aliases': ['七夕賞', 'たなばたしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '鳴尾記念': {
+        'grade': 'G3', 'venue': '中京', 'surface': 'turf', 'distance': 2000,
+        'month': [5, 6],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.68, 'speed_index': 0.60,
+        'notes': '宝塚記念への前哨戦。中京2000mで後半力が問われる。',
+        'aliases': ['鳴尾記念', 'なるおきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['stamina', 'speed', 'corner'],
+        'draw_tendency': 'neutral',
+    },
+    '金鯱賞': {
+        'grade': 'G2', 'venue': '中京', 'surface': 'turf', 'distance': 2000,
+        'month': [3],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.68, 'speed_index': 0.65,
+        'notes': '大阪杯への前哨戦。中京2000mで差し有利の舞台。前走の内容が重要。',
+        'aliases': ['金鯱賞', 'きんこしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'stamina', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '中山金杯': {
+        'grade': 'G3', 'venue': '中山', 'surface': 'turf', 'distance': 2000,
+        'month': [1],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.22, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.66, 'speed_index': 0.58,
+        'notes': '年明け初戦のG3。中山内回り2000mで先行有利。ハンデ戦で斤量の読みが重要。',
+        'aliases': ['中山金杯', 'なかやまきんぱい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '京都金杯': {
+        'grade': 'G3', 'venue': '中京', 'surface': 'turf', 'distance': 1600,
+        'month': [1],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.48, 'speed_index': 0.78,
+        'notes': '年明け初戦のマイルG3（代替開催中は中京）。ハンデ戦で穴馬が台頭しやすい。',
+        'aliases': ['京都金杯', 'きょうときんぱい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'agility', 'gate'],
+        'draw_tendency': 'neutral',
+    },
+    '関屋記念': {
+        'grade': 'G3', 'venue': '新潟', 'surface': 'turf', 'distance': 1600,
+        'month': [8],
+        'style_bias': {'FRONT': -0.08, 'MIDDLE': 0.12, 'REAR': 0.20},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.00, 'stamina_index': 0.48, 'speed_index': 0.82,
+        'notes': '夏の新潟マイル重賞。長い直線で差し・追い込みが決まりやすい。末脚能力が最重要。',
+        'aliases': ['関屋記念', 'せきやきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'outer',
+    },
+    '富士ステークス': {
+        'grade': 'G2', 'venue': '東京', 'surface': 'turf', 'distance': 1600,
+        'month': [10],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.16, 'REAR': 0.18},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.48, 'speed_index': 0.82,
+        'notes': 'マイルチャンピオンシップへの前哨戦。東京1600mで差し有利。',
+        'aliases': ['富士S', '富士ステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'agility', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    'スワンステークス': {
+        'grade': 'G2', 'venue': '京都', 'surface': 'turf', 'distance': 1400,
+        'month': [10, 11],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.14, 'REAR': 0.10},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.42, 'speed_index': 0.84,
+        'notes': 'マイルチャンピオンシップへの前哨戦（1400m組）。スピード・先行力が重要。',
+        'aliases': ['スワンS', 'スワンステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'ターコイズステークス': {
+        'grade': 'G3', 'venue': '中山', 'surface': 'turf', 'distance': 1600,
+        'month': [12],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.16, 'REAR': 0.10},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.50, 'speed_index': 0.78,
+        'notes': '牝馬の中山マイル重賞。ハンデ戦で荒れやすい。',
+        'aliases': ['ターコイズS', 'ターコイズステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'agility', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '愛知杯': {
+        'grade': 'G3', 'venue': '中京', 'surface': 'turf', 'distance': 2000,
+        'month': [1],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.65, 'speed_index': 0.62,
+        'notes': '牝馬の中京2000m重賞。差しも届く舞台。',
+        'aliases': ['愛知杯', 'あいちはい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['stamina', 'speed', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    # ============================================================
+    # G3 ダートレース（主要）
+    # ============================================================
+    '根岸ステークス': {
+        'grade': 'G3', 'venue': '東京', 'surface': 'dirt', 'distance': 1400,
+        'month': [1, 2],
+        'style_bias': {'FRONT': 0.10, 'MIDDLE': 0.12, 'REAR': 0.00},
+        'pace_tendency': 'H', 'pace_adj': 0.6,
+        'ability_weight': 1.05, 'stamina_index': 0.38, 'speed_index': 0.88,
+        'notes': 'フェブラリーステークスへの前哨戦（ダートスプリント組）。東京ダート1400mで先行力・速いスタートが重要。',
+        'aliases': ['根岸S', '根岸ステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'みやこステークス': {
+        'grade': 'G3', 'venue': '京都', 'surface': 'dirt', 'distance': 1800,
+        'month': [11],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.14, 'REAR': 0.02},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.58, 'speed_index': 0.70,
+        'notes': 'チャンピオンズカップへの前哨戦。京都ダート1800mで先行力・スピードが重要。',
+        'aliases': ['みやこS', 'みやこステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'power', 'stamina'],
+        'draw_tendency': 'inner',
+    },
+    'プロキオンステークス': {
+        'grade': 'G3', 'venue': '中京', 'surface': 'dirt', 'distance': 1400,
+        'month': [7],
+        'style_bias': {'FRONT': 0.10, 'MIDDLE': 0.12, 'REAR': 0.00},
+        'pace_tendency': 'H', 'pace_adj': 0.6,
+        'ability_weight': 1.00, 'stamina_index': 0.38, 'speed_index': 0.88,
+        'notes': '夏のダートスプリント重賞。中京ダート1400mで先行・スピードが最重要。',
+        'aliases': ['プロキオンS', 'プロキオンステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'マーキュリーカップ': {
+        'grade': 'G3', 'venue': '盛岡', 'surface': 'dirt', 'distance': 2000,
+        'month': [7],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.16, 'REAR': 0.06},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.65, 'speed_index': 0.62,
+        'notes': '地方交流G3。盛岡ダート2000mでスタミナ・先行力が問われる。',
+        'aliases': ['マーキュリーC', 'マーキュリーカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'power', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    'レパードステークス': {
+        'grade': 'G3', 'venue': '新潟', 'surface': 'dirt', 'distance': 1800,
+        'month': [8],
+        'style_bias': {'FRONT': -0.02, 'MIDDLE': 0.12, 'REAR': 0.14},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.58, 'speed_index': 0.68,
+        'notes': '3歳ダートG3。新潟ダート1800mで後半力・末脚が問われる。3歳馬の素質比較。',
+        'aliases': ['レパードS', 'レパードステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['power', 'stamina', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    'ユニコーンステークス': {
+        'grade': 'G3', 'venue': '東京', 'surface': 'dirt', 'distance': 1600,
+        'month': [6],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.14, 'REAR': 0.04},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.00, 'stamina_index': 0.50, 'speed_index': 0.80,
+        'notes': '3歳ダートマイルG3。東京ダート1600mで先行力・スピードが問われる。',
+        'aliases': ['ユニコーンS', 'ユニコーンステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['speed', 'gate', 'power'],
+        'draw_tendency': 'inner',
+    },
+    '武蔵野ステークス': {
+        'grade': 'G3', 'venue': '東京', 'surface': 'dirt', 'distance': 1600,
+        'month': [11],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.14, 'REAR': 0.04},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.50, 'speed_index': 0.80,
+        'notes': 'チャンピオンズカップ・フェブラリーへの前哨戦。東京ダート1600mで先行力・スピードが重要。',
+        'aliases': ['武蔵野S', '武蔵野ステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    # ============================================================
+    # その他主要重賞（追加）
+    # ============================================================
+    'ダービー卿チャレンジトロフィー': {
+        'grade': 'G3', 'venue': '中山', 'surface': 'turf', 'distance': 1600,
+        'month': [4],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.16, 'REAR': 0.08},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.50, 'speed_index': 0.78,
+        'notes': '中山マイル重賞（ハンデ）。コーナリング・先行力が問われる。',
+        'aliases': ['ダービー卿CT', 'ダービー卿チャレンジ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'corner', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    'ニュージーランドトロフィー': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 1600,
+        'month': [4],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.16, 'REAR': 0.10},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.48, 'speed_index': 0.80,
+        'notes': 'NHKマイルカップへの前哨戦（3歳マイル）。中山内回り1600mで先行・差し混戦。',
+        'aliases': ['NZT', 'ニュージーランドトロフィー'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'NHKマイルカップ': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 1600,
+        'month': [5],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.18},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.48, 'speed_index': 0.84,
+        'notes': '3歳マイル最高峰。東京1600mで差し・瞬発力が問われる。外国産馬・地方交流馬も参戦。',
+        'aliases': ['NHKマイルC', 'NHKマイルカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'agility', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '青葉賞': {
+        'grade': 'G2', 'venue': '東京', 'surface': 'turf', 'distance': 2400,
+        'month': [4, 5],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.12, 'REAR': 0.14},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.78, 'speed_index': 0.60,
+        'notes': 'ダービーへの最重要前哨戦（関東）。東京2400mで差し有利。スタミナ・末脚が問われる。',
+        'aliases': ['青葉賞', 'あおばしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['stamina', 'speed', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '京都新聞杯': {
+        'grade': 'G2', 'venue': '中京', 'surface': 'turf', 'distance': 2200,
+        'month': [5],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.12, 'REAR': 0.14},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.74, 'speed_index': 0.60,
+        'notes': 'ダービーへの前哨戦（関西）。中京2200mで差し有利。スタミナ・末脚が重要。',
+        'aliases': ['京都新聞杯', 'きょうとしんぶんはい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['stamina', 'speed', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    'フラワーカップ': {
+        'grade': 'G3', 'venue': '中山', 'surface': 'turf', 'distance': 1800,
+        'month': [3],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.18, 'REAR': 0.08},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.60, 'speed_index': 0.65,
+        'notes': 'オークスへの前哨戦（牝馬）。中山内回り1800mで先行・差し混戦。',
+        'aliases': ['フラワーC', 'フラワーカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    'チューリップ賞': {
+        'grade': 'G2', 'venue': '阪神', 'surface': 'turf', 'distance': 1600,
+        'month': [3],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.14, 'REAR': 0.10},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.05, 'stamina_index': 0.48, 'speed_index': 0.80,
+        'notes': '桜花賞への最重要前哨戦。阪神外回り1600mでスピード・キレが問われる。',
+        'aliases': ['チューリップ賞', 'チューリップしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'フィリーズレビュー': {
+        'grade': 'G2', 'venue': '阪神', 'surface': 'turf', 'distance': 1400,
+        'month': [3],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.12, 'REAR': 0.08},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.42, 'speed_index': 0.84,
+        'notes': '桜花賞への前哨戦（スプリント組）。阪神1400mで先行力・スピードが最重要。',
+        'aliases': ['フィリーズレビュー'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'アーリントンカップ': {
+        'grade': 'G3', 'venue': '阪神', 'surface': 'turf', 'distance': 1600,
+        'month': [4],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.14, 'REAR': 0.10},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.48, 'speed_index': 0.82,
+        'notes': 'NHKマイルカップへの前哨戦。阪神外回り1600mでスピード・キレが問われる。',
+        'aliases': ['アーリントンC', 'アーリントンカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'スプリングステークス': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 1800,
+        'month': [3],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.18, 'REAR': 0.08},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.60, 'speed_index': 0.62,
+        'notes': '皐月賞への前哨戦。中山内回り1800mでコーナリング・先行力が問われる。',
+        'aliases': ['スプリングS'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '共同通信杯': {
+        'grade': 'G3', 'venue': '東京', 'surface': 'turf', 'distance': 1800,
+        'month': [2],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.58, 'speed_index': 0.72,
+        'notes': '3歳クラシック路線への登竜門。東京1800mで差し有利。上がり能力が最重要。',
+        'aliases': ['共同通信杯', 'きょうどうつうしんはい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'neutral',
+    },
+    'きさらぎ賞': {
+        'grade': 'G3', 'venue': '中京', 'surface': 'turf', 'distance': 1800,
+        'month': [2],
+        'style_bias': {'FRONT': -0.02, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.60, 'speed_index': 0.68,
+        'notes': '3歳クラシック路線の前哨戦（関西）。中京1800mで差しも届く。上がり能力が問われる。',
+        'aliases': ['きさらぎ賞', 'きさらぎしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'neutral',
+    },
+    'クイーンカップ': {
+        'grade': 'G3', 'venue': '東京', 'surface': 'turf', 'distance': 1600,
+        'month': [2],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.48, 'speed_index': 0.80,
+        'notes': '牝馬クラシック路線への前哨戦。東京1600mで差し有利。上がり能力が問われる。',
+        'aliases': ['クイーンC', 'クイーンカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'agility', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+}
+
+# =============================================================================
+# JRA 重賞データ – エイリアス逆引きインデックス
+# =============================================================================
+_GRADED_RACE_ALIAS_INDEX: Dict[str, str] = {}
+for _rname, _rdat in JRA_GRADED_RACES_DATA.items():
+    _GRADED_RACE_ALIAS_INDEX[_rname] = _rname
+    for _al in (_rdat.get('aliases') or []):
+        _GRADED_RACE_ALIAS_INDEX[_al] = _rname
+
+
+def _detect_graded_race(meta: Dict[str, str]) -> Optional[Dict]:
+    """meta からレース名を解析して JRA_GRADED_RACES_DATA の該当レース辞書を返す。
+
+    マッチしなければ None を返す。
+
+    検索順:
+      1. meta の 'race_name' / 'race' / 'course_info' / 'class_name' キーをそれぞれ走査
+      2. エイリアスインデックス（部分一致でも可）で最長マッチを採用
+      3. 距離・馬場のクロスチェックで誤検出を排除（距離が±200m以上離れている場合は不採用）
+    """
+    meta = meta or {}
+    candidate_keys = ['race_name', 'race', 'course_info', 'class_name', 'grade']
+    texts = []
+    for k in candidate_keys:
+        v = str(meta.get(k, '') or '')
+        if v:
+            texts.append(v)
+    search_text = ' '.join(texts).replace('　', ' ')
+
+    # 完全一致 → エイリアス完全一致 → 部分一致 の順で試みる
+    best_key: Optional[str] = None
+    best_len = 0
+
+    for alias, canonical in _GRADED_RACE_ALIAS_INDEX.items():
+        if alias in search_text:
+            if len(alias) > best_len:
+                best_len = len(alias)
+                best_key = canonical
+
+    if best_key is None:
+        return None
+
+    race_data = JRA_GRADED_RACES_DATA.get(best_key)
+    if race_data is None:
+        return None
+
+    # 距離クロスチェック（meta に距離情報があれば）
+    try:
+        dist_m, surface = _meta_distance_surface(meta)
+        if np.isfinite(dist_m) and dist_m > 0:
+            expected_dist = int(race_data.get('distance', 0) or 0)
+            if expected_dist > 0 and abs(float(dist_m) - float(expected_dist)) > 300.0:
+                # 距離が300m以上ずれている場合は別レースと判断し不採用
+                return None
+    except Exception:
+        pass
+
+    result = dict(race_data)
+    result['_matched_name'] = best_key
+    return result
+
+
+def compute_graded_race_bonus(
+    df: pd.DataFrame,
+    meta: Dict[str, str],
+    params: Optional[dict] = None,
+) -> pd.DataFrame:
+    """重賞特化傾向に基づいて AnchorScore および関連スコアを補正する。
+
+    重賞レースが検出された場合のみ補正を行う。
+
+    補正内容:
+      1. style_bias 補正: 脚質（RunningStyleLabel）に応じた AnchorScore 加点
+      2. stamina 補正: StaminaScore と race の stamina_index の乖離によるペナルティ/ボーナス
+      3. speed 補正: SpeedScore と race の speed_index の乖離によるペナルティ/ボーナス
+      4. key_factors 補正: レース固有の key_factors が高い馬へのボーナス
+      5. repeat_winner_bonus: 同コース実績のある馬へのボーナス（course_track_exp 列があれば）
+      6. class_jump_penalty: 格上げ初戦馬へのペナルティ（class_jump 列があれば）
+
+    Returns:
+        補正済み DataFrame（元の df をコピーして修正）
+    """
+    params = params or {}
+    race_data = _detect_graded_race(meta)
+    if race_data is None:
+        return df  # 重賞でなければ無補正
+
+    df = df.copy()
+    graded_params = (params.get('graded_race_params', {}) or {})
+    enabled = bool(graded_params.get('enabled', True))
+    if not enabled:
+        return df
+
+    style_bias_scale = float(graded_params.get('style_bias_scale', 3.0) or 3.0)
+    stamina_scale    = float(graded_params.get('stamina_scale', 2.5) or 2.5)
+    speed_scale      = float(graded_params.get('speed_scale', 2.0) or 2.0)
+    key_factor_scale = float(graded_params.get('key_factor_scale', 1.5) or 1.5)
+    bonus_cap        = float(graded_params.get('bonus_cap', 6.0) or 6.0)
+    penalty_cap      = float(graded_params.get('penalty_cap', 4.0) or 4.0)
+
+    style_bias      = race_data.get('style_bias', {}) or {}
+    stamina_index   = float(race_data.get('stamina_index', 0.5) or 0.5)
+    speed_index     = float(race_data.get('speed_index', 0.5) or 0.5)
+    key_factors     = list(race_data.get('key_factors', []) or [])
+    repeat_bonus    = float(race_data.get('repeat_winner_bonus', 0.0) or 0.0)
+    class_pen       = float(race_data.get('class_jump_penalty', 0.0) or 0.0)
+
+    anchor_col = 'AnchorScore'
+    if anchor_col not in df.columns:
+        df[anchor_col] = 50.0
+
+    # ---- 1. 脚質スタイルバイアス補正 ----
+    if style_bias:
+        style_col = 'RunningStyleLabel'
+        if style_col in df.columns:
+            for style_key, bias_val in style_bias.items():
+                mask = df[style_col].astype(str).str.upper() == str(style_key).upper()
+                adj = float(bias_val) * style_bias_scale
+                adj = float(np.clip(adj, -penalty_cap, bonus_cap))
+                df.loc[mask, anchor_col] = _num_series(df.loc[mask, anchor_col], 50.0, index=df.loc[mask].index) + adj
+
+    # ---- 2. スタミナ適性補正 ----
+    stamina_col = 'StaminaScore'
+    if stamina_col in df.columns:
+        stam = _num_series(df[stamina_col], 50.0, index=df.index)
+        # StaminaScore 50=平均、高いほど長距離向き。差分を重賞のstamina_index基準で補正
+        stam_norm = (stam - 50.0) / 25.0  # -2.0 〜 +2.0
+        stam_adj  = stam_norm * (stamina_index - 0.5) * stamina_scale
+        stam_adj  = pd.Series(np.where(np.isfinite(stam_adj.values), np.clip(stam_adj.values, -penalty_cap, bonus_cap), 0.0), index=stam_adj.index)
+        df[anchor_col] = _num_series(df[anchor_col], 50.0, index=df.index) + stam_adj
+
+    # ---- 3. スピード適性補正 ----
+    speed_col = 'SpeedScore'
+    if speed_col not in df.columns:
+        speed_col = 'speed_max'
+    if speed_col in df.columns:
+        spd = _num_series(df[speed_col], 50.0, index=df.index)
+        spd_norm  = (spd - 50.0) / 25.0
+        spd_adj   = spd_norm * (speed_index - 0.5) * speed_scale
+        spd_adj   = pd.Series(np.where(np.isfinite(spd_adj.values), np.clip(spd_adj.values, -penalty_cap, bonus_cap), 0.0), index=spd_adj.index)
+        df[anchor_col] = _num_series(df[anchor_col], 50.0, index=df.index) + spd_adj
+
+    # ---- 4. key_factors 補正 ----
+    key_factor_col_map = {
+        'stamina': 'StaminaScore',
+        'speed': ['SpeedScore', 'speed_max'],
+        'corner': 'CornerScore',
+        'power': 'PowerScore',
+        'gate': 'GateFit',
+        'agility': 'AgilityScore',
+        'straight': 'StraightScore',
+    }
+    for kf in key_factors:
+        cols = key_factor_col_map.get(kf, [])
+        if isinstance(cols, str):
+            cols = [cols]
+        for col in cols:
+            if col in df.columns:
+                kf_val = _num_series(df[col], 50.0, index=df.index)
+                kf_adj = (kf_val - 50.0) / 25.0 * key_factor_scale
+                kf_adj = pd.Series(np.where(np.isfinite(kf_adj.values), np.clip(kf_adj.values, -(penalty_cap*0.5), (bonus_cap*0.5)), 0.0), index=kf_adj.index)
+                df[anchor_col] = _num_series(df[anchor_col], 50.0, index=df.index) + kf_adj
+                break
+
+    # ---- 5. リピーターボーナス ----
+    if repeat_bonus > 0:
+        for col in ['course_track_exp', 'same_course_win', 'venue_win']:
+            if col in df.columns:
+                rep_mask = _num_series(df[col], 0.0, index=df.index) > 0
+                df.loc[rep_mask, anchor_col] = _num_series(df.loc[rep_mask, anchor_col], 50.0, index=df.loc[rep_mask].index) + repeat_bonus
+                break
+
+    # ---- 6. 格上げ初戦ペナルティ ----
+    if class_pen > 0:
+        for col in ['class_jump', 'class_up', 'is_class_jump']:
+            if col in df.columns:
+                jump_mask = _num_series(df[col], 0.0, index=df.index) > 0
+                df.loc[jump_mask, anchor_col] = _num_series(df.loc[jump_mask, anchor_col], 50.0, index=df.loc[jump_mask].index) - class_pen
+                break
+
+    # ---- AnchorScore をクリップ（0-100）----
+    df[anchor_col] = _clip0100(_num_series(df[anchor_col], 50.0, index=df.index))
+
+    # ---- 補正フラグを記録 ----
+    df['_graded_race_bonus_applied'] = True
+    df['_graded_race_name']          = race_data.get('_matched_name', '')
+    df['_graded_race_grade']         = race_data.get('grade', '')
+
+    return df
+
+
+def _bam_section_graded_race_analysis(
+    df: pd.DataFrame,
+    meta: Dict[str, str],
+    anchor_num: str,
+    params: Optional[dict] = None,
+) -> str:
+    """重賞特化傾向セクションを Markdown 文字列で返す。
+
+    重賞レースが検出された場合のみ詳細セクションを出力し、
+    一般レースの場合は空文字列を返す（出力に影響しない）。
+    """
+    race_data = _detect_graded_race(meta)
+    if race_data is None:
+        return ''
+
+    grade       = str(race_data.get('grade', ''))
+    race_name   = str(race_data.get('_matched_name', '重賞'))
+    venue       = str(race_data.get('venue', ''))
+    surface_raw = str(race_data.get('surface', ''))
+    distance    = int(race_data.get('distance', 0) or 0)
+    surface_jp  = '芝' if surface_raw == 'turf' else 'ダート' if surface_raw == 'dirt' else surface_raw
+    pace_tend   = str(race_data.get('pace_tendency', 'M'))
+    style_bias  = race_data.get('style_bias', {}) or {}
+    stamina_idx = float(race_data.get('stamina_index', 0.5) or 0.5)
+    speed_idx   = float(race_data.get('speed_index', 0.5) or 0.5)
+    key_factors = list(race_data.get('key_factors', []) or [])
+    notes       = str(race_data.get('notes', '') or '')
+    draw_tend   = str(race_data.get('draw_tendency', 'neutral') or 'neutral')
+    month_list  = race_data.get('month', []) or []
+
+    out = f'## 【重賞特化分析】{grade}: {race_name}\n\n'
+
+    # --- 基本情報テーブル ---
+    out += '### レース基本情報\n'
+    out += '| 項目 | 内容 |\n'
+    out += '|---|---|\n'
+    out += f'| グレード | **{grade}** |\n'
+    out += f'| 条件 | {venue} {surface_jp} {distance}m |\n'
+    pace_jp = {'H': 'ハイ', 'MH': 'ミドルハイ', 'M': 'ミドル', 'ML': 'ミドルロー', 'S': 'スロー'}.get(pace_tend, pace_tend)
+    out += f'| ペース傾向 | {pace_jp} |\n'
+    draw_jp = {'inner': '内枠有利', 'outer': '外枠有利', 'neutral': '枠不問'}.get(draw_tend, draw_tend)
+    out += f'| 枠順傾向 | {draw_jp} |\n'
+    if month_list:
+        out += f'| 施行月 | {", ".join(str(m)+"月" for m in month_list)} |\n'
+    out += '\n'
+
+    # --- 脚質傾向 ---
+    out += '### 脚質傾向（重賞固有バイアス）\n'
+    out += '| 脚質 | バイアス | 評価 |\n'
+    out += '|---|---:|---|\n'
+    style_jp = {'FRONT': '先行', 'MIDDLE': '差し', 'REAR': '追い込み'}
+    for style_key in ['FRONT', 'MIDDLE', 'REAR']:
+        bias_val = float(style_bias.get(style_key, 0.0))
+        bar = '◎' if bias_val >= 0.20 else '○' if bias_val >= 0.05 else '△' if bias_val >= -0.05 else '▲' if bias_val >= -0.20 else '×'
+        out += f'| {style_jp.get(style_key, style_key)} | {bias_val:+.2f} | {bar} |\n'
+    out += '\n'
+
+    # --- 要求適性 ---
+    out += '### 要求適性指数\n'
+    out += '| 適性 | 指数 | コメント |\n'
+    out += '|---|---:|---|\n'
+    stam_lv = 'very high' if stamina_idx >= 0.80 else 'high' if stamina_idx >= 0.65 else 'medium' if stamina_idx >= 0.45 else 'low'
+    spd_lv  = 'very high' if speed_idx  >= 0.80 else 'high' if speed_idx  >= 0.65 else 'medium' if speed_idx  >= 0.45 else 'low'
+    stam_jp = {'very high': '最重要', 'high': '重要', 'medium': '標準', 'low': '軽微'}
+    spd_jp  = stam_jp
+    out += f'| スタミナ | {stamina_idx:.2f} | {stam_jp[stam_lv]} |\n'
+    out += f'| スピード | {speed_idx:.2f} | {spd_jp[spd_lv]} |\n'
+    if key_factors:
+        kf_jp = {'stamina': 'スタミナ', 'speed': 'スピード', 'corner': 'コーナリング',
+                 'power': 'パワー', 'gate': 'ゲート', 'agility': '機動力', 'straight': '直線適性'}
+        out += f'| キーファクター | — | {", ".join(kf_jp.get(kf, kf) for kf in key_factors)} |\n'
+    out += '\n'
+
+    # --- クラス別ラップ統計（重賞 class_id=5）---
+    try:
+        pace_stats = _lookup_course_class_pace(venue, surface_raw, distance, 5)
+        if pace_stats:
+            out += '### 重賞クラス平均ラップ（良馬場）\n'
+            out += '| 項目 | 数値 |\n'
+            out += '|---|---:|\n'
+            out += f'| 前半3F | {pace_stats["front3f"]:.2f}s |\n'
+            out += f'| 後半3F | {pace_stats["back3f"]:.2f}s |\n'
+            out += f'| 前傾度 | {pace_stats["pace_dev"]:+.2f}s |\n'
+            out += f'| F6（坂区間） | {pace_stats["f6"]:.2f}s |\n'
+            out += f'| サンプル | {pace_stats.get("race_count","-")}レース / {pace_stats.get("horse_count","-")}頭 |\n'
+            if pace_stats.get('note'):
+                out += f'| 備考 | {pace_stats["note"]} |\n'
+            out += '\n'
+            # 全クラス比較（前傾度推移）
+            try:
+                out += '**クラス別前傾度推移（参考）**\n\n'
+                out += '| クラス | 前半3F | 後半3F | 前傾度 |\n'
+                out += '|---|---:|---:|---:|\n'
+                CLASS_LABELS_JP = {0: '未勝利', 1: '1勝', 2: '2勝', 3: '3勝', 4: 'OP/L', 5: '重賞'}
+                for cid_show in range(6):
+                    ref = _lookup_course_class_pace(venue, surface_raw, distance, cid_show)
+                    if ref:
+                        marker = ' ←' if cid_show == 5 else ''
+                        out += f'| {CLASS_LABELS_JP[cid_show]} | {ref["front3f"]:.2f} | {ref["back3f"]:.2f} | {ref["pace_dev"]:+.2f}{marker} |\n'
+                out += '\n'
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # --- 重賞固有コメント ---
+    if notes:
+        out += '### 重賞傾向メモ\n'
+        out += f'> {notes}\n\n'
+
+    # --- 出走馬への適性評価サマリー ---
+    try:
+        out += '### 出走馬 重賞適性サマリー\n'
+        sdf = df.copy()
+        style_col = 'RunningStyleLabel'
+        has_style = style_col in sdf.columns
+
+        rows = []
+        for _, row in sdf.iterrows():
+            num  = str(row.get('num', ''))
+            name = str(row.get('name', ''))
+            sas  = float(_num_scalar(row.get('AnchorScore', 50.0), 50.0))
+
+            # 脚質評価
+            style_eval = ''
+            if has_style:
+                st = str(row.get(style_col, '')).upper()
+                bv = float(style_bias.get(st, 0.0))
+                style_eval = '◎' if bv >= 0.20 else '○' if bv >= 0.05 else '△' if bv >= -0.05 else '▲'
+            else:
+                style_eval = '—'
+
+            # スタミナ評価
+            stam_score = float(_num_scalar(row.get('StaminaScore', 50.0), 50.0))
+            stam_match = '◎' if (abs(stam_score - 50) < 5 and stamina_idx >= 0.7) or (stam_score >= 60 and stamina_idx >= 0.7) else \
+                         '○' if stam_score >= 55 and stamina_idx >= 0.5 else '△'
+
+            rows.append((num, name, f'{sas:.1f}', style_eval, stam_match))
+
+        # AnchorScore 降順にソート
+        rows.sort(key=lambda x: float(x[2]), reverse=True)
+        out += '| 馬番 | 馬名 | AnchorScore | 脚質適合 | スタミナ適合 |\n'
+        out += '|---|---|---:|---:|---:|\n'
+        for r in rows[:8]:
+            out += f'| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} |\n'
+        out += '\n'
+    except Exception:
+        out += '- 適性サマリー: 算出失敗\n\n'
+
+    return out
 
 
 def _course_patch(*, style: Optional[Dict[str, float]] = None, straight: float = 0.0, corner: float = 0.0,
@@ -12511,8 +15497,452 @@ def _resolve_course_profile(meta: Dict[str, str]) -> tuple[str, str, dict]:
         profile['month'] = float(month) if month else np.nan
         profile['tokyo1400'] = 1.0
 
+    # ---- 全競馬場共通: JRA_ALL_COURSE_CLASS_PACE_DATA からクラス別ラップ参照 ----
+    # 東京1400m以外でも class_id / front3f_ref / back3f_ref / pace_dev_ref / f6_ref を補完する
+    if 'front3f_ref' not in profile or not np.isfinite(float(profile.get('front3f_ref', np.nan))):
+        if not hasattr(dist, '__float__'):
+            pass
+        else:
+            try:
+                dist_int = int(float(dist)) if (np.isfinite(float(dist)) and float(dist) > 0) else 0
+                all_class_id = _infer_race_class_id(meta)
+                if dist_int > 0 and venue:
+                    all_pace_ref = _lookup_course_class_pace(venue, surface or 'turf', dist_int, all_class_id)
+                    if all_pace_ref:
+                        profile['front3f_ref']    = float(all_pace_ref.get('front3f', np.nan))
+                        profile['back3f_ref']     = float(all_pace_ref.get('back3f',  np.nan))
+                        profile['pace_dev_ref']   = float(all_pace_ref.get('pace_dev', np.nan))
+                        profile['f6_ref']         = float(all_pace_ref.get('f6', np.nan))
+                        profile['race_count_ref'] = int(all_pace_ref.get('race_count', 0))
+                        profile['horse_count_ref']= int(all_pace_ref.get('horse_count', 0))
+                        if 'class_id' not in profile:
+                            profile['class_id'] = float(all_class_id) if all_class_id >= 0 else np.nan
+            except Exception:
+                pass
+
     return venue, surface, profile
 
+
+# =============================================================================
+# JRA 全競馬場×クラス別ラップ参照ヘルパー関数 (v1.34)
+# =============================================================================
+
+def resolve_class_pace_ref(
+    meta: Dict[str, str],
+    venue: str = '',
+    surface: str = '',
+    dist_m: float = 0.0,
+    class_id: int = -1,
+) -> Dict[str, object]:
+    """JRA_ALL_COURSE_CLASS_PACE_DATA からクラス別ラップ統計を返す。
+
+    競馬場・馬場・距離・class_id に一致するエントリを返す。
+    距離が完全一致しない場合は最近傍距離のエントリを返す（許容 ±200m）。
+
+    Returns:
+        dict: race_count, horse_count, front3f, back3f, pace_dev, f6, note を含む辞書。
+              一致なしの場合は空辞書 {} を返す。
+    """
+    try:
+        if not venue:
+            venue, surface, _ = _resolve_course_profile(meta)
+        if not surface:
+            _, surface_tmp, _ = _resolve_course_profile(meta)
+            if not surface:
+                surface = surface_tmp
+        if dist_m <= 0:
+            dist_m_tmp, _ = _meta_distance_surface(meta)
+            if np.isfinite(dist_m_tmp) and dist_m_tmp > 0:
+                dist_m = float(dist_m_tmp)
+        if class_id < 0:
+            class_id = _infer_race_class_id(meta)
+
+        venue_data = (JRA_ALL_COURSE_CLASS_PACE_DATA.get(venue, {}) or {})
+        surface_data = (venue_data.get(surface, {}) or {})
+        if not surface_data:
+            return {}
+
+        # 距離完全一致 → 最近傍距離
+        dist_int = int(round(dist_m))
+        if dist_int in surface_data:
+            dist_key = dist_int
+        else:
+            available = [d for d in surface_data.keys() if isinstance(d, int)]
+            if not available:
+                return {}
+            nearest = min(available, key=lambda d: abs(d - dist_int))
+            if abs(nearest - dist_int) > 200:
+                return {}
+            dist_key = nearest
+
+        class_data = surface_data.get(dist_key, {}) or {}
+        if class_id in class_data:
+            entry = dict(class_data[class_id])
+            entry['_venue'] = venue
+            entry['_surface'] = surface
+            entry['_distance'] = dist_key
+            entry['_class_id'] = class_id
+            return entry
+        # fallback: 最近傍 class_id
+        available_cls = [c for c in class_data.keys() if isinstance(c, int)]
+        if not available_cls:
+            return {}
+        nearest_cls = min(available_cls, key=lambda c: abs(c - class_id))
+        entry = dict(class_data[nearest_cls])
+        entry['_venue'] = venue
+        entry['_surface'] = surface
+        entry['_distance'] = dist_key
+        entry['_class_id'] = nearest_cls
+        entry['_class_id_fallback'] = True
+        return entry
+    except Exception:
+        return {}
+
+
+def resolve_tokyo1400_pace_cluster(
+    front3f: Optional[float] = None,
+    pace_dev: Optional[float] = None,
+    meta: Optional[Dict[str, str]] = None,
+) -> str:
+    """東京芝1400m ペースクラスタ名を返す。
+
+    TOKYO_TURF_1400_FULL_SPEC['pace_clusters'] の閾値に基づき
+    '高圧' / '標準' / '遅延' のいずれかを返す。
+
+    Args:
+        front3f: 前半3F タイム（秒）
+        pace_dev: ペース乖離値（前半3F - 後半3F）
+        meta: 前半3F / pace_dev が取れない場合の補助入力
+
+    Returns:
+        str: '高圧' | '標準' | '遅延' | '' (判定不能)
+    """
+    try:
+        clusters = TOKYO_TURF_1400_FULL_SPEC.get('pace_clusters', {}) or {}
+        if front3f is None and meta:
+            try:
+                front3f_raw = float(meta.get('front3f', np.nan))
+                if np.isfinite(front3f_raw):
+                    front3f = front3f_raw
+            except Exception:
+                pass
+        if pace_dev is None and meta:
+            try:
+                pd_raw = float(meta.get('pace_dev', np.nan))
+                if np.isfinite(pd_raw):
+                    pace_dev = pd_raw
+            except Exception:
+                pass
+
+        if front3f is not None and np.isfinite(float(front3f)):
+            f3 = float(front3f)
+            # 高圧: front3f <= 33.8 (高圧クラスタ中心33.5)
+            # 標準: 33.8 < front3f <= 34.5
+            # 遅延: front3f > 34.5
+            if f3 <= 33.80:
+                return '高圧'
+            elif f3 <= 34.50:
+                return '標準'
+            else:
+                return '遅延'
+        if pace_dev is not None and np.isfinite(float(pace_dev)):
+            pd = float(pace_dev)
+            # 高圧: pace_dev <= -2.2
+            # 標準: -2.2 < pace_dev <= -0.8
+            # 遅延: pace_dev > -0.8
+            if pd <= -2.20:
+                return '高圧'
+            elif pd <= -0.80:
+                return '標準'
+            else:
+                return '遅延'
+        return ''
+    except Exception:
+        return ''
+
+
+def build_race_feature_vector(
+    meta: Dict[str, str],
+    row: Optional['pd.Series'] = None,  # type: ignore[name-defined]
+    params: Optional[dict] = None,
+) -> Dict[str, object]:
+    """レース1行分の特徴量ベクトルを辞書で返す（AI学習・スコアリング兼用）。
+
+    TOKYO_TURF_1400_FULL_SPEC の feature_engineering 表に基づき、
+    コース / ペース / 枠&騎手 / 馬体重・輸送 / 調教 / 血統 を網羅する。
+
+    Returns:
+        dict: 特徴量名 → 値 の辞書。欠損値は np.nan。
+    """
+    params = params or {}
+    meta = meta or {}
+    row_data: dict = {}
+    if row is not None:
+        try:
+            row_data = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
+        except Exception:
+            row_data = {}
+
+    def _g(key: str, default=np.nan):
+        """row_data → meta の順で値を探す。"""
+        v = row_data.get(key, meta.get(key, default))
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return default
+        try:
+            return float(v)
+        except Exception:
+            return v
+
+    # ---- コース特徴量 ----
+    venue, surface, profile = _resolve_course_profile(meta)
+    dist_m, surf_inferred = _meta_distance_surface(meta)
+    class_id = _infer_race_class_id(meta)
+    rail = _infer_rail_setting(meta) or 'A'
+    month = _infer_race_month(meta)
+    going_str = str(meta.get('going', meta.get('track_condition', '')) or '')
+
+    # ---- クラス別ラップ参照 ----
+    pace_ref = resolve_class_pace_ref(meta, venue=venue, surface=surface,
+                                      dist_m=float(dist_m) if np.isfinite(dist_m) else 0.0,
+                                      class_id=class_id)
+
+    # ---- ペースクラスタ（東京1400mのみ） ----
+    is_t1400 = bool(_is_tokyo_turf_1400(meta))
+    pace_cluster_label = ''
+    if is_t1400:
+        pace_cluster_label = resolve_tokyo1400_pace_cluster(
+            front3f=_g('front3f'),
+            pace_dev=_g('pace_dev'),
+            meta=meta,
+        )
+
+    # ---- 枠番・騎手タイプ ----
+    gate_num = _g('gate', _g('gate_num', np.nan))
+    gate_inner = 1.0 if (isinstance(gate_num, (int, float)) and np.isfinite(float(gate_num)) and float(gate_num) <= 4) else 0.0
+
+    # ---- 馬体重 ----
+    weight_kg = _g('weight', _g('horse_weight', np.nan))
+    prev_weight = _g('prev_weight', _g('prev_horse_weight', np.nan))
+    weight_delta_pct = np.nan
+    if np.isfinite(float(weight_kg)) and np.isfinite(float(prev_weight)) and float(prev_weight) > 0:
+        weight_delta_pct = (float(weight_kg) - float(prev_weight)) / float(prev_weight) * 100.0
+
+    # ---- 調教フラグ ----
+    final_lap_type = str(meta.get('final_lap_type', row_data.get('final_lap_type', '')) or '')
+    final_lap_time = _g('final_lap_time', np.nan)
+    mid_run_count = _g('mid_run_count', np.nan)
+    aibou_flag = _g('aibou_flag', 0.0)
+    training_score = _g('TrainingScore', _g('training_score', np.nan))
+
+    # ---- 血統 ----
+    sire_line = str(meta.get('sire_line', row_data.get('sire_line', '')) or '')
+    brood_sire = str(meta.get('brood_sire', row_data.get('brood_sire', '')) or '')
+
+    # ---- 重賞検出 ----
+    graded_data = _detect_graded_race(meta)
+    is_graded = 1.0 if graded_data else 0.0
+    graded_grade = str(graded_data.get('grade', '') if graded_data else '')
+    graded_stamina = float(graded_data.get('stamina_index', np.nan)) if graded_data else np.nan
+    graded_speed = float(graded_data.get('speed_index', np.nan)) if graded_data else np.nan
+
+    fv: Dict[str, object] = {
+        # コース
+        'venue': venue,
+        'surface': surface,
+        'distance_m': float(dist_m) if np.isfinite(dist_m) else np.nan,
+        'going': going_str,
+        'rail_setting': rail,
+        'month': float(month) if month else np.nan,
+        'class_id': float(class_id) if class_id >= 0 else np.nan,
+        # ペース参照
+        'pace_ref_front3f': float(pace_ref.get('front3f', np.nan)),
+        'pace_ref_back3f': float(pace_ref.get('back3f', np.nan)),
+        'pace_ref_pace_dev': float(pace_ref.get('pace_dev', np.nan)),
+        'pace_ref_f6': float(pace_ref.get('f6', np.nan)),
+        'pace_ref_race_count': float(pace_ref.get('race_count', np.nan)),
+        # 実測ラップ（あれば）
+        'front3f': _g('front3f'),
+        'back3f': _g('back3f'),
+        'pace_dev': _g('pace_dev'),
+        'f6': _g('f6'),
+        # ペースクラスタ
+        'pace_cluster': pace_cluster_label,
+        'is_tokyo1400': 1.0 if is_t1400 else 0.0,
+        # 枠・騎手
+        'gate_num': gate_num,
+        'gate_inner': gate_inner,
+        'jockey_style': str(meta.get('jockey_style', row_data.get('jockey_style', '')) or ''),
+        'jockey_hold_rate': _g('jockey_hold_rate'),
+        # 馬体重・輸送
+        'weight_kg': weight_kg,
+        'weight_delta_pct': weight_delta_pct,
+        'transport_flag': _g('transport_flag', 0.0),
+        'transport_distance_km': _g('transport_distance_km', np.nan),
+        # 調教
+        'final_lap_type': final_lap_type,
+        'final_lap_time': final_lap_time,
+        'mid_run_count': mid_run_count,
+        'aibou_flag': aibou_flag,
+        'training_score': training_score,
+        # 血統
+        'sire_line': sire_line,
+        'brood_sire': brood_sire,
+        'di_score': _g('di_score'),
+        # 騎手交代
+        'jockey_changed': _g('jockey_changed', 0.0),
+        'prev_jockey_win_rate': _g('prev_jockey_win_rate'),
+        'new_jockey_win_rate': _g('new_jockey_win_rate'),
+        # 重賞
+        'is_graded': is_graded,
+        'graded_grade': graded_grade,
+        'graded_stamina_index': graded_stamina,
+        'graded_speed_index': graded_speed,
+        # コースプロファイル
+        'style_bias_front': float((profile.get('style_bias', {}) or {}).get('FRONT', np.nan)),
+        'style_bias_middle': float((profile.get('style_bias', {}) or {}).get('MIDDLE', np.nan)),
+        'style_bias_rear': float((profile.get('style_bias', {}) or {}).get('REAR', np.nan)),
+        'profile_stamina': float(profile.get('stamina', np.nan)),
+        'profile_speed': float(profile.get('speed', np.nan)),
+        'profile_straight': float(profile.get('straight', np.nan)),
+        'profile_corner': float(profile.get('corner', np.nan)),
+        'profile_gate': float(profile.get('gate', np.nan)),
+    }
+    return fv
+
+
+def build_lgbm_place_skeleton(
+    df_train: 'pd.DataFrame',  # type: ignore[name-defined]
+    feature_cols: Optional[List[str]] = None,
+    target_col: str = 'place_flag',
+    cat_cols: Optional[List[str]] = None,
+    n_splits: int = 5,
+    lgbm_params: Optional[dict] = None,
+) -> dict:
+    """LightGBM 複勝予測モデルのスケルトン（AI特徴量エンジニアリング表準拠）。
+
+    TOKYO_TURF_1400_FULL_SPEC['feature_engineering'] に基づく特徴量列を使用。
+    時系列分割（GroupKFold）で学習し AUC を計算する。
+
+    Args:
+        df_train: 学習データ（各行が1頭分の出走データ）
+        feature_cols: 使用特徴量列リスト（None の場合はデフォルト列セット）
+        target_col: 目的変数列名（1=複勝圏内, 0=圏外）
+        cat_cols: カテゴリ列リスト
+        n_splits: 時系列 GroupKFold の分割数
+        lgbm_params: LightGBM ハイパーパラメータ（None の場合はデフォルト）
+
+    Returns:
+        dict: {'model': LGBMClassifier, 'auc': float, 'feature_importance': dict}
+    """
+    try:
+        import lightgbm as lgb  # type: ignore
+        from sklearn.model_selection import GroupKFold  # type: ignore
+        from sklearn.metrics import roc_auc_score  # type: ignore
+    except ImportError as e:
+        return {'error': f'LightGBM/sklearn が利用できません: {e}', 'model': None, 'auc': np.nan}
+
+    import pandas as _pd
+
+    if feature_cols is None:
+        # デフォルト特徴量列（TOKYO_TURF_1400_FULL_SPEC feature_engineering 準拠）
+        feature_cols = [
+            'distance_m', 'class_id', 'month', 'gate_num', 'gate_inner',
+            'pace_ref_front3f', 'pace_ref_back3f', 'pace_ref_pace_dev', 'pace_ref_f6',
+            'weight_kg', 'weight_delta_pct', 'transport_flag',
+            'final_lap_time', 'mid_run_count', 'aibou_flag', 'training_score',
+            'di_score', 'jockey_hold_rate', 'jockey_changed',
+            'style_bias_front', 'style_bias_middle', 'style_bias_rear',
+            'profile_stamina', 'profile_speed', 'profile_straight',
+            'is_graded', 'graded_stamina_index', 'graded_speed_index',
+        ]
+    if cat_cols is None:
+        cat_cols = ['venue', 'surface', 'going', 'rail_setting',
+                    'sire_line', 'brood_sire', 'pace_cluster', 'jockey_style']
+
+    # 利用可能な列のみ絞り込む
+    avail_feat = [c for c in feature_cols if c in df_train.columns]
+    avail_cat = [c for c in cat_cols if c in df_train.columns]
+
+    if target_col not in df_train.columns:
+        return {'error': f'目的変数列 {target_col!r} が見つかりません', 'model': None, 'auc': np.nan}
+    if not avail_feat:
+        return {'error': '有効な特徴量列がありません', 'model': None, 'auc': np.nan}
+
+    default_lgbm = {
+        'num_leaves': 64,
+        'learning_rate': 0.05,
+        'n_estimators': 800,
+        'objective': 'binary',
+        'metric': 'auc',
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'min_child_samples': 20,
+        'reg_alpha': 0.1,
+        'reg_lambda': 1.0,
+        'random_state': 42,
+        'n_jobs': -1,
+        'verbose': -1,
+    }
+    if lgbm_params:
+        default_lgbm.update(lgbm_params)
+
+    X = df_train[avail_feat].copy()
+    y = df_train[target_col].astype(int)
+    # カテゴリ列を category 型に変換
+    for c in avail_cat:
+        if c in X.columns:
+            X[c] = X[c].astype('category')
+
+    # race_id 列があれば GroupKFold のグループに使用
+    group_col = None
+    for gc in ['race_id', 'race_date', 'date']:
+        if gc in df_train.columns:
+            group_col = gc
+            break
+    groups = df_train[group_col].values if group_col else np.arange(len(df_train))
+
+    gkf = GroupKFold(n_splits=n_splits)
+    auc_scores = []
+    models = []
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups)):
+        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        model = lgb.LGBMClassifier(**default_lgbm)
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(period=-1)],
+            categorical_feature=avail_cat,
+        )
+        pred = model.predict_proba(X_val)[:, 1]
+        try:
+            auc = float(roc_auc_score(y_val, pred))
+        except Exception:
+            auc = np.nan
+        auc_scores.append(auc)
+        models.append(model)
+
+    best_idx = int(np.nanargmax(auc_scores)) if auc_scores else 0
+    best_model = models[best_idx] if models else None
+    mean_auc = float(np.nanmean(auc_scores)) if auc_scores else np.nan
+
+    feat_imp: dict = {}
+    if best_model is not None:
+        try:
+            imp = best_model.feature_importances_
+            feat_imp = {str(c): int(v) for c, v in zip(avail_feat, imp)}
+        except Exception:
+            pass
+
+    return {
+        'model': best_model,
+        'auc': mean_auc,
+        'auc_scores': auc_scores,
+        'feature_cols': avail_feat,
+        'cat_cols': avail_cat,
+        'feature_importance': feat_imp,
+        'lgbm_params': default_lgbm,
+    }
 
 
 def enrich_meta_with_course_profile(meta: Dict[str, str]) -> Dict[str, str]:
@@ -13120,8 +16550,8 @@ def _kbs_raw_workout_score(work: dict, w4: float, w3: float, w1: float) -> float
 
 def _kbs_course_normalize(dfa, tr: dict) -> object:
     """コース別ロバスト正規化を dfa に適用して 'WorkoutScore_latest' を更新する。"""
-    import numpy as np
-    import pandas as pd
+    # import numpy as np
+    # import pandas as pd
     try:
         for course_val in dfa['course_latest'].unique():
             mask = dfa['course_latest'] == course_val
@@ -13129,7 +16559,7 @@ def _kbs_course_normalize(dfa, tr: dict) -> object:
             med  = float(sub.median()) if len(sub) >= 3 else float(sub.mean())
             iqr  = float(sub.quantile(0.75) - sub.quantile(0.25)) if len(sub) >= 3 else 1.0
             iqr  = max(iqr, 1.0)
-            dfa.loc[mask, 'WorkoutScore_latest'] = ((sub - med) / iqr * 10 + 50).clip(0, 100)
+            dfa.loc[mask, 'WorkoutScore_latest'] = _clip0100(((sub - med) / iqr * 10 + 50))
     except Exception:
         pass
     return dfa
@@ -13138,7 +16568,7 @@ def _kbs_course_normalize(dfa, tr: dict) -> object:
 def _kbs_shape_score(dfa) -> object:
     """坂路（加速形）と W/CW（3F配分）の形スコアを計算して dfa に追加する。"""
     import numpy as np
-    import pandas as pd
+    # import pandas as pd
     try:
         # 坂路: lap復元 (t4,t3,t2,t1 → lap4..lap1)
         for c in ['t4_latest','t3_latest','t2_latest','t1_latest']:
@@ -13151,7 +16581,7 @@ def _kbs_shape_score(dfa) -> object:
         lap3 = t3 - t1
         lap4 = t4 - t3
         # 坂路: 加速（lap3→lap1で速くなるほど良い）
-        accel_last  = (lap3 - lap1).clip(lower=-5.0, upper=5.0)
+        accel_last  = _clip_series((lap3 - lap1), -5.0, 5.0)
         accel_count = ((lap4 > lap3).astype(float) + (lap3 > lap1).astype(float))
         dfa['shape_latest'] = (accel_last * 0.7 + accel_count * 0.3).fillna(0.0)
     except Exception:
@@ -13177,31 +16607,27 @@ def compute_training_scores_keibabook(entries: pd.DataFrame, ocr_all: dict, para
     w3 = float(tr.get('w_t3', 0.27) or 0.27)
     w1 = float(tr.get('w_t1', 0.18) or 0.18)
 
-    delta_scale = float(tr.get('delta_scale', 0.08) or 0.08)
-    delta_cap   = float(tr.get('delta_cap', 3.0) or 3.0)
+    _ = float(tr.get('_delta_scale', 0.08) or 0.08)
+    _ = float(tr.get('_delta_cap', 3.0) or 3.0)
 
     horses = (ocr_all or {}).get('horses', {}) or {}
 
-    rows = []
-    for _, row in entries.iterrows():
+    # ── ベクトル化: iterrows → apply ──────────────────────────────
+    def _calc_workout_row(row):
         num = str(row.get('num', ''))
-        works = horses.get(num, {}).get('works', []) if num in horses else []
-        works = works[:max_works]
-
-        raw_scores = [_kbs_raw_workout_score(w, w4, w3, w1) for w in works]
-        raw_scores = [s for s in raw_scores if s == s]  # drop NaN
-
+        wrks = horses.get(num, {}).get('works', []) if num in horses else []
+        wrks = wrks[:max_works]
+        raw_scores = [_kbs_raw_workout_score(w, w4, w3, w1) for w in wrks]
+        raw_scores = [s for s in raw_scores if s == s]
         if not raw_scores:
-            rows.append({'num': num, 'WorkoutScore_latest': np.nan,
-                         't4_latest': np.nan, 't3_latest': np.nan, 't1_latest': np.nan,
-                         'shape_latest': 0.0, 'course_latest': '',
-                         'load_latest': np.nan, 'pair_latest': '',
-                         'TrainingScore': 50.0, 'delta_train': 0.0, 'TrainingRank': 999})
-            continue
-
+            return {'num': num, 'WorkoutScore_latest': np.nan,
+                    't4_latest': np.nan, 't3_latest': np.nan, 't1_latest': np.nan,
+                    'shape_latest': 0.0, 'course_latest': '',
+                    'load_latest': np.nan, 'pair_latest': '',
+                    'TrainingScore': 50.0, 'delta_train': 0.0, 'TrainingRank': 999}
         blended = sum(s * w for s, w in zip(raw_scores, w_recent[:len(raw_scores)]))
-        latest  = works[0] if works else {}
-        rows.append({
+        latest = wrks[0] if wrks else {}
+        return {
             'num': num,
             'WorkoutScore_latest': blended,
             't4_latest': latest.get('t4', np.nan),
@@ -13211,7 +16637,8 @@ def compute_training_scores_keibabook(entries: pd.DataFrame, ocr_all: dict, para
             'load_latest':   latest.get('load', np.nan),
             'pair_latest':   latest.get('pair', ''),
             'shape_latest': 0.0,
-        })
+        }
+    rows = entries.apply(_calc_workout_row, axis=1).tolist()
 
     if not rows:
         return entries[['num']].copy()
@@ -13226,18 +16653,18 @@ def compute_training_scores_keibabook(entries: pd.DataFrame, ocr_all: dict, para
 
     # 負荷差・併せ差ボーナス
     try:
-        load_bonus = (_num_series(dfa['load_latest'], index=dfa.index) - 55.0).clip(-2, 3) * 0.5
-        pair_bonus = dfa['pair_latest'].apply(lambda p: 1.5 if str(p).strip() else 0.0)
-        dfa['WorkoutScore_latest'] = (dfa['WorkoutScore_latest'] + load_bonus + pair_bonus).clip(0, 100)
+        load_bonus = np.clip((_num_series(dfa['load_latest'], index=dfa.index).values - 55.0), -2, 3) * 0.5
+        pair_bonus = dfa['pair_latest'].astype(str).str.strip().map(lambda p: 1.5 if p else 0.0)
+        dfa['WorkoutScore_latest'] = _clip0100((dfa['WorkoutScore_latest'] + load_bonus + pair_bonus))
     except Exception:
         pass
 
     # 全体TrainingScore
     try:
-        dfa['TrainingScore'] = (
+        dfa['TrainingScore'] = _clip0100((
             0.70 * _num_series(dfa['WorkoutScore_latest'], 50.0, index=dfa.index)
-            + 0.30 * (_num_series(dfa['shape_latest'], 0.0, index=dfa.index) * 10 + 50).clip(0, 100)
-        ).clip(0, 100)
+            + 0.30 * _clip0100((_num_series(dfa['shape_latest'], 0.0, index=dfa.index) * 10 + 50))
+        ))
     except Exception:
         dfa['TrainingScore'] = 50.0
 
@@ -13542,26 +16969,26 @@ def classify_running_style(
     pf_rank_ser = pf_ser.rank(method='min', ascending=True) if pf_ser.notna().sum() > 1 else pd.Series([None] * n, index=df.index)
     pl_rank_ser = pl_ser.rank(method='min', ascending=True) if pl_ser.notna().sum() > 1 else pd.Series([None] * n, index=df.index)
 
-    labels, confs, fscores = [], [], []
-    for idx in df.index:
-        row = df.loc[idx]
-        sc  = _rsc_zone_score_row(row, active_weights)
+    # ── ベクトル化: for idx ループ → apply ─────────────────────
+    def _classify_row(row):
+        idx = row.name
+        sc = _rsc_zone_score_row(row, active_weights)
         pf_r = int(pf_rank_ser.loc[idx]) if pd.notna(pf_rank_ser.loc[idx]) else None
         pl_r = int(pl_rank_ser.loc[idx]) if pd.notna(pl_rank_ser.loc[idx]) else None
-        sc   = _rsc_apply_pred_boost(sc, row, pf_r, pl_r, n, cfg)
+        sc = _rsc_apply_pred_boost(sc, row, pf_r, pl_r, n, cfg)
         lbl, conf = _rsc_label_from_scores(sc, cfg)
-        labels.append(lbl)
-        confs.append(conf)
-        # RunningStyleScore: FRONT 偉向度を 0-100 に変換
         front_raw = sc.get('FRONT', 0.0) - sc.get('REAR', 0.0)
-        fscores.append(float(np.clip(50.0 + front_raw * 100.0, 0.0, 100.0)))
+        fscore = float(np.clip(50.0 + front_raw * 100.0, 0.0, 100.0))
+        return pd.Series({'_lbl': lbl, '_conf': conf, '_fs': fscore})
 
-    df['RunningStyleLabel'] = labels
-    df['RunningStyleConf']  = confs
-    df['RunningStyleScore'] = fscores
+    _cls_results = df.apply(_classify_row, axis=1)
+    df['RunningStyleLabel'] = _cls_results['_lbl'].values
+    df['RunningStyleConf']  = _cls_results['_conf'].values
+    df['RunningStyleScore'] = _cls_results['_fs'].values
     return df
 
 
+@lru_cache(maxsize=8)
 def compute_position_fit_v1_1(zone_4c: str) -> float:
     """ベースの位置取り適性（天候補正なし）。"""
     z = normalize_zone_token(zone_4c)
@@ -13574,6 +17001,7 @@ def compute_position_fit_v1_1(zone_4c: str) -> float:
     return 85.0
 
 
+@lru_cache(maxsize=8)
 def compute_winshape_v1_1(zone_4c: str) -> float:
     """ベースの勝ち形（天候補正なし）。"""
     z = normalize_zone_token(zone_4c)
@@ -13588,6 +17016,9 @@ def compute_winshape_v1_1(zone_4c: str) -> float:
 
 def _track_context(meta: Dict[str, str]) -> Dict[str, float]:
     """metaから天候・馬場の数値特徴を取り出して返す（欠損はnan）。"""
+    # キャッシュがあれば即返す
+    if '_cached_ctx' in meta:
+        return meta['_cached_ctx']
     def _f(k: str) -> float:
         """meta 辞書からキー k の値を float に変換するショートハンド。失敗時は nan。"""
         try:
@@ -13717,7 +17148,7 @@ def apply_dynamic_track_bias_features_v1_1(df: pd.DataFrame, meta: Dict[str, str
         return df
 
     d = df.copy()
-    z = d.get('zone_4c', pd.Series(['MIDDLE'] * len(d), index=d.index)).astype(str).apply(normalize_zone_token)
+    z = d.get('zone_4c', pd.Series(['MIDDLE'] * len(d), index=d.index)).astype(str).map(normalize_zone_token)
     draw_zone = _track_draw_zone(d)
     lane_balance = _resolve_dynamic_lane_bias(meta)
     variant = _resolve_dynamic_track_variant(meta)
@@ -13741,7 +17172,7 @@ def apply_dynamic_track_bias_features_v1_1(df: pd.DataFrame, meta: Dict[str, str
         lane_bonus = lane_bonus + middle_mask.astype(float) * abs(lane_balance) * 3.5
         lane_bonus = lane_bonus + (z == 'REAR').astype(float) * abs(lane_balance) * 2.5
         lane_bonus = lane_bonus - inner_mask.astype(float) * abs(lane_balance) * 4.0
-    d['DynamicTrackLaneSuit'] = (50.0 + lane_bonus).clip(lower=0.0, upper=100.0)
+    d['DynamicTrackLaneSuit'] = _clip0100((50.0 + lane_bonus))
 
     ability = _num_series(d.get('Ability', 50.0), 50.0, index=d.index)
     tf = _num_series(d.get('TimeFit', 50.0), 50.0, index=d.index)
@@ -13753,28 +17184,28 @@ def apply_dynamic_track_bias_features_v1_1(df: pd.DataFrame, meta: Dict[str, str
     pf = _num_series(d.get('pred_first3f', np.nan), np.nan, index=d.index)
 
     if pf.notna().sum() > 1 and float(pf.max()) != float(pf.min()):
-        early_fast01 = ((float(pf.max()) - pf) / (float(pf.max()) - float(pf.min()))).clip(lower=0.0, upper=1.0)
+        early_fast01 = _clip_series(((float(pf.max()) - pf) / (float(pf.max()) - float(pf.min()))), 0.0, 1.0)
     else:
         early_fast01 = pd.Series([0.5] * len(d), index=d.index, dtype=float)
 
-    fast_track_fit = (0.42 * ability + 0.26 * tf + 0.18 * (early_fast01 * 100.0) + 0.14 * pace).clip(lower=0.0, upper=100.0)
-    slow_track_fit = (0.32 * ff + 0.28 * mich + 0.22 * cons + 0.18 * cc).clip(lower=0.0, upper=100.0)
-    neutral_track_fit = (0.50 * fast_track_fit + 0.50 * slow_track_fit).clip(lower=0.0, upper=100.0)
+    fast_track_fit = _clip0100((0.42 * ability + 0.26 * tf + 0.18 * (early_fast01 * 100.0) + 0.14 * pace))
+    slow_track_fit = _clip0100((0.32 * ff + 0.28 * mich + 0.22 * cons + 0.18 * cc))
+    neutral_track_fit = _clip0100((0.50 * fast_track_fit + 0.50 * slow_track_fit))
 
     fast_w = float(np.clip(variant / 20.0, 0.0, 1.0))
     slow_w = float(np.clip(-variant / 20.0, 0.0, 1.0))
     neutral_w = float(np.clip(1.0 - max(fast_w, slow_w), 0.0, 1.0))
-    d['DynamicTrackSpeedSuit'] = (neutral_w * neutral_track_fit + fast_w * fast_track_fit + slow_w * slow_track_fit).clip(lower=0.0, upper=100.0)
+    d['DynamicTrackSpeedSuit'] = _clip0100((neutral_w * neutral_track_fit + fast_w * fast_track_fit + slow_w * slow_track_fit))
 
     mapfit = _num_series(d.get('MapFit', 50.0), 50.0, index=d.index)
     posfit = _num_series(d.get('PosFit', 50.0), 50.0, index=d.index)
-    d['DynamicTrackConditionAdvantage'] = (
+    d['DynamicTrackConditionAdvantage'] = _clip0100((
         0.34 * cc
         + 0.18 * mapfit
         + 0.16 * posfit
         + 0.18 * d['DynamicTrackLaneSuit']
         + 0.14 * d['DynamicTrackSpeedSuit']
-    ).clip(lower=0.0, upper=100.0)
+    ))
     return d
 
 
@@ -13839,32 +17270,25 @@ def compute_winshape_adjusted(zone_4c: str, meta: Dict[str, str]) -> float:
 
 def compute_consistency_from_speed_hist(df: pd.DataFrame) -> pd.Series:
     """過去速度ヒストリから安定性スコア (0–100) の Series を返す。"""
-    ranges = []
-    counts = []
-    for s in df["speed_hist"].tolist():
+    n = len(df)
+    ranges_arr = np.full(n, np.nan)
+    counts_arr = np.zeros(n, dtype=int)
+    for i, s in enumerate(df["speed_hist"].tolist()):
         vals = parse_speed_hist(s)
-        counts.append(len(vals))
+        counts_arr[i] = len(vals)
         if len(vals) >= 2:
-            ranges.append(max(vals) - min(vals))
-        else:
-            ranges.append(np.nan)
+            ranges_arr[i] = max(vals) - min(vals)
 
-    r = pd.Series(ranges, index=df.index, dtype=float)
     # R36: 全要素 NaN の場合 np.nanmax が RuntimeWarning を出すため事前にガード
-    _r_vals = r.values
-    rmax = float(np.nanmax(_r_vals)) if (len(_r_vals) > 0 and not np.all(np.isnan(_r_vals)) and np.isfinite(np.nanmax(_r_vals))) else np.nan
+    finite_mask = np.isfinite(ranges_arr)
+    rmax = float(np.nanmax(ranges_arr[finite_mask])) if finite_mask.any() else np.nan
 
-    out = []
-    for i in df.index:
-        c = counts[i]
-        if c == 0:
-            out.append(70.0)  # v1.1: 欠損は70
-            continue
-        if not np.isfinite(rmax) or rmax == 0 or not np.isfinite(r.loc[i]):
-            out.append(70.0)
-            continue
-        out.append(100.0 * (1.0 - float(r.loc[i]) / rmax))
-    return pd.Series(out, index=df.index, dtype=float)
+    # ベクトル化: ループなし
+    out_arr = np.full(n, 70.0)
+    if np.isfinite(rmax) and rmax > 0:
+        valid = (counts_arr > 0) & finite_mask
+        out_arr[valid] = 100.0 * (1.0 - ranges_arr[valid] / rmax)
+    return _make_series(np.clip(out_arr, 0.0, 100.0), df.index)
 
 
 def parse_map_summary_to_rates(map_summary: str) -> Optional[Dict[str, float]]:
@@ -13905,39 +17329,38 @@ def compute_mapfit_v1_1(
     3) Unknown fallback: FRONT/MIDDLE=80, REAR=30
     """
     rates = map_rates if map_rates is not None else parse_map_summary_to_rates(map_summary)
-    z4 = df["zone_4c"].astype(str).str.upper().str.strip()
+    # zone_4c はすでに normalize_zone_token で正規化済み（compute_scores_v1_1 先頭で処理済み）
+    z4_vals = df["zone_4c"].values  # ndarray: 'FRONT'/'MIDDLE'/'REAR'
 
     if rates is None:
-        out = []
-        for v in z4.tolist():
-            out.append(30.0 if normalize_zone_token(v) == "REAR" else 80.0)  # Unknown既定
-        return pd.Series(out, index=df.index, dtype=float)
+        # REAR=30, それ以外=80 を np.where で高速計算
+        result = np.where(z4_vals == "REAR", 30.0, 80.0).astype(float)
+        return _make_series(result, df.index)
 
-    out = []
-    for v in z4.tolist():
-        key = normalize_zone_token(v)
-        r = float(rates.get(key, rates.get("MIDDLE", 0.20)))
-        # rates may be already 0..1 (heatmap) or 0..100 (if someone passes percent)
-        if r > 1.0:
-            r = r / 100.0
-        out.append(clamp(100.0 * r, 0.0, 100.0))
-    return pd.Series(out, index=df.index, dtype=float)
+    # rates が 0..100 の場合は 0..1 に正規化
+    rates_01 = {k: (v / 100.0 if v > 1.0 else float(v)) for k, v in rates.items()}
+    mid_rate = rates_01.get("MIDDLE", 0.20)
+    # np.select でゾーン→スコア変換（pandas .map を排除）
+    front_s = float(np.clip(100.0 * rates_01.get("FRONT",  mid_rate), 0.0, 100.0))
+    mid_s   = float(np.clip(100.0 * rates_01.get("MIDDLE", mid_rate), 0.0, 100.0))
+    rear_s  = float(np.clip(100.0 * rates_01.get("REAR",   mid_rate), 0.0, 100.0))
+    result = np.select(
+        [z4_vals == "FRONT", z4_vals == "MIDDLE", z4_vals == "REAR"],
+        [front_s,            mid_s,               rear_s],
+        default=mid_s,
+    ).astype(float)
+    return _make_series(result, df.index)
 
 
 def compute_timefit_v1_1(df: pd.DataFrame) -> pd.Series:
     """前後3Fタイム予測値からタイムフィットスコア (0–100) を計算する。"""
     f = _num_series(df, 'pred_first3f', np.nan, index=df.index)
     l = _num_series(df, 'pred_last3f', np.nan, index=df.index)
-
-    out = []
-    for i in df.index:
-        if not np.isfinite(f.loc[i]) or not np.isfinite(l.loc[i]):
-            out.append(0.0)  # v1.1: 欠損は0
-            continue
-        diff = abs(float(f.loc[i]) - float(l.loc[i]))
-        score = 100.0 * np.exp(-diff)
-        out.append(float(score))
-    return pd.Series(out, index=df.index, dtype=float)
+    # ── ベクトル化: ループ廃止 ────────────────────────────────
+    valid_mask = f.notna() & l.notna()
+    diff = (f - l).abs()
+    score = (100.0 * np.exp(-diff)).where(valid_mask, 0.0)
+    return score.fillna(0.0).astype(float)
 
 
 def compute_upside_v1_1(speed_max: pd.Series) -> pd.Series:
@@ -13958,6 +17381,9 @@ def _meta_distance_surface(meta: Dict[str, str]) -> tuple[float, str]:
 
     """
     meta = meta or {}
+    # キャッシュがあれば即返す
+    if '_cached_dist' in meta:
+        return meta['_cached_dist'], meta.get('_cached_surface', 'unknown')
     dist = float('nan')
     try:
         dist = float(meta.get('distance', np.nan))
@@ -13986,7 +17412,7 @@ def compute_gatefit_v1_1(df: pd.DataFrame, meta: Dict[str, str]) -> pd.Series:
     cg = _num_series(df, 'CommentGate', 50.0)
     f = _num_series(df, 'pred_first3f', np.nan, index=df.index)
     if f.notna().sum() > 1 and float(f.max()) != float(f.min()):
-        f01 = ((float(f.max()) - f) / (float(f.max()) - float(f.min()))).clip(lower=0.0, upper=1.0)
+        f01 = _clip_series(((float(f.max()) - f) / (float(f.max()) - float(f.min()))), 0.0, 1.0)
     else:
         f01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
     dist, surface = _meta_distance_surface(meta)
@@ -13999,8 +17425,8 @@ def compute_gatefit_v1_1(df: pd.DataFrame, meta: Dict[str, str]) -> pd.Series:
     else:
         gate_mult = 1.00
         w_comment = 0.72
-    gate_base = (50.0 + (cg - 50.0) * gate_mult).clip(lower=0.0, upper=100.0)
-    out = (w_comment * gate_base + (1.0 - w_comment) * (f01 * 100.0)).clip(lower=0.0, upper=100.0)
+    gate_base = _clip0100((50.0 + (cg - 50.0) * gate_mult))
+    out = _clip0100((w_comment * gate_base + (1.0 - w_comment) * (f01 * 100.0)))
     return _num_series(out, 50.0, index=df.index)
 
 
@@ -14160,99 +17586,95 @@ def add_high_granularity_pedigree_features(
         'tokyo1400_lap_rank_emb3', 'tokyo1400_lap_rank_emb4',
     ]
 
-    bm_scores: list[float] = []
-    cross_scores: list[float] = []
-    dosage_scores: list[float] = []
-    chef_scores: list[float] = []
-    tokyo_scores: list[float] = []
+    # ── 完全ベクトル化: 行処理を列操作に変換 ──────────────────────
+    _dist, _surface, _is_tok = dist, surface, is_tokyo1400
+    _target_depth = (3.9 if (np.isfinite(_dist) and _dist <= 1400) else
+                     4.2 if (np.isfinite(_dist) and _dist <= 1800) else
+                     4.6 if (np.isfinite(_dist) and _dist <= 2200) else 4.9)
+    n_rows = len(d)
 
-    for _, row in d.iterrows():
-        # 1) Dosage profile
-        dosage_vals = []
-        for c in dosage_cols:
-            try:
-                v = float(row.get(c, np.nan))
-            except Exception:
-                v = float('nan')
-            dosage_vals.append(v if np.isfinite(v) else np.nan)
-        if np.isfinite(np.nansum(dosage_vals)) and np.isfinite(np.sum([np.isfinite(x) for x in dosage_vals])) and np.sum([np.isfinite(x) for x in dosage_vals]) >= 2 and np.nansum(dosage_vals) > 0:
-            b, i, c0, s0, p0 = [max(0.0, float(x) if np.isfinite(x) else 0.0) for x in dosage_vals]
+    # ── 1) Dosage profile (ベクトル化) ──
+    _dosage_mat = np.full((n_rows, 5), np.nan, dtype=float)
+    for j, c in enumerate(dosage_cols):
+        if c in d.columns:
+            _dosage_mat[:, j] = pd.to_numeric(d[c], errors='coerce').values
+    # 有効な行（2列以上 finite かつ合計>0）
+    _dosage_valid = (np.sum(np.isfinite(_dosage_mat), axis=1) >= 2) & (np.nansum(np.where(np.isfinite(_dosage_mat), _dosage_mat, 0.0), axis=1) > 0)
+    _dosage_mat_clipped = np.where(np.isfinite(_dosage_mat), np.maximum(0.0, _dosage_mat), 0.0)
+    dosage_scores = []
+    for i in range(n_rows):
+        if _dosage_valid[i]:
+            b, ii, c0, s0, p0 = _dosage_mat_clipped[i]
         else:
-            nums = _pedigree_parse_num_list(row.get('dosage_profile', ''))
+            _dp = str(d.iloc[i].get('dosage_profile', '') or '') if hasattr(d.iloc[i], 'get') else ''
+            nums = _pedigree_parse_num_list(_dp)
             if len(nums) >= 5:
-                b, i, c0, s0, p0 = [max(0.0, float(x)) for x in nums[:5]]
+                b, ii, c0, s0, p0 = [max(0.0, float(x)) for x in nums[:5]]
             else:
-                b = i = c0 = s0 = p0 = 0.0
-        dosage_fit = _pedigree_profile_fit_from_points(b, i, c0, s0, p0, dist, surface, is_tokyo1400=is_tokyo1400)
-        dosage_scores.append(dosage_fit)
+                b = ii = c0 = s0 = p0 = 0.0
+        dosage_scores.append(_pedigree_profile_fit_from_points(b, ii, c0, s0, p0, _dist, _surface, is_tokyo1400=_is_tok))
 
-        # 2) Chef-de-race 6分類フラグ相当
-        chef_counts = {'b': 0.0, 'i': 0.0, 'c': 0.0, 's': 0.0, 'p': 0.0}
-        for out_key, col in zip(['b', 'i', 'c', 's', 'p'], chef_flag_cols):
-            try:
-                vv = float(row.get(col, np.nan))
-            except Exception:
-                vv = float('nan')
-            if np.isfinite(vv):
-                chef_counts[out_key] = 1.0 if vv >= 0.5 else 0.0
-        if sum(chef_counts.values()) <= 0.0:
-            parsed = _pedigree_category_counts_from_text(' '.join([
-                str(row.get('chef_race_class', '') or ''),
-                str(row.get('chef_de_race', '') or ''),
-                str(row.get('chef_flags', '') or ''),
-            ]).strip())
-            if sum(parsed.values()) > 0.0:
-                chef_counts = parsed
-        chef_fit = _pedigree_profile_fit_from_points(
-            chef_counts['b'], chef_counts['i'], chef_counts['c'], chef_counts['s'], chef_counts['p'],
-            dist, surface, is_tokyo1400=is_tokyo1400,
-        ) if sum(chef_counts.values()) > 0.0 else 50.0
-        chef_scores.append(chef_fit)
-
-        # 3) BM-Sire2（祖母父）
-        bm_text = ' '.join([
-            str(row.get('bm_sire2', '') or ''),
-            str(row.get('bm_sire2_profile', '') or ''),
-            str(row.get('bm_sire2_type', '') or ''),
-        ]).strip()
-        bm_rates = []
-        for c in ['bm_sire2_tokyo1400_rate', 'bm_sire2_course_rate', 'bm_sire2_distance_rate']:
-            pv = _pedigree_pct_value(row.get(c, np.nan))
-            if np.isfinite(pv):
-                bm_rates.append(pv)
-        bm_counts = _pedigree_category_counts_from_text(bm_text)
-        bm_profile_fit = _pedigree_profile_fit_from_points(
-            bm_counts['b'], bm_counts['i'], bm_counts['c'], bm_counts['s'], bm_counts['p'],
-            dist, surface, is_tokyo1400=is_tokyo1400,
-        ) if sum(bm_counts.values()) > 0.0 else 50.0
-        if bm_rates:
-            bm_rate_fit = float(np.mean(bm_rates))
-            bm_fit = 0.60 * bm_rate_fit + 0.40 * bm_profile_fit
+    # ── 2) Chef-de-race (ベクトル化) ──
+    _chef_mat = np.full((n_rows, 5), np.nan, dtype=float)
+    for j, c in enumerate(chef_flag_cols):
+        if c in d.columns:
+            _chef_mat[:, j] = pd.to_numeric(d[c], errors='coerce').values
+    _chef_flag_mat = np.where(np.isfinite(_chef_mat), (_chef_mat >= 0.5).astype(float), np.nan)
+    _chef_has_data = np.sum(np.isfinite(_chef_flag_mat), axis=1) > 0
+    chef_scores = []
+    for i in range(n_rows):
+        if _chef_has_data[i]:
+            cf = np.where(np.isfinite(_chef_flag_mat[i]), _chef_flag_mat[i], 0.0)
+            b, ii, c0, s0, p0 = cf
         else:
-            bm_fit = bm_profile_fit
+            _row_i = d.iloc[i]
+            _txt = ' '.join([str(_row_i.get('chef_race_class', '') or ''),
+                             str(_row_i.get('chef_de_race', '') or ''),
+                             str(_row_i.get('chef_flags', '') or '')]).strip()
+            parsed = _pedigree_category_counts_from_text(_txt)
+            if sum(parsed.values()) > 0.0:
+                b, ii, c0, s0, p0 = parsed['b'], parsed['i'], parsed['c'], parsed['s'], parsed['p']
+            else:
+                b = ii = c0 = s0 = p0 = 0.0
+        chef_scores.append(
+            _pedigree_profile_fit_from_points(b, ii, c0, s0, p0, _dist, _surface, is_tokyo1400=_is_tok)
+            if (b + ii + c0 + s0 + p0) > 0.0 else 50.0
+        )
+
+    # ── 3) BM-Sire2 (ベクトル化) ──
+    _bm_rate_cols = ['bm_sire2_tokyo1400_rate', 'bm_sire2_course_rate', 'bm_sire2_distance_rate']
+    _bm_rates_mat = np.full((n_rows, 3), np.nan, dtype=float)
+    for j, c in enumerate(_bm_rate_cols):
+        if c in d.columns:
+            _bm_rates_mat[:, j] = pd.to_numeric(d[c], errors='coerce').values
+    _bm_text_cols = ['bm_sire2', 'bm_sire2_profile', 'bm_sire2_type']
+    bm_scores = []
+    for i in range(n_rows):
+        _row_i = d.iloc[i]
+        bm_text = ' '.join([str(_row_i.get(c, '') or '') for c in _bm_text_cols]).strip()
+        bm_rates_valid = [float(v) for v in _bm_rates_mat[i] if np.isfinite(v)]
+        bm_counts = _pedigree_category_counts_from_text(bm_text)
+        bm_profile_fit = (_pedigree_profile_fit_from_points(
+            bm_counts['b'], bm_counts['i'], bm_counts['c'], bm_counts['s'], bm_counts['p'],
+            _dist, _surface, is_tokyo1400=_is_tok)
+            if sum(bm_counts.values()) > 0.0 else 50.0)
+        bm_fit = (0.60 * float(np.mean(bm_rates_valid)) + 0.40 * bm_profile_fit) if bm_rates_valid else bm_profile_fit
         bm_scores.append(float(clamp(bm_fit, 0.0, 100.0)))
 
-        # 4) クロス世代深度
-        raw_cross = ' '.join([
-            str(row.get('cross_depth', '') or ''),
-            str(row.get('cross_pattern', '') or ''),
-            str(row.get('inbreed_depth', '') or ''),
-            str(row.get('inbreed_pattern', '') or ''),
-        ]).strip()
-        try:
-            explicit_cross_depth = float(row.get('cross_depth', np.nan))
-        except Exception:
-            explicit_cross_depth = float('nan')
-        density = 0.0
-        if np.isfinite(explicit_cross_depth):
-            avg_depth = explicit_cross_depth
+    # ── 4) Cross depth (ベクトル化可能な部分のみ) ──
+    _cd_col = 'cross_depth'
+    _cross_depth_vec = pd.to_numeric(d[_cd_col], errors='coerce').values if _cd_col in d.columns else np.full(n_rows, np.nan)
+    cross_scores = []
+    for i in range(n_rows):
+        if np.isfinite(_cross_depth_vec[i]):
+            avg_depth = float(_cross_depth_vec[i])
             density = 1.0
         else:
+            _row_i = d.iloc[i]
+            raw_cross = ' '.join([str(_row_i.get(c, '') or '') for c in ['cross_depth', 'cross_pattern', 'inbreed_depth', 'inbreed_pattern']]).strip()
             nums = _pedigree_parse_num_list(raw_cross)
             if len(nums) >= 2 and (('X' in raw_cross.upper()) or ('×' in raw_cross)):
-                pair_vals = []
-                for i_pair in range(0, len(nums) - 1, 2):
-                    pair_vals.append((nums[i_pair] + nums[i_pair + 1]) / 2.0)
+                pair_vals = [(nums[k] + nums[k + 1]) / 2.0 for k in range(0, len(nums) - 1, 2)]
                 avg_depth = float(np.mean(pair_vals)) if pair_vals else float('nan')
                 density = float(len(pair_vals))
             elif nums:
@@ -14260,40 +17682,39 @@ def add_high_granularity_pedigree_features(
                 density = float(len(nums[:min(4, len(nums))]))
             else:
                 avg_depth = float('nan')
-        if np.isfinite(dist) and dist <= 1400:
-            target_depth = 3.9
-        elif np.isfinite(dist) and dist <= 1800:
-            target_depth = 4.2
-        elif np.isfinite(dist) and dist <= 2200:
-            target_depth = 4.6
-        else:
-            target_depth = 4.9
+                density = 0.0
         if np.isfinite(avg_depth):
-            cross_fit = 100.0 - abs(avg_depth - target_depth) * 18.0 - max(0.0, density - 3.0) * 4.0
-            if is_tokyo1400 and 3.5 <= avg_depth <= 4.5:
+            cross_fit = 100.0 - abs(avg_depth - _target_depth) * 18.0 - max(0.0, density - 3.0) * 4.0
+            if _is_tok and 3.5 <= avg_depth <= 4.5:
                 cross_fit += 6.0
-            cross_fit = float(clamp(cross_fit, 0.0, 100.0))
+            cross_scores.append(float(clamp(cross_fit, 0.0, 100.0)))
         else:
-            cross_fit = 50.0
-        cross_scores.append(cross_fit)
+            cross_scores.append(50.0)
 
-        # 5) 東京芝1400 坂上ラップ順位分布 embedding
-        emb_vals = []
-        for c in tokyo_emb_cols:
-            try:
-                ev = float(row.get(c, np.nan))
-            except Exception:
-                ev = float('nan')
-            if np.isfinite(ev):
-                emb_vals.append(ev)
-        if emb_vals:
-            emb4 = emb_vals[:4] + [0.0] * max(0, 4 - len(emb_vals[:4]))
+    # ── 5) Tokyo 1400 embedding (ベクトル化) ──
+    _emb_mat = np.full((n_rows, len(tokyo_emb_cols)), np.nan, dtype=float)
+    for j, c in enumerate(tokyo_emb_cols):
+        if c in d.columns:
+            _emb_mat[:, j] = pd.to_numeric(d[c], errors='coerce').values
+    _emb_valid_counts = np.sum(np.isfinite(_emb_mat), axis=1)
+    # stat cols for fallback
+    _stat_cols = ['tokyo1400_slope_lap_rank_mean', 'tokyo1400_slope_lap_rank_median',
+                  'tokyo1400_slope_lap_rank_top3_rate', 'tokyo1400_slope_lap_rank_top5_rate']
+    _stat_mat = np.full((n_rows, 4), np.nan, dtype=float)
+    for j, c in enumerate(_stat_cols):
+        if c in d.columns:
+            _stat_mat[:, j] = pd.to_numeric(d[c], errors='coerce').values
+    tokyo_scores = []
+    for i in range(n_rows):
+        emb_valid = [float(v) for v in _emb_mat[i] if np.isfinite(v)]
+        if emb_valid:
+            emb4 = emb_valid[:4] + [0.0] * max(0, 4 - len(emb_valid[:4]))
             tokyo_fit = 50.0 + 18.0 * emb4[0] + 12.0 * emb4[1] - 8.0 * abs(emb4[2]) + 6.0 * emb4[3]
         else:
-            mean_rank = _pedigree_pct_value(row.get('tokyo1400_slope_lap_rank_mean', np.nan))
-            median_rank = _pedigree_pct_value(row.get('tokyo1400_slope_lap_rank_median', np.nan))
-            top3_rate = _pedigree_pct_value(row.get('tokyo1400_slope_lap_rank_top3_rate', np.nan))
-            top5_rate = _pedigree_pct_value(row.get('tokyo1400_slope_lap_rank_top5_rate', np.nan))
+            mean_rank = _pedigree_pct_value(_stat_mat[i, 0])
+            median_rank = _pedigree_pct_value(_stat_mat[i, 1])
+            top3_rate = _pedigree_pct_value(_stat_mat[i, 2])
+            top5_rate = _pedigree_pct_value(_stat_mat[i, 3])
             stat_parts = []
             if np.isfinite(mean_rank) and mean_rank > 1.5:
                 stat_parts.append(clamp(100.0 - (mean_rank - 1.0) * 100.0 / 17.0, 0.0, 100.0))
@@ -14305,11 +17726,11 @@ def add_high_granularity_pedigree_features(
                 stat_parts.append(0.8 * top5_rate)
             if stat_parts:
                 tokyo_fit = float(np.mean(stat_parts))
-            elif is_tokyo1400:
-                tokyo_fit = 0.55 * dosage_fit + 0.25 * bm_scores[-1] + 0.20 * cross_fit
+            elif _is_tok:
+                tokyo_fit = 0.55 * dosage_scores[i] + 0.25 * bm_scores[i] + 0.20 * cross_scores[i]
             else:
                 tokyo_fit = 50.0
-        if not is_tokyo1400:
+        if not _is_tok:
             tokyo_fit = 50.0 + (float(tokyo_fit) - 50.0) * 0.55
         tokyo_scores.append(float(clamp(tokyo_fit, 0.0, 100.0)))
 
@@ -14337,9 +17758,9 @@ def add_high_granularity_pedigree_features(
         + (d['PedigreeChefRaceFit'].sub(50.0).abs() >= 1.0).astype(float)
         + (d['PedigreeTokyo1400LapFit'].sub(50.0).abs() >= 1.0).astype(float)
     )
-    confidence_scale = (0.45 + 0.11 * signal_count).clip(lower=0.45, upper=1.0)
+    confidence_scale = _clip_series((0.45 + 0.11 * signal_count), 0.45, 1.0)
     d['PedigreeFineFit'] = _num_series(50.0 + (pedigree_fine - 50.0) * confidence_scale, 50.0, index=d.index, lower=0.0, upper=100.0)
-    d['PedigreeFineDelta'] = (d['PedigreeFineFit'] - 50.0).clip(lower=-20.0, upper=20.0).astype(float)
+    d['PedigreeFineDelta'] = _clip_series((d['PedigreeFineFit'] - 50.0), -20.0, 20.0).astype(float)
     return d
 
 
@@ -14370,29 +17791,29 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     bucket = _course_profile_distance_bucket(dist)
 
     if 'RunningStyleLabel' in d.columns:
-        style_col = d['RunningStyleLabel'].astype(str).apply(normalize_zone_token)
+        style_col = d['RunningStyleLabel'].astype(str).map(normalize_zone_token)
     else:
-        style_col = d.get('zone_4c', pd.Series(['MIDDLE'] * len(d), index=d.index)).astype(str).apply(normalize_zone_token)
+        style_col = (d['zone_4c'] if 'zone_4c' in d.columns else pd.Series('MIDDLE', index=d.index)).astype(str).map(normalize_zone_token)
 
     style_fit = style_col.map(
         lambda z: clamp(50.0 + 24.0 * float(style_bias.get(z, 0.0) or 0.0), 0.0, 100.0)
     ).astype(float)
 
-    pf = _num_series(d.get('pred_first3f', np.nan), index=d.index)
-    pl = _num_series(d.get('pred_last3f', np.nan), index=d.index)
+    pf = _num_series(d, 'pred_first3f', np.nan) if 'pred_first3f' in d.columns else pd.Series(np.nan, index=d.index, dtype=float)
+    pl = _num_series(d, 'pred_last3f', np.nan) if 'pred_last3f' in d.columns else pd.Series(np.nan, index=d.index, dtype=float)
     early_speed = (_series_norm01(pf, lower_is_better=True, neutral=0.5) * 100.0).astype(float)
     late_speed = (_series_norm01(pl, lower_is_better=True, neutral=0.5) * 100.0).astype(float)
 
-    ability = _num_series(d.get('Ability', 50.0), 50.0, index=d.index)
-    posfit = _num_series(d.get('PosFit', 50.0), 50.0, index=d.index)
-    mapfit = _num_series(d.get('MapFit', 50.0), 50.0, index=d.index)
-    gatefit = _num_series(d.get('GateFit', 50.0), 50.0, index=d.index)
-    pacefit = _num_series(d.get('PaceFit', 50.0), 50.0, index=d.index)
-    condfit = _num_series(d.get('ConditionFit', 50.0), 50.0, index=d.index)
-    factorfit = _num_series(d.get('FactorFit', 50.0), 50.0, index=d.index)
-    michfit = _num_series(d.get('MichiakuFit', factorfit), 50.0, index=d.index)
-    consist = _num_series(d.get('Consist', 50.0), 50.0, index=d.index)
-    comment_trend = _num_series(d.get('CommentTrend', 50.0), 50.0, index=d.index)
+    ability = _num_series(d, 'Ability', 50.0) if 'Ability' in d.columns else _s50.copy()
+    posfit = _num_series(d, 'PosFit', 50.0) if 'PosFit' in d.columns else _s50.copy()
+    mapfit = _num_series(d, 'MapFit', 50.0) if 'MapFit' in d.columns else _s50.copy()
+    gatefit = _num_series(d, 'GateFit', 50.0) if 'GateFit' in d.columns else _s50.copy()
+    pacefit = _num_series(d, 'PaceFit', 50.0) if 'PaceFit' in d.columns else _s50.copy()
+    condfit = _num_series(d, 'ConditionFit', 50.0) if 'ConditionFit' in d.columns else _s50.copy()
+    factorfit = _num_series(d, 'FactorFit', 50.0) if 'FactorFit' in d.columns else _s50.copy()
+    michfit = _num_series(d, 'MichiakuFit', 50.0) if 'MichiakuFit' in d.columns else factorfit
+    consist = _num_series(d, 'Consist', 50.0) if 'Consist' in d.columns else _s50.copy()
+    comment_trend = _num_series(d, 'CommentTrend', 50.0) if 'CommentTrend' in d.columns else _s50.copy()
     lap_shape_meta = _lap_shape_meta_features(meta)
     try:
         start_to_corner_dist = float(lap_shape_meta.get('start_to_corner_dist', float('nan')))
@@ -14427,55 +17848,69 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     start_short_bias = float(np.clip((0.50 - start_corner_norm) * 2.0, -1.0, 1.0))
     straight_long_bias = float(np.clip((straight_len_norm - 0.50) * 2.0, -1.0, 1.0))
 
-    straight_fit = (0.56 * late_speed + 0.24 * ability + 0.10 * pacefit + 0.10 * comment_trend).clip(lower=0.0, upper=100.0)
-    corner_fit = (0.44 * posfit + 0.30 * mapfit + 0.16 * gatefit + 0.10 * pacefit).clip(lower=0.0, upper=100.0)
-    stamina_fit = (0.46 * consist + 0.30 * condfit + 0.14 * factorfit + 0.10 * ability).clip(lower=0.0, upper=100.0)
-    power_fit = (0.40 * condfit + 0.30 * factorfit + 0.20 * ability + 0.10 * michfit).clip(lower=0.0, upper=100.0)
-    speed_fit = (0.42 * ability + 0.28 * early_speed + 0.20 * pacefit + 0.10 * gatefit).clip(lower=0.0, upper=100.0)
-    agility_fit = (0.36 * posfit + 0.34 * mapfit + 0.20 * gatefit + 0.10 * late_speed).clip(lower=0.0, upper=100.0)
+    _didx = d.index
+    straight_fit = _wsum0100(_didx, (0.56, late_speed), (0.24, ability), (0.10, pacefit), (0.10, comment_trend))
+    corner_fit   = _wsum0100(_didx, (0.44, posfit), (0.30, mapfit), (0.16, gatefit), (0.10, pacefit))
+    stamina_fit  = _wsum0100(_didx, (0.46, consist), (0.30, condfit), (0.14, factorfit), (0.10, ability))
+    power_fit    = _wsum0100(_didx, (0.40, condfit), (0.30, factorfit), (0.20, ability), (0.10, michfit))
+    speed_fit    = _wsum0100(_didx, (0.42, ability), (0.28, early_speed), (0.20, pacefit), (0.10, gatefit))
+    agility_fit  = _wsum0100(_didx, (0.36, posfit), (0.34, mapfit), (0.20, gatefit), (0.10, late_speed))
 
     if _is_wet_track(meta):
         wet_boost = 3.5 + 2.5 * float(profile.get('power', 0.5) or 0.5)
-        power_fit = (power_fit + ((michfit - 50.0) / 50.0) * wet_boost + ((factorfit - 50.0) / 50.0) * 2.0).clip(lower=0.0, upper=100.0)
+        power_fit = _clip0100((power_fit + ((michfit - 50.0) / 50.0) * wet_boost + ((factorfit - 50.0) / 50.0) * 2.0))
     if venue in {'札幌', '函館'} and surface == 'turf':
-        power_fit = (power_fit + 0.10 * (factorfit - 50.0)).clip(lower=0.0, upper=100.0)
+        power_fit = _clip0100((power_fit + 0.10 * (factorfit - 50.0)))
     if venue == '東京' and surface == 'turf':
-        straight_fit = (straight_fit + 0.08 * (late_speed - 50.0)).clip(lower=0.0, upper=100.0)
+        straight_fit = _clip0100((straight_fit + 0.08 * (late_speed - 50.0)))
     if venue == '中山' and surface == 'turf':
-        stamina_fit = (stamina_fit + 0.08 * (consist - 50.0)).clip(lower=0.0, upper=100.0)
+        stamina_fit = _clip0100((stamina_fit + 0.08 * (consist - 50.0)))
     if venue in {'福島', '小倉', '札幌', '函館'}:
-        agility_fit = (agility_fit + 0.08 * (mapfit - 50.0)).clip(lower=0.0, upper=100.0)
+        agility_fit = _clip0100((agility_fit + 0.08 * (mapfit - 50.0)))
     if surface == 'dirt' and np.isfinite(dist) and dist <= 1400:
-        speed_fit = (0.60 * speed_fit + 0.40 * early_speed).clip(lower=0.0, upper=100.0)
+        speed_fit = _clip0100((0.60 * speed_fit + 0.40 * early_speed))
 
-    draw_raw = pd.Series([np.nan] * len(d), index=d.index, dtype=float)
+    draw_raw = pd.Series(np.nan, index=d.index, dtype=float)
     for c in ['frame', 'waku', 'draw', 'draw_num', 'post_position']:
         if c in d.columns:
             cand = pd.to_numeric(d[c], errors='coerce')
             if cand.notna().sum() > 0:
                 draw_raw = cand
                 break
-    draw_zone = pd.Series(['middle'] * len(d), index=d.index, dtype=object)
+    draw_zone = pd.Series('middle', index=d.index, dtype=object)
     if draw_raw.notna().sum() > 0:
-        if float(draw_raw.max(skipna=True)) <= 8.5:
-            draw_zone = draw_raw.apply(lambda x: 'inner' if np.isfinite(x) and x <= 4.0 else ('outer' if np.isfinite(x) and x >= 5.0 else 'middle'))
-        else:
-            draw_zone = draw_raw.apply(lambda x: 'inner' if np.isfinite(x) and x <= 6.0 else ('outer' if np.isfinite(x) and x >= 13.0 else 'middle'))
+        _draw_vals = draw_raw.values
+        _draw_max = float(np.nanmax(_draw_vals)) if np.any(np.isfinite(_draw_vals)) else np.nan
+        if np.isfinite(_draw_max):
+            if _draw_max <= 8.5:
+                draw_zone = pd.Series(
+                    np.where(~np.isfinite(_draw_vals), 'middle',
+                             np.where(_draw_vals <= 4.0, 'inner',
+                                      np.where(_draw_vals >= 5.0, 'outer', 'middle'))),
+                    index=d.index, dtype=object)
+            else:
+                draw_zone = pd.Series(
+                    np.where(~np.isfinite(_draw_vals), 'middle',
+                             np.where(_draw_vals <= 6.0, 'inner',
+                                      np.where(_draw_vals >= 13.0, 'outer', 'middle'))),
+                    index=d.index, dtype=object)
 
-    rail_bias_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
-    class_pace_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
-    tokyo1400_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
-    course_special_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
-    course_runup_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
-    course_straight_shape_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
-    course_shape_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
-    distance_style_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
-    distance_draw_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
-    distance_specific_fit = pd.Series([50.0] * len(d), index=d.index, dtype=float)
+    # 一括スカラーSeries初期化（50.0）
+    _s50 = pd.Series(50.0, index=d.index, dtype=float)
+    rail_bias_fit = _s50.copy()
+    class_pace_fit = _s50.copy()
+    tokyo1400_fit = _s50.copy()
+    course_special_fit = _s50.copy()
+    course_runup_fit = _s50.copy()
+    course_straight_shape_fit = _s50.copy()
+    course_shape_fit = _s50.copy()
+    distance_style_fit = _s50.copy()
+    distance_draw_fit = _s50.copy()
+    distance_specific_fit = _s50.copy()
     pedigree_bm_fit = _num_series(d.get('PedigreeBmSire2Fit', 50.0), 50.0, index=d.index)
-    pedigree_cross_fit = _num_series(d.get('PedigreeCrossDepthFit', 50.0), 50.0, index=d.index)
+    _ = _num_series(d.get('PedigreeCrossDepthFit', 50.0), 50.0, index=d.index)
     pedigree_dosage_fit = _num_series(d.get('PedigreeDosageFit', 50.0), 50.0, index=d.index)
-    pedigree_chef_fit = _num_series(d.get('PedigreeChefRaceFit', 50.0), 50.0, index=d.index)
+    _ = _num_series(d.get('PedigreeChefRaceFit', 50.0), 50.0, index=d.index)
     pedigree_tokyo1400_fit = _num_series(d.get('PedigreeTokyo1400LapFit', 50.0), 50.0, index=d.index)
     pedigree_fine_fit = _num_series(d.get('PedigreeFineFit', 50.0), 50.0, index=d.index)
 
@@ -14485,22 +17920,23 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     straight_style_bonus = style_col.map(
         lambda z: (6.0 * straight_long_bias if z == 'REAR' else (1.8 * straight_long_bias if z == 'MIDDLE' else -4.8 * straight_long_bias))
     ).astype(float)
-    course_runup_fit = (
-        50.0
-        + (early_speed - 50.0) * (0.28 + max(start_short_bias, 0.0) * 0.30)
-        + (gatefit - 50.0) * (0.20 + max(start_short_bias, 0.0) * 0.20)
-        + (agility_fit - 50.0) * 0.18
-        + (late_speed - 50.0) * max(-start_short_bias, 0.0) * 0.26
-        + runup_style_bonus
-    ).clip(lower=0.0, upper=100.0)
-    course_straight_shape_fit = (
-        50.0
-        + (late_speed - 50.0) * (0.30 + max(straight_long_bias, 0.0) * 0.34)
-        + (straight_fit - 50.0) * 0.24
-        + (early_speed - 50.0) * (0.16 + max(-straight_long_bias, 0.0) * 0.22)
-        + straight_style_bonus
-    ).clip(lower=0.0, upper=100.0)
-    course_shape_fit = (0.52 * course_runup_fit + 0.48 * course_straight_shape_fit).clip(lower=0.0, upper=100.0)
+    _es = early_speed.values; _gf = gatefit.values; _af = agility_fit.values
+    _ls = late_speed.values; _rsb = runup_style_bonus.values
+    _w_es = 0.28 + max(start_short_bias, 0.0) * 0.30
+    _w_gf = 0.20 + max(start_short_bias, 0.0) * 0.20
+    _w_ls_neg = max(-start_short_bias, 0.0) * 0.26
+    course_runup_fit = _make_series(np.clip(
+        50.0 + (_es - 50.0) * _w_es + (_gf - 50.0) * _w_gf
+             + (_af - 50.0) * 0.18 + (_ls - 50.0) * _w_ls_neg + _rsb,
+        0.0, 100.0), _didx)
+    _sf = straight_fit.values; _ssb = straight_style_bonus.values
+    _w_ls2 = 0.30 + max(straight_long_bias, 0.0) * 0.34
+    _w_es2 = 0.16 + max(-straight_long_bias, 0.0) * 0.22
+    course_straight_shape_fit = _make_series(np.clip(
+        50.0 + (_ls - 50.0) * _w_ls2 + (_sf - 50.0) * 0.24
+             + (_es - 50.0) * _w_es2 + _ssb,
+        0.0, 100.0), _didx)
+    course_shape_fit = _wsum0100(_didx, (0.52, course_runup_fit), (0.48, course_straight_shape_fit))
 
     if distance_key:
         if distance_style_bias:
@@ -14508,9 +17944,9 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
                 lambda z: clamp(50.0 + 30.0 * float(distance_style_bias.get(z, 0.0) or 0.0), 0.0, 100.0)
             ).astype(float)
         if distance_draw_bias:
-            distance_draw_fit = (distance_draw_fit + draw_zone.map(
+            distance_draw_fit = _clip0100((distance_draw_fit + draw_zone.map(
                 lambda z: 100.0 * float(distance_draw_bias.get(z, 0.0) or 0.0)
-            ).astype(float)).clip(lower=0.0, upper=100.0)
+            ).astype(float)))
         dsw_style = 0.18 + (0.10 * max([abs(float(v)) for v in distance_style_bias.values()] or [0.0]))
         dsw_straight = 0.10 + 0.40 * max(float(distance_patch.get('straight', 0.0) or 0.0), 0.0)
         dsw_corner = 0.10 + 0.40 * max(float(distance_patch.get('corner', 0.0) or 0.0), 0.0)
@@ -14533,11 +17969,11 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
             + dsw_draw * distance_draw_fit
         ) / max(1e-9, float(dsw_total))
         if _is_wet_track(meta) and float(distance_patch.get('power', 0.0) or 0.0) > 0.0:
-            distance_specific_fit = (
+            distance_specific_fit = _clip0100((
                 distance_specific_fit
                 + (0.08 + 0.20 * float(distance_patch.get('power', 0.0) or 0.0)) * (power_fit - 50.0)
                 + 0.03 * (michfit - 50.0)
-            ).clip(lower=0.0, upper=100.0)
+            ))
         if distance_source in {'blend', 'nearest', 'heuristic'}:
             if distance_source == 'blend':
                 confidence_scale = min(0.68 + 0.32 * distance_confidence, 0.94)
@@ -14545,34 +17981,29 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
                 confidence_scale = min(0.68 + 0.32 * distance_confidence, 0.88)
             else:
                 confidence_scale = min(0.60 + 0.24 * distance_confidence, 0.82)
-            distance_specific_fit = (50.0 + (distance_specific_fit - 50.0) * confidence_scale).clip(lower=0.0, upper=100.0)
+            distance_specific_fit = _clip0100((50.0 + (distance_specific_fit - 50.0) * confidence_scale))
 
-    rail_bias_fit = (
-        0.42 * distance_draw_fit
-        + 0.24 * gatefit
-        + 0.20 * style_fit
-        + 0.14 * agility_fit
-    ).clip(lower=0.0, upper=100.0)
+    rail_bias_fit = _wsum0100(_didx, (0.42, distance_draw_fit), (0.24, gatefit), (0.20, style_fit), (0.14, agility_fit))
     if surface == 'turf':
         straight_corner_gap = float(profile.get('straight', 0.5) or 0.5) - float(profile.get('corner', 0.5) or 0.5)
         if rail_setting == 'B':
-            rail_bias_fit = (
+            rail_bias_fit = _clip0100((
                 rail_bias_fit
                 + draw_zone.map(lambda z: 3.0 if z == 'outer' else (-2.0 if z == 'inner' else 0.8)).astype(float)
                 + style_col.map(
                     lambda z: 2.5 if (straight_corner_gap >= -0.02 and z == 'REAR') else (1.0 if z == 'MIDDLE' else -1.2)
                 ).astype(float)
-            ).clip(lower=0.0, upper=100.0)
+            ))
         elif rail_setting == 'C':
-            rail_bias_fit = (
+            rail_bias_fit = _clip0100((
                 rail_bias_fit
                 + draw_zone.map(lambda z: 3.0 if z == 'inner' else (-2.0 if z == 'outer' else 0.8)).astype(float)
                 + style_col.map(
                     lambda z: 2.5 if (straight_corner_gap < 0.02 and z == 'FRONT') else (1.2 if z == 'MIDDLE' else -0.8)
                 ).astype(float)
-            ).clip(lower=0.0, upper=100.0)
+            ))
         elif rail_setting == 'A':
-            rail_bias_fit = (rail_bias_fit + draw_zone.map(lambda z: 1.0 if z == 'middle' else 0.0).astype(float)).clip(lower=0.0, upper=100.0)
+            rail_bias_fit = _clip0100((rail_bias_fit + draw_zone.map(lambda z: 1.0 if z == 'middle' else 0.0).astype(float)))
 
     if surface == 'dirt':
         if np.isfinite(dist) and dist <= 1400:
@@ -14591,19 +18022,13 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
         else:
             cp_early_w, cp_late_w, cp_stamina_w, cp_power_w, cp_style_w = 0.16, 0.28, 0.30, 0.14, 0.12
 
-    class_pace_fit = (
-        cp_early_w * early_speed
-        + cp_late_w * late_speed
-        + cp_stamina_w * stamina_fit
-        + cp_power_w * power_fit
-        + cp_style_w * style_fit
-    ).clip(lower=0.0, upper=100.0)
+    class_pace_fit = _wsum0100(_didx, (cp_early_w, early_speed), (cp_late_w, late_speed), (cp_stamina_w, stamina_fit), (cp_power_w, power_fit), (cp_style_w, style_fit))
     if class_id >= 4:
-        class_pace_fit = (class_pace_fit + 0.10 * (late_speed - 50.0) + 0.06 * (stamina_fit - 50.0)).clip(lower=0.0, upper=100.0)
+        class_pace_fit = _clip0100((class_pace_fit + 0.10 * (late_speed - 50.0) + 0.06 * (stamina_fit - 50.0)))
     elif class_id >= 2:
-        class_pace_fit = (class_pace_fit + 0.05 * (late_speed - 50.0) + 0.03 * (style_fit - 50.0)).clip(lower=0.0, upper=100.0)
+        class_pace_fit = _clip0100((class_pace_fit + 0.05 * (late_speed - 50.0) + 0.03 * (style_fit - 50.0)))
     elif class_id in {0, 1}:
-        class_pace_fit = (class_pace_fit + 0.10 * (early_speed - 50.0) + 0.04 * (gatefit - 50.0)).clip(lower=0.0, upper=100.0)
+        class_pace_fit = _clip0100((class_pace_fit + 0.10 * (early_speed - 50.0) + 0.04 * (gatefit - 50.0)))
 
     if is_tokyo1400:
         rail_bias = TOKYO_TURF_1400_RAIL_BIAS.get(rail_setting or 'A', TOKYO_TURF_1400_RAIL_BIAS.get('A', {}))
@@ -14619,7 +18044,7 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
             rail_bias_fit = rail_bias_fit + style_col.map(lambda z: 4.0 if z == 'FRONT' else (1.5 if z == 'MIDDLE' else -1.0)).astype(float)
         elif month in {10, 11}:
             rail_bias_fit = rail_bias_fit + style_col.map(lambda z: 3.0 if z == 'FRONT' else (1.0 if z == 'MIDDLE' else 0.0)).astype(float)
-        rail_bias_fit = rail_bias_fit.clip(lower=0.0, upper=100.0)
+        rail_bias_fit = _clip0100(rail_bias_fit)
 
         if class_ref:
             target_front = float(class_ref.get('front3f', np.nan))
@@ -14629,51 +18054,39 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
             early_pen = (pf - target_front).abs() * 18.0
             late_pen = (pl - target_back).abs() * 15.0
             dev_pen = (pace_dev - target_dev).abs() * 12.0
-            class_pace_fit = (100.0 - early_pen - late_pen - dev_pen).clip(lower=0.0, upper=100.0)
+            class_pace_fit = _clip0100((100.0 - early_pen - late_pen - dev_pen))
             if class_id >= 4:
-                class_pace_fit = (class_pace_fit + style_col.map(lambda z: 4.0 if z == 'REAR' else (1.5 if z == 'MIDDLE' else -2.5)).astype(float)).clip(lower=0.0, upper=100.0)
+                class_pace_fit = _clip0100((class_pace_fit + style_col.map(lambda z: 4.0 if z == 'REAR' else (1.5 if z == 'MIDDLE' else -2.5)).astype(float)))
             elif class_id >= 2:
-                class_pace_fit = (class_pace_fit + style_col.map(lambda z: 2.0 if z == 'REAR' else (1.0 if z == 'MIDDLE' else -1.0)).astype(float)).clip(lower=0.0, upper=100.0)
+                class_pace_fit = _clip0100((class_pace_fit + style_col.map(lambda z: 2.0 if z == 'REAR' else (1.0 if z == 'MIDDLE' else -1.0)).astype(float)))
             elif class_id in {0, 1}:
-                class_pace_fit = (class_pace_fit + style_col.map(lambda z: 3.0 if z == 'FRONT' else (1.0 if z == 'MIDDLE' else -1.5)).astype(float)).clip(lower=0.0, upper=100.0)
+                class_pace_fit = _clip0100((class_pace_fit + style_col.map(lambda z: 3.0 if z == 'FRONT' else (1.0 if z == 'MIDDLE' else -1.5)).astype(float)))
 
-        tokyo1400_fit = (
-            0.24 * rail_bias_fit
-            + 0.26 * class_pace_fit
-            + 0.12 * late_speed
-            + 0.08 * speed_fit
-            + 0.07 * straight_fit
-            + 0.07 * power_fit
-            + 0.10 * pedigree_tokyo1400_fit
-            + 0.04 * pedigree_dosage_fit
-            + 0.02 * pedigree_bm_fit
-        ).clip(lower=0.0, upper=100.0)
+        tokyo1400_fit = _wsum0100(_didx,
+            (0.24, rail_bias_fit), (0.26, class_pace_fit), (0.12, late_speed),
+            (0.08, speed_fit), (0.07, straight_fit), (0.07, power_fit),
+            (0.10, pedigree_tokyo1400_fit), (0.04, pedigree_dosage_fit), (0.02, pedigree_bm_fit),
+        )
         if _is_wet_track(meta):
-            tokyo1400_fit = (tokyo1400_fit + 0.14 * (power_fit - 50.0) + 0.06 * (michfit - 50.0)).clip(lower=0.0, upper=100.0)
+            tokyo1400_fit = _clip0100((tokyo1400_fit + 0.14 * (power_fit - 50.0) + 0.06 * (michfit - 50.0)))
 
-    course_special_fit = (
-        0.17 * rail_bias_fit
-        + 0.20 * class_pace_fit
-        + 0.18 * distance_specific_fit
-        + 0.10 * straight_fit
-        + 0.08 * corner_fit
-        + 0.07 * power_fit
-        + 0.05 * gatefit
-        + 0.08 * course_runup_fit
-        + 0.07 * course_straight_shape_fit
-    ).clip(lower=0.0, upper=100.0)
+    course_special_fit = _wsum0100(_didx,
+        (0.17, rail_bias_fit), (0.20, class_pace_fit), (0.18, distance_specific_fit),
+        (0.10, straight_fit), (0.08, corner_fit), (0.07, power_fit), (0.05, gatefit),
+        (0.08, course_runup_fit), (0.07, course_straight_shape_fit),
+    )
     if surface == 'dirt' and np.isfinite(dist) and dist <= 1400:
-        course_special_fit = (course_special_fit + 0.06 * (speed_fit - 50.0) + 0.04 * (early_speed - 50.0)).clip(lower=0.0, upper=100.0)
+        course_special_fit = _clip0100((course_special_fit + 0.06 * (speed_fit - 50.0) + 0.04 * (early_speed - 50.0)))
     elif bucket == 'long':
-        course_special_fit = (course_special_fit + 0.06 * (stamina_fit - 50.0) + 0.04 * (late_speed - 50.0)).clip(lower=0.0, upper=100.0)
+        course_special_fit = _clip0100((course_special_fit + 0.06 * (stamina_fit - 50.0) + 0.04 * (late_speed - 50.0)))
     if distance_source in {'blend', 'nearest', 'heuristic'} and distance_key:
         if distance_source == 'heuristic':
             special_scale = 0.66 + 0.20 * distance_confidence
         else:
             special_scale = 0.74 + 0.26 * distance_confidence
-        course_special_fit = (50.0 + (course_special_fit - 50.0) * special_scale).clip(lower=0.0, upper=100.0)
+        course_special_fit = _clip0100((50.0 + (course_special_fit - 50.0) * special_scale))
     if is_tokyo1400:
-        course_special_fit = (0.72 * course_special_fit + 0.28 * tokyo1400_fit).clip(lower=0.0, upper=100.0)
+        course_special_fit = _clip0100((0.72 * course_special_fit + 0.28 * tokyo1400_fit))
 
     style_w = 0.22
     straight_w = 0.12 + 0.10 * float(profile.get('straight', 0.5) or 0.5)
@@ -14693,47 +18106,47 @@ def add_course_profile_features(df: pd.DataFrame, meta: Dict[str, str], params: 
     tokyo_w = 0.08 if is_tokyo1400 else 0.0
     total_w = style_w + straight_w + corner_w + stamina_w + power_w + speed_w + gate_w + agility_w + shape_w + distance_w + special_w + pedigree_w + pedigree_tokyo_w + rail_w + classpace_w + tokyo_w
 
-    d['CourseStyleFit'] = _num_series(style_fit, 50.0, index=d.index)
-    d['CourseStraightFit'] = _num_series(straight_fit, 50.0, index=d.index)
-    d['CourseCornerFit'] = _num_series(corner_fit, 50.0, index=d.index)
-    d['CourseStaminaFit'] = _num_series(stamina_fit, 50.0, index=d.index)
-    d['CoursePowerFit'] = _num_series(power_fit, 50.0, index=d.index)
-    d['CourseSpeedFit'] = _num_series(speed_fit, 50.0, index=d.index)
-    d['CourseAgilityFit'] = _num_series(agility_fit, 50.0, index=d.index)
+    d['CourseStyleFit'] = style_fit
+    d['CourseStraightFit'] = straight_fit
+    d['CourseCornerFit'] = corner_fit
+    d['CourseStaminaFit'] = stamina_fit
+    d['CoursePowerFit'] = power_fit
+    d['CourseSpeedFit'] = speed_fit
+    d['CourseAgilityFit'] = agility_fit
     d['CourseStartToCornerDist'] = float(start_to_corner_dist) if np.isfinite(start_to_corner_dist) else np.nan
     d['CourseStraightLen'] = float(straight_len) if np.isfinite(straight_len) else np.nan
-    d['CourseRunupFit'] = _num_series(course_runup_fit, 50.0, index=d.index)
-    d['CourseStraightShapeFit'] = _num_series(course_straight_shape_fit, 50.0, index=d.index)
-    d['CourseShapeFit'] = _num_series(course_shape_fit, 50.0, index=d.index)
-    d['CourseDistanceStyleFit'] = _num_series(distance_style_fit, 50.0, index=d.index)
-    d['CourseDistanceDrawFit'] = _num_series(distance_draw_fit, 50.0, index=d.index)
-    d['CourseDistanceSpecificFit'] = _num_series(distance_specific_fit, 50.0, index=d.index)
-    d['CourseSpecialFit'] = _num_series(course_special_fit, 50.0, index=d.index)
-    d['CoursePedigreeFineFit'] = _num_series(pedigree_fine_fit, 50.0, index=d.index)
-    d['CoursePedigreeTokyo1400Fit'] = _num_series(pedigree_tokyo1400_fit, 50.0, index=d.index)
-    d['CourseRailBiasFit'] = _num_series(rail_bias_fit, 50.0, index=d.index)
-    d['CourseClassPaceFit'] = _num_series(class_pace_fit, 50.0, index=d.index)
-    d['CourseTokyo1400Fit'] = _num_series(tokyo1400_fit, 50.0, index=d.index)
-    d['CourseProfileFit'] = (
-        style_w * d['CourseStyleFit']
-        + straight_w * d['CourseStraightFit']
-        + corner_w * d['CourseCornerFit']
-        + stamina_w * d['CourseStaminaFit']
-        + power_w * d['CoursePowerFit']
-        + speed_w * d['CourseSpeedFit']
-        + gate_w * gatefit
-        + agility_w * d['CourseAgilityFit']
-        + shape_w * d['CourseShapeFit']
-        + distance_w * d['CourseDistanceSpecificFit']
-        + special_w * d['CourseSpecialFit']
-        + pedigree_w * d['CoursePedigreeFineFit']
-        + pedigree_tokyo_w * d['CoursePedigreeTokyo1400Fit']
-        + rail_w * d['CourseRailBiasFit']
-        + classpace_w * d['CourseClassPaceFit']
-        + tokyo_w * d['CourseTokyo1400Fit']
-    ) / max(1e-9, float(total_w))
-    d['CourseProfileFit'] = _num_series(d['CourseProfileFit'], 50.0, index=d.index, lower=0.0, upper=100.0)
-    d['CourseBiasDelta'] = (d['CourseProfileFit'] - 50.0).clip(lower=-20.0, upper=20.0).astype(float)
+    d['CourseRunupFit'] = course_runup_fit
+    d['CourseStraightShapeFit'] = course_straight_shape_fit
+    d['CourseShapeFit'] = course_shape_fit
+    d['CourseDistanceStyleFit'] = distance_style_fit
+    d['CourseDistanceDrawFit'] = distance_draw_fit
+    d['CourseDistanceSpecificFit'] = distance_specific_fit
+    d['CourseSpecialFit'] = course_special_fit
+    d['CoursePedigreeFineFit'] = pedigree_fine_fit
+    d['CoursePedigreeTokyo1400Fit'] = pedigree_tokyo1400_fit
+    d['CourseRailBiasFit'] = rail_bias_fit
+    d['CourseClassPaceFit'] = class_pace_fit
+    d['CourseTokyo1400Fit'] = tokyo1400_fit
+    _tw = max(1e-9, float(total_w))
+    d['CourseProfileFit'] = _make_series(np.clip((
+        style_w * d['CourseStyleFit'].values
+        + straight_w * d['CourseStraightFit'].values
+        + corner_w * d['CourseCornerFit'].values
+        + stamina_w * d['CourseStaminaFit'].values
+        + power_w * d['CoursePowerFit'].values
+        + speed_w * d['CourseSpeedFit'].values
+        + gate_w * gatefit.values
+        + agility_w * d['CourseAgilityFit'].values
+        + shape_w * d['CourseShapeFit'].values
+        + distance_w * d['CourseDistanceSpecificFit'].values
+        + special_w * d['CourseSpecialFit'].values
+        + pedigree_w * d['CoursePedigreeFineFit'].values
+        + pedigree_tokyo_w * d['CoursePedigreeTokyo1400Fit'].values
+        + rail_w * d['CourseRailBiasFit'].values
+        + classpace_w * d['CourseClassPaceFit'].values
+        + tokyo_w * d['CourseTokyo1400Fit'].values
+    ) / _tw, 0.0, 100.0), d.index)
+    d['CourseBiasDelta'] = _clip_series((d['CourseProfileFit'] - 50.0), -20.0, 20.0).astype(float)
     d['CourseProfileVenue'] = venue if venue else ''
     d['CourseProfileSurface'] = surface if surface else ''
     d['CourseDistanceKey'] = distance_key if distance_key else ''
@@ -14914,7 +18327,7 @@ def compute_pacefit_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optiona
     meta = meta or {}
     wp = ((params or {}).get('win_pattern_rules', {}) or {})
     pace = str(meta.get('pace', '') or '').upper().strip()[:1]
-    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).map(normalize_zone_token)
     f = _num_series(df, 'pred_first3f', np.nan)
     l = _num_series(df, 'pred_last3f', np.nan)
     st = _num_series(df, ['StabilityComposite', 'SAS'], 50.0)
@@ -14924,11 +18337,11 @@ def compute_pacefit_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: Optiona
 
     n = int(len(df))
     if f.notna().sum() > 1 and float(f.max()) != float(f.min()):
-        f01 = ((float(f.max()) - f) / (float(f.max()) - float(f.min()))).clip(lower=0.0, upper=1.0)
+        f01 = _clip_series(((float(f.max()) - f) / (float(f.max()) - float(f.min()))), 0.0, 1.0)
     else:
         f01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
     if l.notna().sum() > 1 and float(l.max()) != float(l.min()):
-        l01 = ((float(l.max()) - l) / (float(l.max()) - float(l.min()))).clip(lower=0.0, upper=1.0)
+        l01 = _clip_series(((float(l.max()) - l) / (float(l.max()) - float(l.min()))), 0.0, 1.0)
     else:
         l01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
     pf_rank = f.rank(method='min', ascending=True)
@@ -15094,8 +18507,8 @@ def compute_distance_comment_profile_v1_1(df: pd.DataFrame) -> tuple[pd.Series, 
               r'|短距離向き|マイラー向き|短めが向')
     pos_hits = txt.str.count(pos_pat).infer_objects(copy=False).fillna(0.0).astype(float)
     neg_hits = txt.str.count(neg_pat).infer_objects(copy=False).fillna(0.0).astype(float)
-    score = (50.0 + 8.0 * pos_hits - 7.0 * neg_hits).clip(lower=0.0, upper=100.0)
-    risk = (2.2 * neg_hits).clip(lower=0.0, upper=8.0)
+    score = _clip0100((50.0 + 8.0 * pos_hits - 7.0 * neg_hits))
+    risk = _clip_series((2.2 * neg_hits), 0.0, 8.0)
     return _num_series(score, 50.0, index=df.index), _num_series(risk, 0.0, index=df.index)
 
 
@@ -15111,7 +18524,7 @@ def compute_distance_suit_score_v1_1(df: pd.DataFrame, meta: Dict[str, str], par
     if _is_long_maiden_race(meta, df):
         pl = _num_series(df, 'pred_last3f', np.nan)
         if pl.notna().sum() > 1 and float(pl.max()) != float(pl.min()):
-            l01 = ((float(pl.max()) - pl) / (float(pl.max()) - float(pl.min()))).clip(lower=0.0, upper=1.0)
+            l01 = _clip_series(((float(pl.max()) - pl) / (float(pl.max()) - float(pl.min()))), 0.0, 1.0)
         else:
             l01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
         out = out + 6.0 * (l01 - 0.5)
@@ -15134,7 +18547,7 @@ def compute_long_front_fade_risk_v1_1(df: pd.DataFrame, meta: Dict[str, str], pa
     wp = ((params or {}).get('win_pattern_rules', {}) or {})
     base_pen = float(wp.get('long_maiden_frontfade_base_penalty', 6.0) or 6.0)
     extra_pen = float(wp.get('long_maiden_frontfade_extra_penalty', 2.0) or 2.0)
-    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).map(normalize_zone_token)
     pf = _num_series(df, 'pred_first3f', np.nan)
     pl = _num_series(df, 'pred_last3f', np.nan)
     tf = _num_series(df, 'TimeFit', 50.0)
@@ -15155,12 +18568,12 @@ def compute_distance_stamina_risk_v1_1(df: pd.DataFrame, meta: Dict[str, str], p
     """長距離未勝利戦における距離スタミナリスクスコアを返す。非対象レースは 0 埋め。"""
     if not _is_long_maiden_race(meta, df):
         return pd.Series([0.0] * len(df), index=df.index, dtype=float)
-    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).map(normalize_zone_token)
     tf = _num_series(df, 'TimeFit', 50.0)
     dcr = _num_series(df, 'DistanceCommentRisk', 0.0)
     pl = _num_series(df, 'pred_last3f', np.nan)
     pl_rank = pl.rank(method='min', ascending=True)
-    late_weak = ((55.0 - tf) / 4.5).clip(lower=0.0, upper=4.0)
+    late_weak = _clip_series(((55.0 - tf) / 4.5), 0.0, 4.0)
     late_weak = late_weak + (pl_rank >= 6.0).astype(float) * 2.0
     late_weak = late_weak + ((z == 'FRONT') & (pl_rank >= 6.0)).astype(float) * 1.0
     out = 0.55 * dcr + 0.45 * late_weak
@@ -15202,7 +18615,7 @@ def compute_maintenance_run_relief_v1_1(df: pd.DataFrame, meta: Dict[str, str], 
     Returns:
         (flag: pd.Series[int], reason: pd.Series[str])
     """
-    fr = ((params or {}).get('favorite_logic_rules', {}) or {})
+    _ = ((params or {}).get('favorite_logic_rules', {}) or {})
     dist = _num_series(df, 'DistanceSuitScore', 50.0)
     tr = _num_series(df, 'TrainingScore', 50.0)
     dt = _num_series(df, 'delta_train', 0.0)
@@ -15213,7 +18626,7 @@ def compute_maintenance_run_relief_v1_1(df: pd.DataFrame, meta: Dict[str, str], 
     txt = (short + ' ' + tags).astype(str)
     maintain_tag = txt.str.contains(r'ひと叩き|叩いて|叩き良化|良化余地|軽め|維持|次走|上積み', regex=True, na=False)
     base = ((dist >= 60.0) & (tr >= 55.0) & (dt >= -0.30) & (rf >= 49.0)).astype(float)
-    bonus = (base * 1.2 + maintain_tag.astype(float) * 1.0 + ((ct >= 55.0) & (dist >= 58.0)).astype(float) * 0.8).clip(lower=0.0, upper=4.0)
+    bonus = _clip_series((base * 1.2 + maintain_tag.astype(float) * 1.0 + ((ct >= 55.0) & (dist >= 58.0)).astype(float) * 0.8), 0.0, 4.0)
     reason = pd.Series([''] * len(df), index=df.index, dtype=str)
     reason.loc[bonus >= 1.0] = '軽い前走でも維持・上積み型'
     return _num_series(bonus, 0.0, index=df.index), reason
@@ -15230,7 +18643,7 @@ def compute_development_wait_risk_v1_1(df: pd.DataFrame, meta: Dict[str, str], p
     pf = _num_series(df, 'PaceFit', 50.0)
     ct = _num_series(df, 'CommentTrend', 50.0)
     pos = _num_series(df, 'PosFit', 50.0)
-    risk = ((ab - rc - 4.0).clip(lower=0.0) / 4.5) + ((ab - rf - 2.0).clip(lower=0.0) / 7.0)
+    risk = (np.maximum(ab.values - rc.values - 4.0, 0.0) / 4.5) + (np.maximum(ab.values - rf.values - 2.0, 0.0) / 7.0)
     risk = risk + ((pf < 58.0) & (ct < 53.0)).astype(float) * 1.2 + ((pos < 56.0) & (ab >= 58.0)).astype(float) * 0.8
     risk = _num_series(risk, 0.0, index=df.index, lower=0.0, upper=6.0)
     reason = pd.Series([''] * len(df), index=df.index, dtype=str)
@@ -15264,30 +18677,35 @@ def compute_favorite_score_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: 
 
     mismatch_thr = float(fr.get('favorite_mismatch_threshold', 56.0) or 56.0)
     mismatch_scale_val = float(fr.get('favorite_mismatch_half_scale', 0.5) or 0.5)
-    mismatch_scale = pd.Series([1.0] * len(df), index=df.index, dtype=float)
-    mismatch_mask = (pf < mismatch_thr) | (pos < mismatch_thr) | (rc < mismatch_thr)
-    mismatch_scale.loc[mismatch_mask] = mismatch_scale_val
+    _mm = (pf.values < mismatch_thr) | (pos.values < mismatch_thr) | (rc.values < mismatch_thr)
+    _ms_arr = np.where(_mm, mismatch_scale_val, 1.0)
+    mismatch_scale = _make_series(_ms_arr, df.index)
 
     train_cap = float(fr.get('favorite_training_push_cap', 12.0) or 12.0)
     comment_cap = float(fr.get('favorite_comment_push_cap', 10.0) or 10.0)
-    tr_adj = 50.0 + (tr - 50.0).clip(lower=-10.0, upper=train_cap) * mismatch_scale
-    cf_adj = 50.0 + (cf - 50.0).clip(lower=-10.0, upper=comment_cap) * mismatch_scale
-    ct_adj = 50.0 + (ct - 50.0).clip(lower=-10.0, upper=comment_cap) * mismatch_scale
+    _ms = _ms_arr  # already numpy array
+    # All pure numpy from here
+    _ab = ab.values; _rf = rf.values; _tr = tr.values; _cf = cf.values
+    _ct = ct.values; _wps = wps.values; _st = st.values; _sr = sr.values
+    _pf = pf.values; _pos = pos.values; _rc = rc.values; _dwr = dwr.values
+    tr_adj_arr = 50.0 + np.clip(_tr - 50.0, -10.0, train_cap) * _ms
+    cf_adj_arr = 50.0 + np.clip(_cf - 50.0, -10.0, comment_cap) * _ms
+    ct_adj_arr = 50.0 + np.clip(_ct - 50.0, -10.0, comment_cap) * _ms
 
-    win_axis = (0.34 * ab + 0.22 * pf + 0.16 * pos + 0.14 * st + 0.14 * rc).astype(float)
-    overall = (0.46 * win_axis + 0.18 * rf + 0.10 * tr_adj + 0.08 * cf_adj + 0.06 * ct_adj + 0.12 * wps).astype(float)
-    overall_rank = overall.rank(method='min', ascending=False)
+    win_axis_arr = 0.34 * _ab + 0.22 * _pf + 0.16 * _pos + 0.14 * _st + 0.14 * _rc
+    overall_arr = 0.46 * win_axis_arr + 0.18 * _rf + 0.10 * tr_adj_arr + 0.08 * cf_adj_arr + 0.06 * ct_adj_arr + 0.12 * _wps
+    # rank requires Series
+    overall_rank = _make_series(overall_arr, df.index).rank(method='min', ascending=False).values
 
-    override_recent = (
-        (rf >= float(fr.get('favorite_override_min_recent', 58.0) or 58.0))
-        & (tr >= float(fr.get('favorite_override_min_training', 58.0) or 58.0))
-        & ((cf >= float(fr.get('favorite_override_min_comment', 55.0) or 55.0)) | (ct >= float(fr.get('favorite_override_min_comment', 55.0) or 55.0)))
-    )
-    override_support = (pf >= 58.0) & (pos >= 58.0) & (st >= 56.0)
+    _min_recent = float(fr.get('favorite_override_min_recent', 58.0) or 58.0)
+    _min_train = float(fr.get('favorite_override_min_training', 58.0) or 58.0)
+    _min_comment = float(fr.get('favorite_override_min_comment', 55.0) or 55.0)
+    override_recent = (_rf >= _min_recent) & (_tr >= _min_train) & ((_cf >= _min_comment) | (_ct >= _min_comment))
+    override_support = (_pf >= 58.0) & (_pos >= 58.0) & (_st >= 56.0)
     if graded_or_large:
-        override = ((overall_rank <= 1.0) & override_recent & override_support & (tr >= 62.0) & ((cf >= 56.0) | (ct >= 56.0))).astype(int)
+        override_arr = ((overall_rank <= 1.0) & override_recent & override_support & (_tr >= 62.0) & ((_cf >= 56.0) | (_ct >= 56.0))).astype(float)
     else:
-        override = ((overall_rank <= 1.0) & override_recent & override_support).astype(int)
+        override_arr = ((overall_rank <= 1.0) & override_recent & override_support).astype(float)
 
     start_scale = float(fr.get('favorite_start_penalty_scale', 0.60) or 0.60)
     start_cap = float(fr.get('favorite_start_penalty_cap', 1.8) or 1.8)
@@ -15295,24 +18713,28 @@ def compute_favorite_score_v1_1(df: pd.DataFrame, meta: Dict[str, str], params: 
     if graded_or_large:
         top_bonus *= 0.55
 
-    score = (
-        0.42 * win_axis
-        + 0.18 * rf
-        + 0.10 * tr_adj
-        + 0.08 * cf_adj
-        + 0.06 * ct_adj
-        + 0.08 * wps
-        + 0.08 * st
-        + override.astype(float) * top_bonus
-        - (sr * start_scale).clip(lower=0.0, upper=start_cap)
-        - 0.75 * dwr
-        - ((mismatch_scale < 0.99) & (tr >= 60.0)).astype(float) * 0.8
-    ).clip(lower=0.0, upper=100.0)
+    score_arr = np.clip(
+        0.42 * win_axis_arr
+        + 0.18 * _rf
+        + 0.10 * tr_adj_arr
+        + 0.08 * cf_adj_arr
+        + 0.06 * ct_adj_arr
+        + 0.08 * _wps
+        + 0.08 * _st
+        + override_arr * top_bonus
+        - np.clip(_sr * start_scale, 0.0, start_cap)
+        - 0.75 * _dwr
+        - ((_ms < 0.99) & (_tr >= 60.0)).astype(float) * 0.8,
+        0.0, 100.0
+    )
+    score = _make_series(score_arr, df.index)
+    override = _make_series(override_arr.astype(np.int64), df.index)
 
-    reason = pd.Series([''] * len(df), index=df.index, dtype=str)
-    reason.loc[override > 0] = '能力×展開×位置取り一致で本命維持'
-    reason.loc[(override <= 0) & (mismatch_scale < 0.99)] = '展開不一致で調教・コメント加点を半減'
-    return _num_series(score, 0.0, index=df.index), _num_series(override, 0, index=df.index, dtype=int), reason
+    reason_arr = np.full(len(df), '', dtype=object)
+    reason_arr[override_arr > 0] = '能力×展開×位置取り一致で本命維持'
+    reason_arr[(override_arr <= 0) & (_ms < 0.99)] = '展開不一致で調教・コメント加点を半減'
+    reason = pd.Series(reason_arr, index=df.index, dtype=str)
+    return score, override, reason
 
 def compute_popularity_danger_v1_1(df: pd.DataFrame, params: Optional[dict] = None) -> tuple[pd.Series, pd.Series, pd.Series]:
     """人気馬危険度スコア・フラグ・理由を返す。
@@ -15325,13 +18747,16 @@ def compute_popularity_danger_v1_1(df: pd.DataFrame, params: Optional[dict] = No
     win_through = _num_series(df, ['WinThroughScore', 'WinCandidateScore'], 50.0)
     dwr = _num_series(df, 'DevelopmentWaitRisk', 0.0)
     fav = _num_series(df, 'FavoriteScore', 50.0)
-    gap = (place_axis - win_through).clip(lower=0.0)
-    score = (1.1 * dwr + 0.22 * gap + ((fav >= 60.0) & (gap >= 3.0)).astype(float) * 1.0).clip(lower=0.0, upper=10.0)
+    gap = _make_series(np.maximum(place_axis.values - win_through.values, 0.0), df.index)
+    score = _clip_series((1.1 * dwr + 0.22 * gap + ((fav >= 60.0) & (gap >= 3.0)).astype(float) * 1.0), 0.0, 10.0)
     thr = float(fr.get('danger_flag_threshold', 3.0) or 3.0)
     flag = (score >= thr).astype(int)
-    reason = pd.Series([''] * len(df), index=df.index, dtype=str)
-    reason.loc[flag > 0] = '人気先行リスクあり'
-    reason.loc[(score >= (thr * 0.66)) & (flag <= 0)] = '相手向き止まり注意'
+    _flag_arr = flag.values
+    _score_arr = score.values
+    _reason_arr = np.full(len(df), '', dtype=object)
+    _reason_arr[_flag_arr > 0] = '人気先行リスクあり'
+    _reason_arr[(_score_arr >= (thr * 0.66)) & (_flag_arr <= 0)] = '相手向き止まり注意'
+    reason = pd.Series(_reason_arr, index=df.index, dtype=str)
     return score, flag, reason
 
 def compute_value_hole_flags_v1_1(df: pd.DataFrame, params: Optional[dict] = None) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -15341,63 +18766,68 @@ def compute_value_hole_flags_v1_1(df: pd.DataFrame, params: Optional[dict] = Non
         (flag: pd.Series[int], score: pd.Series[float], reason: pd.Series[str])
     """
     fr = ((params or {}).get('favorite_logic_rules', {}) or {})
-    place = _num_series(df, 'PlaceAxisScore', 50.0)
-    dist = _num_series(df, 'DistanceSuitScore', 50.0)
-    tr = _num_series(df, 'TrainingScore', 50.0)
-    ct = _num_series(df, 'CommentTrend', 50.0)
-    rel = _num_series(df, 'MaintenanceRunRelief', 0.0)
-    rec = _num_series(df, 'RecoverySignal', 0.0)
-    temp = _num_series(df, 'TemperamentRisk', 0.0)
-    win = _num_series(df, ['WinThroughScore', 'WinCandidateScore'], 50.0)
-    pace = _num_series(df, ['PaceScenarioAdvantage', 'PaceFit'], 50.0)
-    pos = _num_series(df, 'PosFit', 50.0)
-    zone = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
-    pf = _num_series(df, 'pred_first3f', np.nan)
-    pl = _num_series(df, 'pred_last3f', np.nan)
-    pf_rank = pf.rank(method='min', ascending=True)
-    pl_rank = pl.rank(method='min', ascending=True)
+    idx = df.index
+    N = len(df)
+    # All numpy from the start
+    _place = _arr(df, 'PlaceAxisScore', 50.0)
+    _dist  = _arr(df, 'DistanceSuitScore', 50.0)
+    _tr    = _arr(df, 'TrainingScore', 50.0)
+    _ct    = _arr(df, 'CommentTrend', 50.0)
+    _rel   = _arr(df, 'MaintenanceRunRelief', 0.0)
+    _rec   = _arr(df, 'RecoverySignal', 0.0)
+    _temp  = _arr(df, 'TemperamentRisk', 0.0)
+    # win: WinThroughScore or WinCandidateScore
+    if 'WinThroughScore' in df.columns:
+        _win = _arr(df, 'WinThroughScore', 50.0)
+    else:
+        _win = _arr(df, 'WinCandidateScore', 50.0)
+    # pace: PaceScenarioAdvantage or PaceFit
+    if 'PaceScenarioAdvantage' in df.columns:
+        _pace = _arr(df, 'PaceScenarioAdvantage', 50.0)
+    else:
+        _pace = _arr(df, 'PaceFit', 50.0)
+    _pos = _arr(df, 'PosFit', 50.0)
+    z4_raw = df.get('zone_4c', pd.Series(['MIDDLE'] * N, index=idx)).astype(str)
+    zone_arr = np.array([normalize_zone_token(v) for v in z4_raw], dtype=object)
+    pf_arr = _arr(df, 'pred_first3f', np.nan)
+    pl_arr = _arr(df, 'pred_last3f', np.nan)
+    pf_rank_arr = _make_series(pf_arr, idx).rank(method='min', ascending=True).values
+    pl_rank_arr = _make_series(pl_arr, idx).rank(method='min', ascending=True).values
 
-    front_signal = ((zone == 'FRONT') & (pf_rank <= 3.0)).astype(float)
-    rear_signal = ((zone != 'FRONT') & (pl_rank <= 5.0)).astype(float)
+    front_signal = ((zone_arr == 'FRONT') & (pf_rank_arr <= 3.0)).astype(float)
+    rear_signal  = ((zone_arr != 'FRONT') & (pl_rank_arr <= 5.0)).astype(float)
+    win_over_place = (_win >= _place + 4.0).astype(float)
 
-    front_score = (
-        0.34 * place
-        + 0.18 * pace
-        + 0.14 * pos
-        + 0.12 * dist
-        + 0.10 * tr
-        + 0.06 * ct
-        + rel * 1.2
-        + rec * 0.8
+    front_score_arr = np.clip(
+        0.34 * _place + 0.18 * _pace + 0.14 * _pos + 0.12 * _dist
+        + 0.10 * _tr + 0.06 * _ct
+        + 1.2 * _rel + 0.8 * _rec
         + front_signal * 4.0
-        - 0.22 * temp
-        - ((win >= place + 4.0).astype(float) * 1.8)
-    ).clip(lower=0.0, upper=100.0)
-
-    rear_score = (
-        0.34 * place
-        + 0.18 * dist
-        + 0.14 * pace
-        + 0.10 * tr
-        + 0.10 * ct
-        + rel * 0.8
-        + rec * 1.2
+        - 0.22 * _temp
+        - win_over_place * 1.8,
+        0.0, 100.0
+    )
+    rear_score_arr = np.clip(
+        0.34 * _place + 0.18 * _dist + 0.14 * _pace
+        + 0.10 * _tr + 0.10 * _ct
+        + 0.8 * _rel + 1.2 * _rec
         + rear_signal * 4.0
-        + ((pl_rank <= 3.0).astype(float) * 2.0)
-        - 0.24 * temp
-        - ((win >= place + 4.0).astype(float) * 1.6)
-    ).clip(lower=0.0, upper=100.0)
+        + (pl_rank_arr <= 3.0).astype(float) * 2.0
+        - 0.24 * _temp
+        - win_over_place * 1.6,
+        0.0, 100.0
+    )
 
-    choose_front = front_score >= rear_score
-    score = pd.Series(np.where(choose_front, front_score, rear_score), index=df.index, dtype=float)
+    choose_front = front_score_arr >= rear_score_arr
+    score_arr = np.where(choose_front, front_score_arr, rear_score_arr)
     thr = float(fr.get('value_hole_score_min', 58.0) or 58.0)
-    flag = ((score >= thr) & (win <= place + 4.0)).astype(int)
-    reason = pd.Series([''] * len(df), index=df.index, dtype=str)
-    reason.loc[(flag > 0) & choose_front] = '前残り穴条件に合致'
-    reason.loc[(flag > 0) & (~choose_front)] = '差し込み穴条件に合致'
-    reason.loc[(flag <= 0) & choose_front & (front_score >= thr * 0.92)] = '前残り穴候補'
-    reason.loc[(flag <= 0) & (~choose_front) & (rear_score >= thr * 0.92)] = '差し込み穴候補'
-    return score, flag, reason
+    flag_arr = ((score_arr >= thr) & (_win <= _place + 4.0)).astype(np.int64)
+    reason_arr = np.full(N, '', dtype=object)
+    reason_arr[(flag_arr > 0) & choose_front] = '前残り穴条件に合致'
+    reason_arr[(flag_arr > 0) & (~choose_front)] = '差し込み穴条件に合致'
+    reason_arr[(flag_arr <= 0) & choose_front & (front_score_arr >= thr * 0.92)] = '前残り穴候補'
+    reason_arr[(flag_arr <= 0) & (~choose_front) & (rear_score_arr >= thr * 0.92)] = '差し込み穴候補'
+    return _make_series(score_arr, idx), _make_series(flag_arr, idx), pd.Series(reason_arr, index=idx, dtype=str)
 
 def _nrr_load_weights(nr: dict) -> tuple[float, ...]:
     """next_run_rules から8つの重みを読んで正規化し、タプルで返す。
@@ -15452,7 +18882,7 @@ def _nrr_compute_score(
     )
 
     recovery_bonus        = recovery.astype(float) * float(nr.get('recovery_signal_bonus',        4.0) or 4.0)
-    insurance_bonus       = (insurance_count.clip(lower=0.0) - 1.0).clip(lower=0.0) * float(nr.get('insurance_signal_bonus', 1.2) or 1.2)
+    insurance_bonus       = _make_series(np.maximum(np.maximum(insurance_count.values, 0.0) - 1.0, 0.0) * float(nr.get('insurance_signal_bonus', 1.2) or 1.2), df.index)
     train_rank_bonus      = (train_rank <= 3.0).astype(float) * float(nr.get('training_rank_bonus',  2.0) or 2.0)
     delta_bonus           = (delta_train >= 1.0).astype(float) * float(nr.get('delta_train_bonus',   1.0) or 1.0)
     start_issue_bonus     = ((start_risk > 0.0) & (base >= 58.0)).astype(float) * float(nr.get('start_issue_bonus',     1.5) or 1.5)
@@ -15466,15 +18896,15 @@ def _nrr_compute_score(
             ((front_fade > 0.0) | (stamina_risk > 2.0)) & (base >= 60.0)
         ).astype(float) * float(nr.get('pace_mismatch_bonus', 2.0) or 2.0)
 
-    severe_temp_pen    = (temperament - 10.0).clip(lower=0.0) * float(nr.get('severe_temp_penalty_scale',    1.2) or 1.2)
-    severe_stamina_pen = (stamina_risk -  6.0).clip(lower=0.0) * float(nr.get('severe_stamina_penalty_scale', 1.0) or 1.0)
+    severe_temp_pen    = _make_series(np.maximum(temperament.values - 10.0, 0.0) * float(nr.get('severe_temp_penalty_scale',    1.2) or 1.2), df.index)
+    severe_stamina_pen = _make_series(np.maximum(stamina_risk.values  -  6.0, 0.0) * float(nr.get('severe_stamina_penalty_scale', 1.0) or 1.0), df.index)
 
-    return (
+    return _clip0100((
         base
         + recovery_bonus + insurance_bonus + train_rank_bonus + delta_bonus
         + pace_mismatch_bonus + start_issue_bonus + temperament_relief_bonus
         - severe_temp_pen - severe_stamina_pen
-    ).clip(lower=0.0, upper=100.0)
+    ))
 
 
 def _nrr_build_reason_tags(
@@ -15589,7 +19019,7 @@ def compute_ability_base_score_v1_1(df: pd.DataFrame, params: Optional[dict] = N
     ab = _num_series(df, 'Ability', 50.0)
     tf = _num_series(df, 'TimeFit', 50.0)
     cs = _num_series(df, 'Consist', 50.0)
-    out = (aw_main * ab + aw_time * tf + aw_cons * cs).clip(lower=0.0, upper=100.0)
+    out = _clip0100((aw_main * ab + aw_time * tf + aw_cons * cs))
     return _num_series(out, 50.0, index=df.index)
 
 
@@ -15609,8 +19039,8 @@ def compute_recent_form_score_v1_1(df: pd.DataFrame, params: Optional[dict] = No
     ct = _num_series(df, 'CommentTrend', 50.0)
     dt = _num_series(df, 'delta_train', 0.0)
     ta = _num_series(df, 'TrainingAdjustmentScore', 50.0)
-    dt01 = (50.0 + 12.0 * dt).clip(lower=0.0, upper=100.0)
-    out = (wt * tr + wr * ct + wd * dt01 + wa * ta).clip(lower=0.0, upper=100.0)
+    dt01 = _clip0100((50.0 + 12.0 * dt))
+    out = _clip0100((wt * tr + wr * ct + wd * dt01 + wa * ta))
     return _num_series(out, 50.0, index=df.index)
 
 
@@ -15638,12 +19068,12 @@ def _normalize_training_rank_score(series_like, index) -> pd.Series:
         return pd.Series([50.0] * len(index), index=index, dtype=float)
     max_abs = float(finite.abs().max())
     if max_abs <= 1.2:
-        score = 100.0 * (1.0 - s.clip(lower=0.0, upper=1.0))
+        score = 100.0 * (1.0 - _clip_series(s, 0.0, 1.0))
     elif max_abs <= 100.0:
-        score = 100.0 * (1.0 - (s.clip(lower=0.0, upper=100.0) / 100.0))
+        score = 100.0 * (1.0 - (_clip0100(s) / 100.0))
     else:
-        score = 100.0 - 18.0 * np.log1p((s.clip(lower=1.0) - 1.0))
-    return score.clip(lower=0.0, upper=100.0).fillna(50.0).astype(float)
+        score = 100.0 - 18.0 * np.log1p((np.clip(s.values, 1.0, None) - 1.0))
+    return _clip0100(score).fillna(50.0).astype(float)
 
 
 def _extract_weeks_since_last(df: pd.DataFrame) -> pd.Series:
@@ -15686,7 +19116,8 @@ def _normalize_count_score(series_like, index, *, max_count: float = 8.0) -> pd.
     if len(finite) == 0:
         return pd.Series([50.0] * len(index), index=index, dtype=float)
     max_ref = max(float(max_count), float(finite.max()), 1.0)
-    return (100.0 * s.clip(lower=0.0, upper=max_ref) / max_ref).clip(lower=0.0, upper=100.0).fillna(50.0).astype(float)
+    _arr = np.where(np.isfinite(s.values), np.clip(s.values, 0.0, max_ref) / max_ref * 100.0, 50.0)
+    return _make_series(np.clip(_arr, 0.0, 100.0), s.index)
 
 
 def add_training_adjustment_features(
@@ -15718,11 +19149,17 @@ def add_training_adjustment_features(
     gaikyu_text_flag = gaikyu_raw.infer_objects(copy=False).fillna('').astype(str).str.contains(r'1|true|yes|あり|有|帰厩', case=False, regex=True, na=False)
     gaikyu_return_flag = ((gaikyu_num >= 0.5) | gaikyu_text_flag | (has_gaikyu & (weeks >= 10.0))).astype(int)
 
-    gaikyu_score = pd.Series([50.0] * len(out), index=idx, dtype=float)
-    gaikyu_score.loc[has_gaikyu & (weeks >= 6.0)] = 58.0
-    gaikyu_score.loc[gaikyu_return_flag > 0] = 68.0
-    gaikyu_boost = ((weeks - 10.0).clip(lower=0.0, upper=8.0).fillna(0.0) * 1.25)
-    gaikyu_score.loc[gaikyu_return_flag > 0] = (68.0 + gaikyu_boost.loc[gaikyu_return_flag > 0]).clip(lower=0.0, upper=80.0)
+    _gaikyu_arr = np.full(len(out), 50.0, dtype=np.float64)
+    _hg_arr = has_gaikyu.values
+    _wk_arr = weeks.values
+    _grf_arr = gaikyu_return_flag.values
+    _hg_w6 = _hg_arr & (_wk_arr >= 6.0)
+    _gaikyu_arr[_hg_w6] = 58.0
+    _grf_mask = _grf_arr > 0
+    _gaikyu_arr[_grf_mask] = 68.0
+    _gaikyu_boost_arr = np.clip(np.where(np.isfinite(_wk_arr), _wk_arr - 10.0, 0.0), 0.0, 8.0) * 1.25
+    _gaikyu_arr[_grf_mask] = np.clip(68.0 + _gaikyu_boost_arr[_grf_mask], 0.0, 80.0)
+    gaikyu_score = _make_series(_gaikyu_arr, idx)
 
     train_rank_raw = _first_existing_series(out, [
         'training_time_rank', '調教時計順位', '追い切り時計順位', '追切時計順位',
@@ -15730,7 +19167,7 @@ def add_training_adjustment_features(
         '追切上位率', 'TrainingRank'
     ], default=np.nan)
     training_rank_score = _normalize_training_rank_score(train_rank_raw, idx)
-    training_rank_score = (0.65 * training_rank_score + 0.35 * _num_series(out, 'TrainingScore', 50.0)).clip(lower=0.0, upper=100.0)
+    training_rank_score = _wsum0100(idx, (0.65, training_rank_score), (0.35, _num_series(out, 'TrainingScore', 50.0)))
 
     method_text = _first_existing_series(out, [
         'training_method', '調教方法', '追い切り方法', '追切方法', '追い切りコース',
@@ -15778,18 +19215,23 @@ def add_training_adjustment_features(
         | comment_text.str.contains(r'CW|南W|美W|栗W|ウッド', case=False, regex=True, na=False)
     )
     cw_index = cw_index.where(np.isfinite(cw_index), cw_comment_flag.astype(float) * 1.8)
+    _mwc_arr = np.where(np.isfinite(mid_work_count.values), mid_work_count.values, 0.0)
+    _fwc_arr = np.where(np.isfinite(finish_work_count.values), finish_work_count.values, 0.0)
     prep_load = (
-        0.55 * mid_work_count.fillna(0.0)
-        + 1.05 * finish_work_count.fillna(0.0)
-        + 1.65 * np.log1p(cw_index.clip(lower=0.0).fillna(0.0))
+        0.55 * _mwc_arr
+        + 1.05 * _fwc_arr
+        + 1.65 * np.log1p(np.clip(np.where(np.isfinite(cw_index.values), cw_index.values, 0.0), 0.0, None))
     )
-    rest_need = np.log1p(weeks.clip(lower=0.0).fillna(0.0))
-    rest_load_score = (50.0 + 18.0 * (prep_load - 1.35 * rest_need)).clip(lower=0.0, upper=100.0)
-    long_rest_underwork = ((weeks >= 10.0) & (prep_load < (rest_need + 0.8))).astype(float)
-    long_rest_sufficient = ((weeks >= 10.0) & (prep_load >= (rest_need + 1.5))).astype(float)
-    rest_load_score = (rest_load_score - 10.0 * long_rest_underwork + 4.0 * long_rest_sufficient).clip(lower=0.0, upper=100.0)
-    rest_present = (np.isfinite(mid_work_count) | np.isfinite(finish_work_count) | np.isfinite(cw_index) | np.isfinite(weeks) | cw_comment_flag).astype(float)
-    rest_load_score = rest_load_score.where(rest_present > 0.0, 50.0)
+    rest_need = np.log1p(np.clip(np.where(np.isfinite(weeks.values), weeks.values, 0.0), 0.0, None))
+    rest_load_score = np.clip(50.0 + 18.0 * (prep_load - 1.35 * rest_need), 0.0, 100.0)
+    _long_rest = _wk_arr >= 10.0
+    _lru = (_long_rest & (prep_load < (rest_need + 0.8))).astype(float)
+    _lrs = (_long_rest & (prep_load >= (rest_need + 1.5))).astype(float)
+    rest_load_score = np.clip(rest_load_score - 10.0 * _lru + 4.0 * _lrs, 0.0, 100.0)
+    _rest_present = (np.isfinite(mid_work_count.values) | np.isfinite(finish_work_count.values) | np.isfinite(cw_index.values) | np.isfinite(_wk_arr) | cw_comment_flag.values).astype(float)
+    _rls_arr = rest_load_score.copy()
+    _rls_arr[_rest_present <= 0.0] = 50.0
+    rest_load_score = _make_series(_rls_arr, idx)
 
     shoe_raw = _first_existing_series(out, [
         'shoe_change_comment', 'shoeing_comment', 'shoe_change', '蹄鉄変更', '蹄鉄コメント',
@@ -15807,13 +19249,19 @@ def add_training_adjustment_features(
     aluminum_to_steel = shoe_text.str.contains(r'アルミ\s*[→>\-／/]\s*スチール|アルミからスチール|アルミ.*スチール', regex=True, na=False)
     steel_to_aluminum = shoe_text.str.contains(r'スチール\s*[→>\-／/]\s*アルミ|スチールからアルミ', regex=True, na=False)
     shoe_change_flag = shoe_text.str.contains(r'蹄鉄|装蹄|アルミ|スチール', regex=True, na=False)
-    shoe_change_score = pd.Series([50.0] * len(out), index=idx, dtype=float)
-    shoe_change_score.loc[shoe_change_flag] = 54.0
-    shoe_change_score.loc[aluminum_to_steel] = 60.0
-    shoe_change_score.loc[aluminum_to_steel & muddy_signal] = 72.0
-    shoe_change_score.loc[steel_to_aluminum & (~muddy_signal)] = 60.0
-    shoe_change_score.loc[steel_to_aluminum & muddy_signal] = 42.0
-    shoe_change_score.loc[shoe_text.str.contains(r'パワー|踏ん張|力強|重馬場対応', regex=True, na=False) & muddy_signal] = 74.0
+    _scs_arr = np.full(len(out), 50.0, dtype=np.float64)
+    _scf = shoe_change_flag.values
+    _a2s = aluminum_to_steel.values
+    _s2a = steel_to_aluminum.values
+    _mud = muddy_signal.values
+    _pwr = shoe_text.str.contains(r'パワー|踏ん張|力強|重馬場対応', regex=True, na=False).values
+    _scs_arr[_scf] = 54.0
+    _scs_arr[_a2s] = 60.0
+    _scs_arr[_a2s & _mud] = 72.0
+    _scs_arr[_s2a & (~_mud)] = 60.0
+    _scs_arr[_s2a & _mud] = 42.0
+    _scs_arr[_pwr & _mud] = 74.0
+    shoe_change_score = _make_series(_scs_arr, idx)
     shoe_present = shoe_change_flag.astype(float)
 
     method_present = ((method_text.str.strip() != '') | (trainer_pref_text.str.strip() != '')).astype(float)
@@ -15826,7 +19274,7 @@ def add_training_adjustment_features(
 
     out['weeks_since_last'] = weeks.astype(float)
     out['is_gaikyu_return'] = gaikyu_return_flag.astype(int)
-    out['GaikyuReturnScore'] = gaikyu_score.clip(lower=0.0, upper=100.0).astype(float)
+    out['GaikyuReturnScore'] = _clip0100(gaikyu_score).astype(float)
     out['TrainingTimeRankScore'] = training_rank_score.astype(float)
     out['TrainingMethodScore'] = training_method_score.astype(float)
     out['mid_work_count'] = mid_work_count.fillna(0.0).astype(float)
@@ -15835,22 +19283,24 @@ def add_training_adjustment_features(
     out['RestLoadCompensationScore'] = rest_load_score.astype(float)
     out['ShoeingChangeFlag'] = shoe_change_flag.astype(int)
     out['ShoeingCommentScore'] = shoe_change_score.astype(float)
-    out['HorseConditionScore'] = (
-        0.56 * rest_load_score
-        + 0.22 * shoe_change_score
-        + 0.22 * _num_series(out, 'TrainingScore', 50.0)
-    ).clip(lower=0.0, upper=100.0).astype(float)
-    out['TrainingAdjustmentReliability'] = (
-        100.0 * (gaikyu_present + rank_present + method_present + rest_present + shoe_present) / 5.0
-    ).clip(lower=0.0, upper=100.0).astype(float)
-    out['TrainingAdjustmentScore'] = (
-        0.18 * out['GaikyuReturnScore']
-        + 0.30 * out['TrainingTimeRankScore']
-        + 0.10 * out['TrainingMethodScore']
-        + 0.24 * out['RestLoadCompensationScore']
-        + 0.08 * out['ShoeingCommentScore']
-        + 0.10 * out['HorseConditionScore']
-    ).clip(lower=0.0, upper=100.0).astype(float)
+    _ts_arr = _arr(out, 'TrainingScore', 50.0)
+    _hcs_arr = np.clip(0.56 * _rls_arr + 0.22 * _scs_arr + 0.22 * _ts_arr, 0.0, 100.0)
+    out['HorseConditionScore'] = _hcs_arr
+    _gaikyu_present = gaikyu_present.values
+    _rank_present = rank_present.values
+    _method_present = method_present.values
+    _shoe_present = shoe_present.values
+    out['TrainingAdjustmentReliability'] = np.clip(
+        100.0 * (_gaikyu_present + _rank_present + _method_present + _rest_present + _shoe_present) / 5.0, 0.0, 100.0)
+    _grs_arr = out['GaikyuReturnScore'].values
+    _ttrs_arr = out['TrainingTimeRankScore'].values
+    _tms_arr = out['TrainingMethodScore'].values
+    _rlcs_arr = out['RestLoadCompensationScore'].values
+    _scss_arr = out['ShoeingCommentScore'].values
+    out['TrainingAdjustmentScore'] = np.clip(
+        0.18 * _grs_arr + 0.30 * _ttrs_arr + 0.10 * _tms_arr
+        + 0.24 * _rlcs_arr + 0.08 * _scss_arr + 0.10 * _hcs_arr,
+        0.0, 100.0)
     return out
 
 
@@ -15927,7 +19377,7 @@ def compute_front_collapse_risk_v1_1(df: pd.DataFrame, meta: Dict[str, str], par
     if pace != 'H':
         return pd.Series([0.0] * len(df), index=df.index, dtype=float)
 
-    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).map(normalize_zone_token)
     pf = _num_series(df, 'pred_first3f', np.nan)
     pl = _num_series(df, 'pred_last3f', np.nan)
     cg = _num_series(df, 'CommentGate', 50.0)
@@ -15976,7 +19426,7 @@ def compute_start_risk_short_v1_1(df: pd.DataFrame, meta: Dict[str, str], params
         return out
 
     cg = _num_series(df, 'CommentGate', 50.0)
-    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
+    z = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).map(normalize_zone_token)
     tags = df.get('comment_tags', pd.Series([''] * len(df), index=df.index)).astype(str)
     bad_gate_mask = (cg < 45.0) | _comment_tag_mask(tags, ['G-出遅', 'G-スタートひと息', 'G-ゲートひと息', 'G-ゲート不安', 'G-1歩目は速くない', 'G-一歩目は速くない', 'G-ダッシュ付か', 'G-行き脚つか', 'G-モサッ'])
 
@@ -16009,24 +19459,26 @@ def compute_factorfit(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series
 
     cols = [c for c in [first_col, "course", "distance", "last", "training", "record"] if c]
 
-    pts = []
-    mich = []
-    for i in df.index:
-        p = 0.0
-        mpt = 0.0
-        for c in cols:
-            series = df.get(c, pd.Series([""] * len(df)))
-            v = factor_mark_to_points(series.loc[i])
-            p += v
-            if c == first_col:
-                mpt = v
-        pts.append(p)
-        mich.append(mpt)
+    # ベクトル化: np.select で印→点数変換（Series.map を排除）
+    n = len(df)
+    idx = df.index
+    pts_arr = np.zeros(n, dtype=np.float64)
+    mich_arr = np.zeros(n, dtype=np.float64)
+    for c in cols:
+        raw = df[c].values if c in df.columns else np.full(n, '', dtype=object)
+        # np.select: ◎=2.0, ○=1.0, △=0.5, それ以外=0.0
+        mapped_arr = np.select(
+            [raw == '◎', raw == '○', raw == '△'],
+            [2.0,          1.0,        0.5],
+            default=0.0,
+        )
+        pts_arr += mapped_arr
+        if c == first_col:
+            mich_arr = mapped_arr
 
-    pts_s = pd.Series(pts, index=df.index, dtype=float)
-    fit_s = (pts_s / 12.0 * 100.0).astype(float)
-    mich_fit = (pd.Series(mich, index=df.index, dtype=float) / 2.0 * 100.0).astype(float)
-    return pts_s, fit_s, mich_fit
+    fit_arr = pts_arr / 12.0 * 100.0
+    mich_fit_arr = mich_arr / 2.0 * 100.0
+    return _make_series(pts_arr, idx), _make_series(fit_arr, idx), _make_series(mich_fit_arr, idx)
 
 
 def _is_wet_track(meta: Dict[str, str]) -> bool:
@@ -16037,6 +19489,9 @@ def _is_wet_track(meta: Dict[str, str]) -> bool:
 
     目的: 道悪印（◎○△）を強めに効かせるスイッチ。
     """
+    # キャッシュがあれば即返す
+    if '_cached_wet' in meta:
+        return meta['_cached_wet']
     tg = str(meta.get("turf_going", "")).strip()
     dg = str(meta.get("dirt_going", "")).strip()
     if tg in ["稍重", "重", "不良"]:
@@ -16087,13 +19542,31 @@ def weighted_geomean_0_100(row: pd.Series, keys: list[str], weights: dict[str, f
 
 
 def weighted_geomean_df_0_100(df: pd.DataFrame, keys: list[str], weights: dict[str, float], floor: float = 5.0, ceil: float = 95.0) -> pd.Series:
-    """DataFrame行方向に weighted_geomean_0_100 を適用。
+    """DataFrame行方向に weighted_geomean_0_100 を適用。NumPy完全ベクトル化版。
 
     NOTE: v9では compute_scores_v1_1 から参照されるが定義が欠けていたため追加。
     """
     if df is None or len(df) == 0:
         return pd.Series([], dtype=float)
-    return df.apply(lambda r: weighted_geomean_0_100(r, keys, weights, floor=floor, ceil=ceil), axis=1).astype(float)
+    # 有効キー（weight > 0 かつ列が存在）だけ抽出
+    valid_keys = [k for k in keys if float(weights.get(k, 0.0)) > 0]
+    if not valid_keys:
+        return pd.Series(50.0, index=df.index, dtype=float)
+    eps = 1e-9
+    w_arr = np.array([float(weights[k]) for k in valid_keys], dtype=float)
+    # 各列を取り出し (n_rows, n_keys) の行列を作る
+    mat = np.full((len(df), len(valid_keys)), 50.0, dtype=float)
+    for j, k in enumerate(valid_keys):
+        if k in df.columns:
+            col = pd.to_numeric(df[k], errors='coerce').values
+            finite_mask = np.isfinite(col)
+            mat[:, j] = np.where(finite_mask, col, 50.0)
+    mat = np.clip(mat, float(floor), float(ceil))
+    # weighted log-sum → exp → scale
+    log_mat = np.log(np.maximum(mat / 100.0, eps))  # (n_rows, n_keys)
+    z = log_mat.dot(w_arr)  # (n_rows,)
+    out = np.clip(100.0 * np.exp(z), 0.0, 100.0)
+    return pd.Series(out, index=df.index, dtype=float)
 
 
 
@@ -16292,17 +19765,29 @@ def build_comment_features(entries: pd.DataFrame, comments_df: pd.DataFrame, par
     cf = (params.get('comment_features', {}) or {})
 
     def _neutral(base_df: pd.DataFrame) -> pd.DataFrame:
-        """        コメント関連スコア列（CommentFit/CommentRisk/CommentGate/CommentTags/CommentShort）を
-        中立値で埋めた DataFrame コピーを返す。
-        """
+        """コメント関連スコア列を中立値で埋めた DataFrame コピーを返す。"""
         out = base_df.copy()
-        out['CommentFit'] = 50.0
-        out['CommentRisk'] = 0.0
-        out['CommentGate'] = 50.0
-        out['CommentCondition'] = 50.0
-        out['CommentTrend'] = 50.0
+        _n = len(out)
+        _idx = out.index
+        # 数値列を一括 concat で追加（個別 setitem を回避）
+        _neutral_nums = {
+            'CommentFit':               np.full(_n, 50.0),
+            'CommentRisk':              np.full(_n,  0.0),
+            'CommentGate':              np.full(_n, 50.0),
+            'CommentCondition':         np.full(_n, 50.0),
+            'CommentTrend':             np.full(_n, 50.0),
+            'SankoGaiFlag':             np.full(_n,  0.0),
+            'StartRiskInterviewPenalty': np.full(_n, 0.0),
+            'GateRecoveryBonus':        np.full(_n,  0.0),
+        }
+        _new = {k: v for k, v in _neutral_nums.items() if k not in out.columns}
+        _upd = {k: v for k, v in _neutral_nums.items() if k in out.columns}
+        if _new:
+            out = pd.concat([out, pd.DataFrame(_new, index=_idx)], axis=1)
+        for k, v in _upd.items():
+            out[k] = v
         out['comment_short'] = ''
-        out['comment_tags'] = ''
+        out['comment_tags']  = ''
         return out
 
     if not bool(cf.get('enabled', True)):
@@ -16326,14 +19811,14 @@ def build_comment_features(entries: pd.DataFrame, comments_df: pd.DataFrame, par
             return 0.8
         return 0.7
 
-    rows = []
-    for _, r in cdf.iterrows():
+    # ── ベクトル化: iterrows → apply ───────────────────────────────
+    def _process_comment_row(r):
         num = str(r['num']).strip()
-        typ = str(r.get('type','comment'))
-        txt = str(r.get('text',''))
+        typ = str(r.get('type', 'comment'))
+        txt = str(r.get('text', ''))
         sc = _comment_keyword_score(txt)
         w = _w(typ)
-        rows.append({
+        return {
             'num': num,
             'pos': sc['pos'] * w,
             'neg': sc['neg'] * w,
@@ -16348,7 +19833,8 @@ def build_comment_features(entries: pd.DataFrame, comments_df: pd.DataFrame, par
             'sanko_gai': float(sc.get('sanko_gai', 0.0)),  # R19
             'tags': ' '.join(sc['tags'][:10]),
             'text': txt,
-        })
+        }
+    rows = cdf.apply(_process_comment_row, axis=1).tolist()
 
     agg = pd.DataFrame(rows)
     if len(agg) == 0:
@@ -16371,20 +19857,20 @@ def build_comment_features(entries: pd.DataFrame, comments_df: pd.DataFrame, par
     start_risk_scale = float(cf.get('start_risk_scale', 6.0) or 6.0)
 
     g['CommentFit'] = 50.0 + (g['pos'] - g['neg']) * 6.0 + (g['up'] - g['down']) * 3.0
-    g['CommentFit'] = g['CommentFit'].clip(lower=0.0, upper=100.0)
-    g['CommentGate'] = (50.0 + (g['gate_pos'] - g['gate_neg']) * gate_scale).clip(lower=0.0, upper=100.0)
-    g['CommentCondition'] = (50.0 + (g['cond_pos'] - g['cond_neg']) * cond_scale).clip(lower=0.0, upper=100.0)
-    g['CommentTrend'] = (50.0 + (g['trend_pos'] - g['trend_neg']) * trend_scale).clip(lower=0.0, upper=100.0)
+    g['CommentFit'] = _clip0100(g['CommentFit'])
+    g['CommentGate'] = _clip0100((50.0 + (g['gate_pos'] - g['gate_neg']) * gate_scale))
+    g['CommentCondition'] = _clip0100((50.0 + (g['cond_pos'] - g['cond_neg']) * cond_scale))
+    g['CommentTrend'] = _clip0100((50.0 + (g['trend_pos'] - g['trend_neg']) * trend_scale))
     try:
         g['temp_hits'] = g['text'].astype(str).str.count(r'キックバック|砂を被|砂を嫌|集中|気難|イレ込|テンション|気持ち|ムラ|若さ|幼さ')
         g['start_hits'] = g['text'].astype(str).str.count(r'出遅|スタート|ゲート|発馬|一歩目|二の脚|ダッシュ|行き脚')
         # R22: 前走インタビューに「のっそり」「行き脚つかない」等が含まれる場合の追加ペナルティ
         _prev_intvw_penalty = float(cf.get('start_risk_prev_interview_penalty', 3.0) or 3.0)
-        _apply_to_anchor   = bool(cf.get('start_risk_apply_to_anchor', True))
+        _ = bool(cf.get('start_risk_apply_to_anchor', True))
         g['prev_interview_hits'] = g['text'].astype(str).str.count(
             r'のっそり|もたもた|行き脚つかな|ひと息|スタートいまひとつ|出遅れ気味|1歩目|二の足'
         )
-        g['StartRiskInterviewPenalty'] = (g['prev_interview_hits'] * _prev_intvw_penalty).clip(lower=0.0, upper=15.0)
+        g['StartRiskInterviewPenalty'] = _clip_series((g['prev_interview_hits'] * _prev_intvw_penalty), 0.0, 15.0)
         # R26: 前走コメントに「出遅れ」「ゲート不利」等が含まれる場合のリカバリーボーナス
         _gate_kws  = cf.get('gate_recovery_keywords',
                             ['出遅れ', 'ゲート不利', '発走不利', '後手', 'スタートでつまずかれ', '出し遅れ'])
@@ -16394,11 +19880,11 @@ def build_comment_features(entries: pd.DataFrame, comments_df: pd.DataFrame, par
             g['gate_recovery_hits'] = g['text'].astype(str).str.count(_gate_pat)
             _grb_max_raw = cf.get('gate_recovery_bonus_max', 7.5)
             _grb_max = float(_grb_max_raw) if _grb_max_raw is not None else 7.5  # R37: パラメータ化 (0.0許容)
-            g['GateRecoveryBonus']  = (g['gate_recovery_hits'] * _gate_bon).clip(lower=0.0, upper=_grb_max)
-            g['CommentFit'] = (g['CommentFit'] + g['GateRecoveryBonus']).clip(lower=0.0, upper=100.0)
+            g['GateRecoveryBonus']  = np.clip((g['gate_recovery_hits'].values * _gate_bon), 0.0, _grb_max)
+            g['CommentFit'] = _clip0100((g['CommentFit'] + g['GateRecoveryBonus']))
         else:
             g['GateRecoveryBonus'] = 0.0
-        g['CommentRisk'] = (
+        g['CommentRisk'] = _clip0100((
             g['neg'] * 8.0
             + g['down'] * 4.0
             + g['gate_neg'] * 6.5
@@ -16407,7 +19893,7 @@ def build_comment_features(entries: pd.DataFrame, comments_df: pd.DataFrame, par
             + g['temp_hits'] * temp_risk_scale
             + g['start_hits'] * start_risk_scale
             + g.get('StartRiskInterviewPenalty', 0.0)
-        ).clip(lower=0.0, upper=100.0)
+        ))
     except Exception:
         g['CommentRisk'] = 0.0
     g['comment_short'] = g['text'].astype(str).apply(lambda x: (x[:70] + '…') if len(x) > 70 else x)
@@ -16439,27 +19925,43 @@ def build_comment_features(entries: pd.DataFrame, comments_df: pd.DataFrame, par
            ),  # R19 / R22
         on='num', how='left'
     )
-    for col, default in [('CommentFit', 50.0), ('CommentRisk', 0.0), ('CommentGate', 50.0), ('CommentCondition', 50.0), ('CommentTrend', 50.0)]:
-        out[col] = _num_series(out.get(col, default), default, index=out.index)
-    out['comment_short'] = out['comment_short'].infer_objects(copy=False).fillna('').astype(str)
-    out['comment_tags'] = out['comment_tags'].infer_objects(copy=False).fillna('').astype(str)
-    # R19: SankoGaiFlag
-    out['SankoGaiFlag'] = _num_series(out.get('sanko_gai', 0.0), 0.0, index=out.index).clip(lower=0.0)
-    # R22: 前走インタビュー起因スタートリスクペナルティ列
-    out['StartRiskInterviewPenalty'] = _num_series(
-        out.get('StartRiskInterviewPenalty', 0.0), 0.0, index=out.index
-    ).clip(lower=0.0, upper=15.0)
-    # R26: ゲートリカバリーボーナス列  R37: clip上限をパラメータ参照に変更
-    # R37バグ修正: params.get (トップレベル) → cf.get (comment_features サブ辞書) に統一
-    #   修正前: _grb_max_final = float((params or {}).get('gate_recovery_bonus_max', 7.5) or 7.5)
-    #           → cf.gate_recovery_bonus_max=10.0 と設定しても line 5049 でのみ反映され、
-    #             最終クリップ (line 5110) は常にデフォルト 7.5 になるバグ
-    #   修正後: cf を直接参照することで line 5049 / 5110 双方で一貫した上限を使用
+    # ── 後処理: _arr で高速 ndarray 取得 → 一括で DataFrame に書き込む ──────────
+    _oidx = out.index
+    _cf_arr   = np.where(np.isfinite(_arr(out, 'CommentFit',   50.0)), _arr(out, 'CommentFit',   50.0), 50.0)
+    _cr_arr   = np.where(np.isfinite(_arr(out, 'CommentRisk',   0.0)), _arr(out, 'CommentRisk',   0.0),  0.0)
+    _cg_arr   = np.where(np.isfinite(_arr(out, 'CommentGate',  50.0)), _arr(out, 'CommentGate',  50.0), 50.0)
+    _cc_arr   = np.where(np.isfinite(_arr(out, 'CommentCondition', 50.0)), _arr(out, 'CommentCondition', 50.0), 50.0)
+    _ct_arr   = np.where(np.isfinite(_arr(out, 'CommentTrend', 50.0)), _arr(out, 'CommentTrend', 50.0), 50.0)
+    _srip_arr = np.clip(_arr(out, 'StartRiskInterviewPenalty', 0.0), 0.0, 15.0)
+    # R37バグ修正: cf を直接参照することで line 5049 / 5110 双方で一貫した上限を使用
     _grb_max_final_raw = cf.get('gate_recovery_bonus_max', 7.5)
-    _grb_max_final = float(_grb_max_final_raw) if _grb_max_final_raw is not None else 7.5  # R37fix: 0.0許容
-    out['GateRecoveryBonus'] = _num_series(
-        out.get('GateRecoveryBonus', 0.0), 0.0, index=out.index
-    ).clip(lower=0.0, upper=_grb_max_final)
+    _grb_max_final = float(_grb_max_final_raw) if _grb_max_final_raw is not None else 7.5
+    _grb_arr_final = np.clip(_arr(out, 'GateRecoveryBonus', 0.0), 0.0, _grb_max_final)
+    _sg_arr   = np.clip(_arr(out, 'sanko_gai', 0.0), 0.0, None)
+
+    # 文字列列は通常の代入（ndarray 化は不要）
+    if 'comment_short' in out.columns:
+        out['comment_short'] = out['comment_short'].infer_objects(copy=False).fillna('').astype(str)
+    else:
+        out['comment_short'] = ''
+    if 'comment_tags' in out.columns:
+        out['comment_tags'] = out['comment_tags'].infer_objects(copy=False).fillna('').astype(str)
+    else:
+        out['comment_tags'] = ''
+
+    # 数値列を一括 dict で追加（既存列は上書き）
+    _num_updates = {
+        'CommentFit':                 _make_series(_cf_arr,       _oidx),
+        'CommentRisk':                _make_series(_cr_arr,       _oidx),
+        'CommentGate':                _make_series(_cg_arr,       _oidx),
+        'CommentCondition':           _make_series(_cc_arr,       _oidx),
+        'CommentTrend':               _make_series(_ct_arr,       _oidx),
+        'SankoGaiFlag':               _make_series(_sg_arr,       _oidx),
+        'StartRiskInterviewPenalty':  _make_series(_srip_arr,     _oidx),
+        'GateRecoveryBonus':          _make_series(_grb_arr_final, _oidx),
+    }
+    for k, v in _num_updates.items():
+        out[k] = v
     return out
 
 
@@ -16497,61 +19999,126 @@ def _csv_neutral_return(
     _core_missing = (rating_num.notna().sum() == 0) or (speed_num.notna().sum() == 0)
 
     if _core_missing:
-        # neutral norms
-        df["rating_norm"] = 50.0
-        df["speed_norm"] = 50.0
-        df["AI_REAR_CONFIRMED"] = compute_ai_rear_confirmed(df)
-        df["Ability"] = 50.0
-        df["PosFit"] = df["zone_4c"].apply(lambda z: compute_position_fit_adjusted(z, meta)).astype(float)
-        df["Consist"] = compute_consistency_from_speed_hist(df)
+        _n_rows = len(df)
+        _df_idx = df.index
+
+        # ── 計算が必要な列を先に取得（setitem なし）──────────────────────────
+        # AI_REAR: zone_4c/zone_3c はすでに正規化済みなので str.upper 不要
+        _z4_vals = df["zone_4c"].values
+        _z3_vals = df["zone_3c"].values if "zone_3c" in df.columns else _z4_vals
+        _ai_rear_arr = ((_z3_vals == "REAR") & (_z4_vals == "REAR")).astype(float)
+
+        # PosFit: zone_4c 値をベクトル化マッピング
+        _unique_zones = {z: compute_position_fit_adjusted(z, meta) for z in set(_z4_vals.tolist())}
+        _posfit_arr = np.array([_unique_zones.get(z, 50.0) for z in _z4_vals], dtype=float)
+        _posfit_arr = np.where(np.isfinite(_posfit_arr), _posfit_arr, 50.0)
+
+        _consist = compute_consistency_from_speed_hist(df)
         map_summary = meta.get("map_summary", "Unknown")
         map_rates = meta.get("_map_rates", None)
-        df["MapFit"] = compute_mapfit_v1_1(df, map_summary, map_rates=map_rates)
-        df["FactorPts"], df["FactorFit"], df["MichiakuFit"] = compute_factorfit(df)
-        if 'CommentFit' not in df.columns:
-            df['CommentFit'] = 50.0
-        for _c in ['CommentFit','CommentGate','CommentCondition','CommentTrend']:
-            if _c not in df.columns:
-                df[_c] = 50.0
-            df[_c] = _num_series(df, _c, 50.0)
-        df['PaceFit'] = 50.0
-        df['GateFit'] = 50.0
-        df['ConditionFit'] = 50.0
-        df['CourseStyleFit'] = 50.0
-        df['CourseStraightFit'] = 50.0
-        df['CourseCornerFit'] = 50.0
-        df['CourseStaminaFit'] = 50.0
-        df['CoursePowerFit'] = 50.0
-        df['CourseSpeedFit'] = 50.0
-        df['CourseAgilityFit'] = 50.0
-        df['CourseRunupFit'] = 50.0
-        df['CourseStraightShapeFit'] = 50.0
-        df['CourseShapeFit'] = 50.0
-        df['CourseSpecialFit'] = 50.0
-        df['CourseProfileFit'] = 50.0
-        df['CourseBiasDelta'] = 0.0
-        df['FrontCollapseRisk'] = 0.0
-        df['StartRiskShort'] = 0.0
-        df['PaceTransitionScore'] = 50.0
-        df['PaceReboundSignal'] = 50.0
-        df['WinShape'] = 50.0
-        df['TimeFit'] = 50.0
-        df['Upside'] = 50.0
-        df['WPS'] = 50.0
+        _mapfit = compute_mapfit_v1_1(df, map_summary, map_rates=map_rates)
+        # compute_factorfit をインライン化（Series 構築オーバーヘッドを回避）
+        _first_col = "michiaku" if "michiaku" in df.columns else ("dirt" if "dirt" in df.columns else None)
+        _fcols = [c for c in [_first_col, "course", "distance", "last", "training", "record"] if c]
+        _pts_arr2 = np.zeros(_n_rows, dtype=np.float64)
+        _mich_arr2 = np.zeros(_n_rows, dtype=np.float64)
+        for _fc in _fcols:
+            _raw2 = df[_fc].values if _fc in df.columns else np.full(_n_rows, '', dtype=object)
+            _mapped2 = np.select([_raw2 == '◎', _raw2 == '○', _raw2 == '△'], [2.0, 1.0, 0.5], default=0.0)
+            _pts_arr2 += _mapped2
+            if _fc == _first_col:
+                _mich_arr2 = _mapped2
+        _factor_pts_v   = _pts_arr2
+        _factor_fit_v   = _pts_arr2 / 12.0 * 100.0
+        _michiaku_fit_v = _mich_arr2 / 2.0 * 100.0
 
-        # minimal SAS/AnchorScore (keep stable)
-        df["SAS"] = (0.45*df["Ability"] + 0.18*df["PosFit"] + 0.15*df["Consist"] + 0.08*df["MapFit"] + 0.07*df['GateFit'] + 0.07*df['ConditionFit']).astype(float)
-        df["PlaceAxisScore"] = df["SAS"].astype(float)
-        df["WinCandidateScore"] = df["SAS"].astype(float)
-        df["AnchorScore"] = df["PlaceAxisScore"].astype(float)
-        df['is_win_group'] = 0
-        df['is_place_group'] = 0
+        # コメント列は既存値を使うか 50 にフォールバック
+        def _get_comment(col):
+            if col in df.columns:
+                return np.where(np.isfinite(_arr(df, col, 50.0)), _arr(df, col, 50.0), 50.0)
+            return np.full(_n_rows, 50.0)
 
-        # place probability unavailable -> set zeros (report builder clamps anyway)
-        df["p_place_est"] = 0.0
-        df["p_place_est_pct"] = 0.0
-        df["p_place_low"] = np.nan
-        df["p_win_field"] = 0.0
+        _cf_arr  = _get_comment('CommentFit')
+        _cg_arr  = _get_comment('CommentGate')
+        _cc_arr  = _get_comment('CommentCondition')
+        _ct_arr  = _get_comment('CommentTrend')
+
+        # minimal SAS/AnchorScore (全て 50 ベース) — _f50 は後で _new_cols でも使う
+        _f50_sas = np.full(_n_rows, 50.0)  # ability/gate/cond は全て 50
+        _ability_arr = _gatefit_arr = _condfit_arr = _f50_sas
+
+        _mapfit_v  = _mapfit.values.astype(float, copy=False) if hasattr(_mapfit, 'values') else _f50_sas
+        _mapfit_v  = np.where(np.isfinite(_mapfit_v), _mapfit_v, 50.0)
+        _consist_v = _consist.values.astype(float, copy=False) if hasattr(_consist, 'values') else _f50_sas
+        _consist_v = np.where(np.isfinite(_consist_v), _consist_v, 50.0)
+
+        _sas_arr = np.clip(
+            0.45 * _ability_arr
+            + 0.18 * _posfit_arr
+            + 0.15 * _consist_v
+            + 0.08 * _mapfit_v
+            + 0.07 * _gatefit_arr
+            + 0.07 * _condfit_arr,
+            0.0, 100.0)
+
+        # ── 全新規列を dict にまとめて一括 concat（setitem 回数を最小化）──────
+        _existing_cols = set(df.columns)  # set lookup は O(1)、Index.__contains__ より速い
+        _new_cols: dict = {}
+
+        # スカラー 50.0 列（存在しない場合のみ） — _f50_sas を再利用
+        _f50 = _f50_sas
+        for _c in [
+            'PaceFit', 'GateFit', 'ConditionFit',
+            'CourseStyleFit', 'CourseStraightFit', 'CourseCornerFit',
+            'CourseStaminaFit', 'CoursePowerFit', 'CourseSpeedFit',
+            'CourseAgilityFit', 'CourseRunupFit', 'CourseStraightShapeFit',
+            'CourseShapeFit', 'CourseSpecialFit', 'CourseProfileFit',
+            'PaceTransitionScore', 'PaceReboundSignal',
+            'WinShape', 'TimeFit', 'Upside', 'WPS',
+        ]:
+            if _c not in _existing_cols:
+                _new_cols[_c] = _f50  # 同じ配列を共有（concat 時に copy されるので安全）
+
+        # スカラー 0.0 列
+        _f00 = np.zeros(_n_rows, dtype=np.float64)
+        for _c in ['CourseBiasDelta', 'FrontCollapseRisk', 'StartRiskShort']:
+            if _c not in _existing_cols:
+                _new_cols[_c] = _f00
+
+        # 計算済み列
+        _computed: dict = {
+            'rating_norm':      np.full(_n_rows, 50.0),
+            'speed_norm':       np.full(_n_rows, 50.0),
+            'AI_REAR_CONFIRMED': _ai_rear_arr,
+            'Ability':          _ability_arr,
+            'PosFit':           _posfit_arr,
+            'Consist':          _consist_v,
+            'MapFit':           _mapfit_v,
+            'FactorPts':        _factor_pts_v,
+            'FactorFit':        _factor_fit_v,
+            'MichiakuFit':      _michiaku_fit_v,
+            'CommentFit':       _cf_arr,
+            'CommentGate':      _cg_arr,
+            'CommentCondition': _cc_arr,
+            'CommentTrend':     _ct_arr,
+            'SAS':              _sas_arr,
+            'PlaceAxisScore':   _sas_arr,
+            'WinCandidateScore': _sas_arr,
+            'AnchorScore':      _sas_arr,
+            'is_win_group':     np.zeros(_n_rows, dtype=np.float64),
+            'is_place_group':   np.zeros(_n_rows, dtype=np.float64),
+            'p_place_est':      np.zeros(_n_rows, dtype=np.float64),
+            'p_place_est_pct':  np.zeros(_n_rows, dtype=np.float64),
+            'p_place_low':      np.full(_n_rows, np.nan, dtype=np.float64),
+            'p_win_field':      np.zeros(_n_rows, dtype=np.float64),
+        }
+
+        # ── 全列を1回の concat で追加（setitem を完全排除）──────────────────────
+        _all_computed = {**_new_cols, **_computed}
+        _drop_existing = [c for c in _all_computed if c in _existing_cols]
+        if _drop_existing:
+            df = df.drop(columns=_drop_existing)
+        df = pd.concat([df, pd.DataFrame(_all_computed, index=_df_idx)], axis=1)
 
         logs = {"rating_min": None, "rating_max": None, "speed_min": None, "speed_max": None}
         return df, logs, AuditFlags(audit_flag="NO_BET(data_missing)", reason="rating/speed_max missing")
@@ -16575,9 +20142,9 @@ def _cbf_apply_sp_weighting(df: "pd.DataFrame", speed_norm: "pd.Series") -> "pd.
             _sp_recent_norm, _, _ = norm_minmax_to_0_100(_sp_recent_raw)
             _sp_blended = (0.35 * speed_norm.fillna(50.0)
                            + 0.65 * _sp_recent_norm.fillna(50.0))
-            df["speed_norm"] = _sp_blended.clip(0.0, 100.0)
+            df["speed_norm"] = _clip0100(_sp_blended)
             # peak ボーナス列（WPS 等で参照可能）
-            df["SpeedPeakBonus"] = (speed_norm - _sp_recent_norm).clip(lower=0.0) * 0.35
+            df["SpeedPeakBonus"] = np.clip((speed_norm.values - _sp_recent_norm.values), 0.0, None) * 0.35
         else:
             df["SpeedPeakBonus"] = 0.0
     except Exception:
@@ -16594,7 +20161,7 @@ def _cbf_apply_sp_weighting(df: "pd.DataFrame", speed_norm: "pd.Series") -> "pd.
             # class_up_point が有効な行のみボーナス計算
             _valid_mask = _cup_raw.notna() & _smax.notna()
             _diff       = (_smax - _cup_raw).clip(lower=0.0)   # 負の差は 0
-            _bonus      = (_diff * 0.10).clip(lower=0.0, upper=10.0)
+            _bonus      = _clip_series((_diff * 0.10), 0.0, 10.0)
             df['ClassUpBonus'] = _bonus.where(_valid_mask, other=0.0)
         else:
             df['ClassUpBonus'] = 0.0
@@ -16670,13 +20237,34 @@ def _csv_compute_base_features(
     df = _cbf_apply_sp_weighting(df, speed_norm)
 
     df["AI_REAR_CONFIRMED"] = compute_ai_rear_confirmed(df)
-    df["Ability"] = (0.60 * df["rating_norm"].fillna(50.0) + 0.40 * df["speed_norm"].fillna(50.0)).astype(float)
+    df["Ability"] = _make_series(
+        np.clip(0.60 * _arr(df, 'rating_norm', 50.0) + 0.40 * _arr(df, 'speed_norm', 50.0), 0.0, 100.0),
+        df.index)
     # R22: ClassUpBonus（SP最高値が昇級点を上回る場合の加算）
     if "ClassUpBonus" in df.columns:
-        df["Ability"] = (df["Ability"] + df["ClassUpBonus"]).clip(upper=100.0)
+        df["Ability"] = _make_series(np.minimum((df["Ability"].values + pd.to_numeric(df["ClassUpBonus"], errors='coerce').fillna(0.0).values), 100.0), df.index)
 
-    # 天候/馬場（道悪・内側傷み等）を反映した位置取り補正
-    df["PosFit"] = df["zone_4c"].apply(lambda z: compute_position_fit_adjusted(z, meta)).astype(float)
+    # 天候/馬場（道悪・内側傷み等）を反映した位置取り補正 [ベクトル化]
+    # meta は全行共通 → ゾーン別デルタを事前計算してマップ
+    _wet_mode = _is_wet_track(meta)
+    _ctx = _track_context(meta)
+    _inside_dmg = _ctx.get("inside_damage", 0.0) >= 1.0
+    _pf_delta = {}
+    for _z in ("FRONT", "MIDDLE", "REAR", "UNKNOWN"):
+        _d = 0.0
+        if _wet_mode:
+            if _z == "FRONT":   _d += 3.0
+            elif _z == "MIDDLE": _d += 1.0
+            elif _z == "REAR":   _d -= 5.0
+        if _inside_dmg:
+            if _z == "FRONT":   _d -= 3.0
+            elif _z == "MIDDLE": _d += 3.0
+        _pf_delta[_z] = _d
+    # zone_4c は compute_scores_v1_1 冒頭で normalize_zone_token 済み → 再正規化不要
+    _zone_norm = df["zone_4c"]
+    _base_fit = _zone_norm.map(compute_position_fit_v1_1)
+    _delta_fit = _zone_norm.map(lambda z: _pf_delta.get(z, 0.0))
+    df["PosFit"] = _clip0100((_base_fit + _delta_fit))
     df["Consist"] = compute_consistency_from_speed_hist(df)
     map_summary = meta.get("map_summary", "Unknown")
     map_rates = meta.get("_map_rates", None)
@@ -16705,7 +20293,7 @@ def _csv_compute_base_features(
         _grb_gate_scale = float(_cf_params.get('gate_recovery_gate_scale', 0.6))
         if _grb_gate_scale > 0.0 and 'GateRecoveryBonus' in df.columns:
             _grb = pd.to_numeric(df['GateRecoveryBonus'], errors='coerce').fillna(0.0)
-            df['GateFit'] = (df['GateFit'] + _grb * _grb_gate_scale).clip(lower=0.0, upper=100.0).astype(float)
+            df['GateFit'] = _clip0100((df['GateFit'] + _grb * _grb_gate_scale)).astype(float)
     except Exception:
         pass
 
@@ -16741,7 +20329,7 @@ def _sas_compute_weights(params: dict, wet_mode: bool) -> dict:
     w_p = float(wp.get('w_posfit',    0.18) or 0.18)
     w_m = float(wp.get('w_mapfit',    0.12) or 0.12)
     w_f = float(wp.get('w_factorfit', 0.12) or 0.12)
-    w_c = float(wp.get('w_consist',   0.30) or 0.30)
+    _ = float(wp.get('w_consist',   0.30) or 0.30)
     factor_w   = 0.06 if wet_mode else 0.03
     michiaku_w = 0.03 if wet_mode else 0.00
 
@@ -16773,13 +20361,13 @@ def _sas_apply_geo_blend(df, params: dict, sas_add_col: str = 'SAS') -> object:
         avail = [c for c in geo_cols if c in df.columns]
         if avail and geo_blend > 0.0:
             stack = np.column_stack([
-                _num_series(df[c], 50.0, index=df.index).clip(1.0, 100.0)
+                np.clip(_arr(df, c, 50.0), 1.0, 100.0)
                 for c in avail
             ])
             with np.errstate(all='ignore'):
                 sas_geo = np.exp(np.nanmean(np.log(stack + 1e-9), axis=1)) - 1e-9
             sas_geo = np.clip(sas_geo, 0.0, 100.0)
-            df[sas_add_col] = ((1.0 - geo_blend) * sas_add + geo_blend * sas_geo).clip(0.0, 100.0)
+            df[sas_add_col] = _clip0100(((1.0 - geo_blend) * sas_add + geo_blend * sas_geo))
     except Exception:
         pass
     return df
@@ -16787,7 +20375,7 @@ def _sas_apply_geo_blend(df, params: dict, sas_add_col: str = 'SAS') -> object:
 
 def _sas_apply_training_delta(df, params: dict) -> object:
     """TrainingScore Δ を SAS / AnchorScore へ小さく反映した df を返す。"""
-    import numpy as np
+    # import numpy as np
     wp = (params.get('wide_rules') or {})
     td_enabled = bool(wp.get('training_delta_apply_enabled', True))
     td_scale   = float(wp.get('training_delta_scale', 0.12) or 0.12)
@@ -16795,9 +20383,9 @@ def _sas_apply_training_delta(df, params: dict) -> object:
     if not td_enabled or 'delta_train' not in df.columns:
         return df
     try:
-        delta = _num_series(df['delta_train'], 0.0, index=df.index).clip(-td_cap, td_cap)
-        df['SAS']         = (_num_series(df['SAS'],         50.0, index=df.index) + delta * td_scale).clip(0, 100)
-        df['AnchorScore'] = (_num_series(df['AnchorScore'], 50.0, index=df.index) + delta * td_scale).clip(0, 100)
+        delta = _clip_series(_num_series(df['delta_train'], 0.0, index=df.index), -td_cap, td_cap)
+        df['SAS']         = _clip0100((_num_series(df['SAS'],         50.0, index=df.index) + delta * td_scale))
+        df['AnchorScore'] = _clip0100((_num_series(df['AnchorScore'], 50.0, index=df.index) + delta * td_scale))
     except Exception:
         pass
     return df
@@ -16812,7 +20400,7 @@ def _csv_compute_sas(
     meta にも各重みを文字列で格納する。
     サブ関数: _sas_init_market / _sas_compute_weights / _sas_apply_geo_blend / _sas_apply_training_delta
     """
-    import numpy as np
+    # import numpy as np
     # 1. 市場特徴初期化
     df = _sas_init_market(df)
 
@@ -16846,7 +20434,7 @@ def _csv_compute_sas(
         def _sc(col, default=50.0) -> object:
             return _num_series(df.get(col, default), default, index=df.index)
 
-        sas_add = (
+        sas_add = _clip0100((
             w_a * _sc('Ability')
             + w_p * _sc('PosFit')
             + w_m * _sc('MapFit')
@@ -16854,7 +20442,7 @@ def _csv_compute_sas(
             + w_c * _sc('Consist')
             + factor_w   * _sc('MichiakuFit', 50.0)
             + michiaku_w * _sc('MichiakuScore', 50.0)
-        ).clip(0, 100)
+        ))
         df['SAS'] = sas_add
     except Exception:
         df['SAS'] = 50.0
@@ -16864,8 +20452,8 @@ def _csv_compute_sas(
         cap   = float(wp.get('comment_delta_cap',   3.0) or 3.0)
         scale = float(wp.get('comment_delta_scale', 0.10) or 0.10)
         if 'comment_delta' in df.columns:
-            cd = _num_series(df['comment_delta'], 0.0, index=df.index).clip(-cap, cap)
-            df['SAS'] = (_num_series(df['SAS'], 50.0, index=df.index) + cd * scale).clip(0, 100)
+            cd = _clip_series(_num_series(df['comment_delta'], 0.0, index=df.index), -cap, cap)
+            df['SAS'] = _clip0100((_num_series(df['SAS'], 50.0, index=df.index) + cd * scale))
     except Exception:
         pass
 
@@ -17023,8 +20611,8 @@ def _wps_compute_risk_signals(
     # R22: 前走インタビューペナルティを StartRiskShort に加算（SAS.前処理ステップとして統合）
     _cf2 = (params.get('comment_features', {}) or {})
     if bool(_cf2.get('start_risk_apply_to_anchor', True)):
-        _srip = _num_series(df.get('StartRiskInterviewPenalty', 0.0), 0.0, index=df.index)
-        df['StartRiskShort'] = (df['StartRiskShort'] + _srip).clip(lower=0.0, upper=15.0)
+        _srip = _num_series(df, 'StartRiskInterviewPenalty', 0.0) if 'StartRiskInterviewPenalty' in df.columns else pd.Series(0.0, index=df.index, dtype=float)
+        df['StartRiskShort'] = _clip_series((df['StartRiskShort'] + _srip), 0.0, 15.0)
     df['TemperamentRisk'] = compute_temperament_risk_v1_1(df, params)
     df = add_training_adjustment_features(df, meta, params)
     df['AbilityBaseScore'] = compute_ability_base_score_v1_1(df, params)
@@ -17036,23 +20624,35 @@ def _wps_compute_risk_signals(
     df['LongFrontFadeRisk'] = compute_long_front_fade_risk_v1_1(df, meta, params)
     df['DistanceStaminaRisk'] = compute_distance_stamina_risk_v1_1(df, meta, params)
     rec_count, rec_flag, rec_bonus_win, rec_bonus_place = compute_recovery_signal_v1_1(df, meta, params)
-    df['RecoverySignalCount'] = _num_series(rec_count, 0, index=df.index, dtype=int)
-    df['RecoverySignal'] = _num_series(rec_flag, 0, index=df.index, dtype=int)
-    df['RecoveryBonusWin'] = _num_series(rec_bonus_win, 0.0, index=df.index)
-    df['RecoveryBonusPlace'] = _num_series(rec_bonus_place, 0.0, index=df.index)
+    _idx = df.index
+    # _make_series + _arr でSeries構築コストを削減（_num_series(x, default, index=idx) より高速）
+    def _ns(v, fill=0.0):
+        if hasattr(v, 'values'):
+            a = v.values.astype(float, copy=False)
+        else:
+            try:
+                a = np.asarray(v, dtype=float)
+            except Exception:
+                a = np.full(len(df), float(fill))
+        a = np.where(np.isfinite(a), a, float(fill))
+        return _make_series(a, _idx)
+    df['RecoverySignalCount'] = _ns(rec_count, 0.0)
+    df['RecoverySignal']      = _ns(rec_flag,  0.0)
+    df['RecoveryBonusWin']    = _ns(rec_bonus_win,   0.0)
+    df['RecoveryBonusPlace']  = _ns(rec_bonus_place, 0.0)
     fav_score, fav_override, fav_reason = compute_favorite_score_v1_1(df, meta, params)
     maint_relief, maint_reason = compute_maintenance_run_relief_v1_1(df, meta, params)
     dev_wait_risk, dev_wait_reason = compute_development_wait_risk_v1_1(df, meta, params)
-    df['FavoriteScore'] = _num_series(fav_score, 0.0, index=df.index)
-    df['FavoriteOverrideFlag'] = _num_series(fav_override, 0, index=df.index, dtype=int)
-    df['FavoriteReason'] = fav_reason.infer_objects(copy=False).fillna('').astype(str)
-    df['MaintenanceRunRelief'] = _num_series(maint_relief, 0.0, index=df.index)
-    df['MaintenanceReason'] = maint_reason.infer_objects(copy=False).fillna('').astype(str)
-    df['DevelopmentWaitRisk'] = _num_series(dev_wait_risk, 0.0, index=df.index)
+    df['FavoriteScore']       = _ns(fav_score,   0.0)
+    df['FavoriteOverrideFlag']= _ns(fav_override, 0.0)
+    df['FavoriteReason']      = fav_reason.infer_objects(copy=False).fillna('').astype(str)
+    df['MaintenanceRunRelief']= _ns(maint_relief, 0.0)
+    df['MaintenanceReason']   = maint_reason.infer_objects(copy=False).fillna('').astype(str)
+    df['DevelopmentWaitRisk'] = _ns(dev_wait_risk, 0.0)
     df['DevelopmentWaitReason'] = dev_wait_reason.infer_objects(copy=False).fillna('').astype(str)
 
-    trend_bonus = ((_num_series(df, 'CommentTrend', 50.0) - 50.0) / 50.0).clip(lower=-1.0, upper=1.0)
-    comment_trend = _num_series(df, 'CommentTrend', 50.0)
+    _ = np.clip((_arr(df, 'CommentTrend', 50.0) - 50.0) / 50.0, -1.0, 1.0)
+    _ = _arr(df, 'CommentTrend', 50.0)
     dist, surface = _meta_distance_surface(meta)
 
     return df
@@ -17100,18 +20700,18 @@ def _wps_compute_pattern_scores(
     promote_win_bonus = float(wp.get('signal_promote_bonus_win', 4.5) or 4.5)
     promote_place_bonus = float(wp.get('signal_promote_bonus_place', 2.5) or 2.5)
     df['is_insurance_line'] = ((df['InsuranceSignalCount'] >= sig_thr) | (df['RecoverySignal'] > 0)).astype(int)
-    promote_scale = (_num_series(df, 'InsuranceSignalCount', 0.0).clip(lower=float(sig_thr), upper=4.0) - float(sig_thr) + 1.0).clip(lower=0.0, upper=2.0) / 2.0
+    promote_scale = _clip_series(_make_series(np.clip(_arr(df, 'InsuranceSignalCount', 0.0), float(sig_thr), 4.0) - float(sig_thr) + 1.0, df.index), 0.0, 2.0) / 2.0
     df['WinPatternBoost'] = (promote_win_bonus * promote_scale).astype(float)
     df['PlaceAxisBoost'] = (promote_place_bonus * promote_scale).astype(float)
 
-    temp_win_scale = float(wp.get('temperament_penalty_win_scale', 0.85) or 0.85)
-    temp_place_scale = float(wp.get('temperament_penalty_place_scale', 0.35) or 0.35)
+    _ = float(wp.get('temperament_penalty_win_scale', 0.85) or 0.85)
+    _ = float(wp.get('temperament_penalty_place_scale', 0.35) or 0.35)
 
     fr = (params.get('favorite_logic_rules', {}) or {})
-    maint_bonus_win = float(fr.get('maintenance_relief_bonus_win', 2.0) or 2.0)
-    maint_bonus_place = float(fr.get('maintenance_relief_bonus_place', 0.8) or 0.8)
-    dev_pen_win = float(fr.get('development_wait_penalty_win', 3.2) or 3.2)
-    dev_pen_place = float(fr.get('development_wait_penalty_place', 1.0) or 1.0)
+    _ = float(fr.get('maintenance_relief_bonus_win', 2.0) or 2.0)
+    _ = float(fr.get('maintenance_relief_bonus_place', 0.8) or 0.8)
+    _ = float(fr.get('development_wait_penalty_win', 3.2) or 3.2)
+    _ = float(fr.get('development_wait_penalty_place', 1.0) or 1.0)
 
     return df
 
@@ -17124,11 +20724,11 @@ def _wps_finalize_candidate_scores(
     """WinCandidateScore・PlaceAxisScore最終統合と馬場距離ボーナスを適用して返す。
 
     R29 fix: ヘルパー関数分割後にローカル変数が参照できなくなっていた問題を修正。
-    long_maiden_mode / comment_trend / scale 変数を関数内で再計算する。
+    NumPy fast-path: すべての重み付き和をndarray演算で実行。
     """
+    idx = df.index
     # R29 fix: 変数を再計算（分割後のスコープ問題を解消）
     long_maiden_mode = _is_long_maiden_race(meta, df)
-    comment_trend = _num_series(df, 'CommentTrend', 50.0)
     wp = (params.get('win_pattern_rules', {}) or {})
     temp_win_scale   = float(wp.get('temperament_penalty_win_scale',  0.85) or 0.85)
     temp_place_scale = float(wp.get('temperament_penalty_place_scale', 0.35) or 0.35)
@@ -17137,74 +20737,100 @@ def _wps_finalize_candidate_scores(
     maint_bonus_place = float(fr.get('maintenance_relief_bonus_place',  0.8) or 0.8)
     dev_pen_win       = float(fr.get('development_wait_penalty_win',    3.2) or 3.2)
     dev_pen_place     = float(fr.get('development_wait_penalty_place',  1.0) or 1.0)
+
+    # Extract all arrays once
+    comment_trend_arr  = _arr(df, 'CommentTrend', 50.0)
+    wps_arr            = _arr(df, 'WPS', 50.0)
+    upside_arr         = _arr(df, 'Upside', 50.0)
+    fav_arr            = _arr(df, 'FavoriteScore', 50.0)
+    win_boost_arr      = _arr(df, 'WinPatternBoost', 0.0)
+    place_boost_arr    = _arr(df, 'PlaceAxisBoost', 0.0)
+    rec_win_arr        = _arr(df, 'RecoveryBonusWin', 0.0)
+    rec_place_arr      = _arr(df, 'RecoveryBonusPlace', 0.0)
+    maint_arr          = _arr(df, 'MaintenanceRunRelief', 0.0)
+    front_coll_arr     = _arr(df, 'FrontCollapseRisk', 0.0)
+    start_risk_arr     = _arr(df, 'StartRiskShort', 0.0)
+    temp_risk_arr      = _arr(df, 'TemperamentRisk', 0.0)
+    dev_wait_arr       = _arr(df, 'DevelopmentWaitRisk', 0.0)
+    sas_arr            = _arr(df, 'SAS', 50.0)
+    consist_arr        = _arr(df, 'Consist', 50.0)
+    gatefit_arr        = _arr(df, 'GateFit', 50.0)
+    condfit_arr        = _arr(df, 'ConditionFit', 50.0)
+    recent_arr         = _arr(df, 'RecentFormScore', 50.0)
+    dist_arr           = _arr(df, 'DistanceSuitScore', 50.0)
+    wps_score_arr      = _arr(df, 'WinPatternScore', 50.0)
+
     if long_maiden_mode:
-        df["WinCandidateScore"] = (
-            0.48 * df['WinPatternScore']
-            + 0.20 * df['StabilityComposite']
-            + 0.14 * df["WPS"]
-            + 0.10 * comment_trend
-            + 0.08 * df["Upside"]
-            + df['WinPatternBoost']
-            + df['RecoveryBonusWin']
-            + 0.08 * df['FavoriteScore']
-            + maint_bonus_win * df['MaintenanceRunRelief']
-            - df['FrontCollapseRisk']
-            - df['StartRiskShort']
-            - temp_win_scale * df['TemperamentRisk']
-            - df['LongFrontFadeRisk']
-            - df['DistanceStaminaRisk']
-            - dev_pen_win * (df['DevelopmentWaitRisk'] / 6.0)
-        ).astype(float)
-
-        df["PlaceAxisScore"] = (
-            0.46 * df["SAS"]
-            + 0.14 * df["Consist"]
-            + 0.08 * df['GateFit']
-            + 0.08 * df['ConditionFit']
-            + 0.06 * comment_trend
-            + 0.10 * df['RecentFormScore']
-            + 0.08 * df['DistanceSuitScore']
-            + df['PlaceAxisBoost']
-            + df['RecoveryBonusPlace']
-            + maint_bonus_place * df['MaintenanceRunRelief']
-            - 0.25 * df['FrontCollapseRisk']
-            - 0.15 * df['StartRiskShort']
-            - temp_place_scale * df['TemperamentRisk']
-            - 0.35 * df['LongFrontFadeRisk']
-            - 0.40 * df['DistanceStaminaRisk']
-            - dev_pen_place * (df['DevelopmentWaitRisk'] / 6.0)
-        ).astype(float)
+        stab_arr = _arr(df, 'StabilityComposite', 50.0)
+        long_fade_arr = _arr(df, 'LongFrontFadeRisk', 0.0)
+        dist_stam_arr = _arr(df, 'DistanceStaminaRisk', 0.0)
+        win_arr = (
+            0.48 * wps_score_arr
+            + 0.20 * stab_arr
+            + 0.14 * wps_arr
+            + 0.10 * comment_trend_arr
+            + 0.08 * upside_arr
+            + win_boost_arr
+            + rec_win_arr
+            + 0.08 * fav_arr
+            + maint_bonus_win * maint_arr
+            - front_coll_arr
+            - start_risk_arr
+            - temp_win_scale * temp_risk_arr
+            - long_fade_arr
+            - dist_stam_arr
+            - dev_pen_win * (dev_wait_arr / 6.0)
+        )
+        place_arr = (
+            0.46 * sas_arr
+            + 0.14 * consist_arr
+            + 0.08 * gatefit_arr
+            + 0.08 * condfit_arr
+            + 0.06 * comment_trend_arr
+            + 0.10 * recent_arr
+            + 0.08 * dist_arr
+            + place_boost_arr
+            + rec_place_arr
+            + maint_bonus_place * maint_arr
+            - 0.25 * front_coll_arr
+            - 0.15 * start_risk_arr
+            - temp_place_scale * temp_risk_arr
+            - 0.35 * long_fade_arr
+            - 0.40 * dist_stam_arr
+            - dev_pen_place * (dev_wait_arr / 6.0)
+        )
     else:
-        df["WinCandidateScore"] = (
-            0.58 * df['WinPatternScore']
-            + 0.14 * df["WPS"]
-            + 0.06 * comment_trend
-            + 0.10 * df["Upside"]
-            + 0.12 * df['FavoriteScore']
-            + df['WinPatternBoost']
-            + maint_bonus_win * df['MaintenanceRunRelief']
-            - df['FrontCollapseRisk']
-            - df['StartRiskShort']
-            - temp_win_scale * df['TemperamentRisk']
-            - dev_pen_win * (df['DevelopmentWaitRisk'] / 6.0)
-        ).astype(float)
+        win_arr = (
+            0.58 * wps_score_arr
+            + 0.14 * wps_arr
+            + 0.06 * comment_trend_arr
+            + 0.10 * upside_arr
+            + 0.12 * fav_arr
+            + win_boost_arr
+            + maint_bonus_win * maint_arr
+            - front_coll_arr
+            - start_risk_arr
+            - temp_win_scale * temp_risk_arr
+            - dev_pen_win * (dev_wait_arr / 6.0)
+        )
+        place_arr = (
+            0.52 * sas_arr
+            + 0.14 * consist_arr
+            + 0.08 * gatefit_arr
+            + 0.08 * condfit_arr
+            + 0.06 * comment_trend_arr
+            + 0.10 * recent_arr
+            + 0.02 * dist_arr
+            + place_boost_arr
+            + maint_bonus_place * maint_arr
+            - 0.25 * front_coll_arr
+            - 0.15 * start_risk_arr
+            - temp_place_scale * temp_risk_arr
+            - dev_pen_place * (dev_wait_arr / 6.0)
+        )
 
-        df["PlaceAxisScore"] = (
-            0.52 * df["SAS"]
-            + 0.14 * df["Consist"]
-            + 0.08 * df['GateFit']
-            + 0.08 * df['ConditionFit']
-            + 0.06 * comment_trend
-            + 0.10 * df['RecentFormScore']
-            + 0.02 * df['DistanceSuitScore']
-            + df['PlaceAxisBoost']
-            + maint_bonus_place * df['MaintenanceRunRelief']
-            - 0.25 * df['FrontCollapseRisk']
-            - 0.15 * df['StartRiskShort']
-            - temp_place_scale * df['TemperamentRisk']
-            - dev_pen_place * (df['DevelopmentWaitRisk'] / 6.0)
-        ).astype(float)
-
+    df["WinCandidateScore"] = _make_series(win_arr.astype(np.float64), idx)
+    df["PlaceAxisScore"]    = _make_series(place_arr.astype(np.float64), idx)
     df = _wps_surface_dist_bonus(df, meta)
     return df
 
@@ -17233,39 +20859,51 @@ def _first_existing_series(df: pd.DataFrame, candidates, default=np.nan) -> pd.S
     for c in list(candidates or []):
         if c in df.columns:
             return df[c]
-    return pd.Series([default] * len(df), index=df.index)
+    # If default is numeric-compatible, use fast path; otherwise fall back to pd.Series
+    try:
+        fv = float(default) if default is not None else np.nan
+        return _make_series(np.full(len(df), fv, dtype=float), df.index)
+    except (TypeError, ValueError):
+        return pd.Series([default] * len(df), index=df.index)
 
 
 def _normalize_rate_score(series_like, index) -> pd.Series:
     """勝率・複勝率・直近率などを 0-100 スコアへ正規化して返す。"""
     s = _num_series(series_like, np.nan, index=index)
     s = pd.to_numeric(s, errors='coerce')
-    finite = s[np.isfinite(s)]
-    if len(finite) == 0:
-        return pd.Series([50.0] * len(index), index=index, dtype=float)
-    if float(finite.abs().max()) <= 1.5:
-        s = s * 100.0
-    return s.clip(lower=0.0, upper=100.0).fillna(50.0).astype(float)
+    arr = s.values.copy()
+    finite_mask = np.isfinite(arr)
+    if not finite_mask.any():
+        return _make_series(np.full(len(index), 50.0), index)
+    if float(np.abs(arr[finite_mask]).max()) <= 1.5:
+        arr *= 100.0
+    arr = np.clip(arr, 0.0, 100.0)
+    arr[~finite_mask] = 50.0
+    return _make_series(arr, index)
 
 
 def _normalize_roi_score(series_like, index) -> pd.Series:
     """ROI / 回収率を 0-100 スコアへ正規化して返す。1.0 または 100 を損益分岐点とみなす。"""
     s = _num_series(series_like, np.nan, index=index)
     s = pd.to_numeric(s, errors='coerce')
-    finite = s[np.isfinite(s)]
-    if len(finite) == 0:
-        return pd.Series([50.0] * len(index), index=index, dtype=float)
-    if float(finite.abs().max()) > 10.0:
-        s = s / 100.0
-    s = s.clip(lower=0.0, upper=3.0)
-    return (50.0 + (s - 1.0) * 45.0).clip(lower=0.0, upper=100.0).fillna(50.0).astype(float)
+    arr = s.values.copy()
+    finite_mask = np.isfinite(arr)
+    if not finite_mask.any():
+        return _make_series(np.full(len(index), 50.0), index)
+    if float(np.abs(arr[finite_mask]).max()) > 10.0:
+        arr /= 100.0
+    arr = np.clip(arr, 0.0, 3.0)
+    arr = np.clip(50.0 + (arr - 1.0) * 45.0, 0.0, 100.0)
+    arr[~finite_mask] = 50.0
+    return _make_series(arr, index)
 
 
 def _shrink_score_by_sample(score: pd.Series, sample_n, *, neutral: float = 50.0, max_n: float = 40.0) -> pd.Series:
     """サンプル数が少ない統計を中立値へ縮小して過学習を抑える。"""
-    n = _num_series(sample_n, 0.0, index=score.index, lower=0.0)
-    reliability = (n / float(max_n)).clip(lower=0.0, upper=1.0)
-    return (float(neutral) + (score - float(neutral)) * reliability).clip(lower=0.0, upper=100.0).astype(float)
+    n_arr = _num_series(sample_n, 0.0, index=score.index, lower=0.0).values
+    rel = np.clip(n_arr / float(max_n), 0.0, 1.0)
+    out = np.clip(float(neutral) + (score.values - float(neutral)) * rel, 0.0, 100.0)
+    return _make_series(out, score.index)
 
 
 def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = None) -> pd.DataFrame:
@@ -17330,8 +20968,11 @@ def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = No
     stable_jockey_score = pd.Series(np.nan, index=idx, dtype=float)
     stable_jockey_score.loc[stable_jockey_known & stable_jockey_flag] = 70.0
     stable_jockey_score.loc[stable_jockey_known & (~stable_jockey_flag)] = 35.0
-    stable_jockey_score = stable_jockey_score.where(np.isfinite(stable_jockey_score), 0.55 * main_jockey_share_score + 17.5)
-    stable_jockey_score = stable_jockey_score.fillna(50.0).clip(lower=0.0, upper=100.0).astype(float)
+    _sjs_arr = stable_jockey_score.values.copy()
+    _sjs_na = ~np.isfinite(_sjs_arr)
+    _sjs_arr[_sjs_na] = np.clip(0.55 * main_jockey_share_score.values[_sjs_na] + 17.5, 0.0, 100.0)
+    _sjs_arr = np.where(np.isfinite(_sjs_arr), np.clip(_sjs_arr, 0.0, 100.0), 50.0)
+    stable_jockey_score = _make_series(_sjs_arr, idx)
 
     breeder_owner_affinity = _normalize_roi_score(_first_existing_series(out, [
         'breeder_owner_affinity', '生産者馬主相性', '生産者馬主期待値'
@@ -17391,195 +21032,241 @@ def add_connection_aggregate_features(df: pd.DataFrame, params: dict | None = No
     owner_name_text = owner_name_raw.infer_objects(copy=False).fillna('').astype(str)
     gaikyu_name_text = gaikyu_name_raw.infer_objects(copy=False).fillna('').astype(str)
 
-    major_breeder_flag = breeder_name_text.str.contains(
+    # ── str.contains → 直接 ndarray float 化（.astype(float) 中間 Series を排除）──
+    _mbf = breeder_name_text.str.contains(
         r'ノーザンファーム|ノーザンF|社台ファーム|社台F|白老ファーム|追分ファーム|ノーザンホースパーク',
         case=False, regex=True, na=False,
-    ).astype(float)
-    agent_jockey_flag = jockey_name_text.str.contains(
+    ).values.astype(np.float64)
+    _ajf = jockey_name_text.str.contains(
         r'ルメール|川田|武豊|モレイラ|レーン|戸崎|横山武|坂井|デムーロ',
         case=False, regex=True, na=False,
-    ).astype(float)
-    elite_trainer_flag = trainer_name_text.str.contains(
+    ).values.astype(np.float64)
+    _etf = elite_trainer_flag = trainer_name_text.str.contains(
         r'中内田|堀|木村|友道|国枝|手塚|須貝|矢作|池江|藤原|斉藤崇|杉山晴',
         case=False, regex=True, na=False,
-    ).astype(float)
-    owner_strategy_flag = owner_name_text.str.contains(
+    ).values.astype(np.float64)
+    _osf = owner_name_text.str.contains(
         r'サンデー|シルク|キャロット|社台レースホース|G1レーシング|東京ホース|ラフィアン|ノルマンディー|ロード|ダノックス|金子真人|キーファーズ|近藤旬子',
         case=False, regex=True, na=False,
-    ).astype(float)
-    club_owner_flag = owner_name_text.str.contains(
+    ).values.astype(np.float64)
+    _cof = owner_name_text.str.contains(
         r'サンデー|シルク|キャロット|社台レースホース|G1レーシング|東京ホース|ラフィアン|ノルマンディー|ロード|DMM|ウイン',
         case=False, regex=True, na=False,
-    ).astype(float)
-    major_gaikyu_flag = gaikyu_name_text.str.contains(
+    ).values.astype(np.float64)
+    _mgf = gaikyu_name_text.str.contains(
         r'天栄|しがらき|山元|チャンピオンヒルズ|大山ヒルズ|ノーザン',
         case=False, regex=True, na=False,
-    ).astype(float)
-    gaikyu_return_flag_num = (_num_series(out, 'is_gaikyu_return', 0.0, index=idx) >= 1.0).astype(float)
+    ).values.astype(np.float64)
+    gaikyu_return_flag_num = (_arr(out, 'is_gaikyu_return', 0.0) >= 1.0).astype(np.float64)
     gaikyu_current_score = _num_series(out, 'GaikyuReturnScore', 50.0, index=idx)
     training_adjust_score = _num_series(out, 'TrainingAdjustmentScore', 50.0, index=idx)
 
-    breeder_agent_heuristic = (
-        44.0
-        + 12.0 * major_breeder_flag
-        + 12.0 * agent_jockey_flag
-        + 8.0 * (combo_place_rate >= 58.0).astype(float)
-        + 6.0 * (main_jockey_share_score >= 60.0).astype(float)
-        + 6.0 * (jockey_rate >= 58.0).astype(float)
-    ).clip(lower=0.0, upper=100.0)
-    breeder_trainer_heuristic = (
-        44.0
-        + 12.0 * major_breeder_flag
-        + 12.0 * elite_trainer_flag
-        + 8.0 * (trainer_rate >= 58.0).astype(float)
-        + 8.0 * (trainer_recent >= 56.0).astype(float)
-        + 6.0 * (combo_place_rate >= 56.0).astype(float)
-    ).clip(lower=0.0, upper=100.0)
-    breeder_gaikyu_heuristic = (
-        42.0
-        + 10.0 * major_breeder_flag
-        + 10.0 * major_gaikyu_flag
-        + 10.0 * gaikyu_return_flag_num
-        + 8.0 * (gaikyu_current_score >= 60.0).astype(float)
-        + 8.0 * (training_adjust_score >= 58.0).astype(float)
-        + 6.0 * (trainer_rate >= 58.0).astype(float)
-    ).clip(lower=0.0, upper=100.0)
+    # Series aliases for code that still references these as Series (for .notna() etc.)
+    major_breeder_flag = _make_series(_mbf, idx)
+    agent_jockey_flag  = _make_series(_ajf, idx)
+    elite_trainer_flag = _make_series(_etf, idx)
+    owner_strategy_flag = _make_series(_osf, idx)
+    club_owner_flag    = _make_series(_cof, idx)
+    major_gaikyu_flag  = _make_series(_mgf, idx)
+    _mgf = major_gaikyu_flag.values
+    _grf = gaikyu_return_flag_num if isinstance(gaikyu_return_flag_num, np.ndarray) else gaikyu_return_flag_num.values
+    _cpr = combo_place_rate.values
+    _mjss = main_jockey_share_score.values
+    _jra = jockey_rate.values
+    _trr = trainer_rate.values
+    _trc = trainer_recent.values
+    _gcs = gaikyu_current_score.values
+    _tas = training_adjust_score.values
+    _osw = owner_strategy_flag.values
+    _oca = owner_condition_switch.values
+    _oss = owner_surface_switch.values
+    _ods = owner_distance_switch.values
+    _ocp = owner_class_priority.values
+    _boa = breeder_owner_affinity.values
+    _bjn = breeder_jockey_network.values
+    _btn = breeder_trainer_network.values
+    _bgt = breeder_gaikyu_trainer.values
+    _ope = owner_prize_expectation.values
 
-    breeder_agent_network_score = breeder_agent_heuristic.where(
-        breeder_jockey_network_raw.isna(),
-        0.62 * breeder_jockey_network + 0.38 * breeder_agent_heuristic,
-    ).clip(lower=0.0, upper=100.0)
-    breeder_trainer_network_score = breeder_trainer_heuristic.where(
-        breeder_trainer_network_raw.isna(),
-        0.62 * breeder_trainer_network + 0.38 * breeder_trainer_heuristic,
-    ).clip(lower=0.0, upper=100.0)
-    breeder_gaikyu_coordination_score = breeder_gaikyu_heuristic.where(
-        breeder_gaikyu_trainer_raw.isna(),
-        0.60 * breeder_gaikyu_trainer + 0.40 * breeder_gaikyu_heuristic,
-    ).clip(lower=0.0, upper=100.0)
-
-    owner_prize_heuristic = (
-        46.0
-        + 12.0 * owner_strategy_flag
-        + 8.0 * club_owner_flag
-        + 10.0 * (owner_class_priority >= 58.0).astype(float)
-        + 6.0 * (breeder_owner_affinity >= 58.0).astype(float)
-    ).clip(lower=0.0, upper=100.0)
-    owner_condition_heuristic = (
-        46.0
-        + 10.0 * owner_strategy_flag
-        + 8.0 * club_owner_flag
-        + 8.0 * (owner_class_priority >= 55.0).astype(float)
-        + 6.0 * (training_adjust_score >= 58.0).astype(float)
-    ).clip(lower=0.0, upper=100.0)
-    owner_condition_base = (
-        0.50 * owner_condition_switch
-        + 0.25 * owner_surface_switch
-        + 0.25 * owner_distance_switch
-    ).clip(lower=0.0, upper=100.0)
-    owner_prize_score = owner_prize_heuristic.where(
-        owner_prize_expectation_raw.isna(),
-        0.58 * owner_prize_expectation + 0.42 * owner_prize_heuristic,
-    ).clip(lower=0.0, upper=100.0)
-    owner_condition_switch_score = owner_condition_heuristic.where(
-        owner_condition_switch_raw.isna() & owner_surface_switch_raw.isna() & owner_distance_switch_raw.isna(),
-        0.65 * owner_condition_base + 0.35 * owner_condition_heuristic,
-    ).clip(lower=0.0, upper=100.0)
-
-    out['JockeyRecentFormScore'] = _shrink_score_by_sample(jockey_recent, jockey_n, max_n=36.0)
-    out['TrainerRecentFormScore'] = _shrink_score_by_sample(trainer_recent, trainer_n, max_n=36.0)
-    out['TrainerJockeyWinRateScore'] = _shrink_score_by_sample(combo_win_rate, combo_n, max_n=24.0)
-    out['TrainerJockeyPlaceRateScore'] = _shrink_score_by_sample(combo_place_rate, combo_n, max_n=24.0)
-    out['MainJockeyShareScore'] = main_jockey_share_score.astype(float)
-    out['JockeyTrainerComboROIScore'] = _shrink_score_by_sample(
-        0.25 * combo_win_rate + 0.35 * combo_place_rate + 0.40 * combo_roi,
-        combo_n,
-        max_n=24.0,
+    # bool比較の結果を直接 float 乗算（numpy は bool * float でキャストを行う）
+    breeder_agent_heuristic_arr = np.clip(
+        44.0 + 12.0 * _mbf + 12.0 * _ajf
+        + 8.0 * (_cpr >= 58.0)
+        + 6.0 * (_mjss >= 60.0)
+        + 6.0 * (_jra >= 58.0),
+        0.0, 100.0
     )
-    out['JockeyTrainerComboFormScore'] = _shrink_score_by_sample(combo_recent, combo_n, max_n=24.0)
-    out['TrainerJockeyChemistryScore'] = _shrink_score_by_sample(
-        0.30 * combo_win_rate + 0.30 * combo_place_rate + 0.22 * combo_roi + 0.18 * main_jockey_share_score,
-        combo_n,
-        max_n=24.0,
+    breeder_trainer_heuristic_arr = np.clip(
+        44.0 + 12.0 * _mbf + 12.0 * _etf
+        + 8.0 * (_trr >= 58.0)
+        + 8.0 * (_trc >= 56.0)
+        + 6.0 * (_cpr >= 56.0),
+        0.0, 100.0
     )
-    out['StableJockeyScore'] = stable_jockey_score
-    out['BreederOwnerAffinityScore'] = breeder_owner_affinity.astype(float)
-    out['OwnerClassPriorityScore'] = owner_class_priority.astype(float)
-    out['BreederAgentNetworkScore'] = breeder_agent_network_score.astype(float)
-    out['BreederTrainerNetworkScore'] = breeder_trainer_network_score.astype(float)
-    out['BreederGaikyuCoordinationScore'] = breeder_gaikyu_coordination_score.astype(float)
-    out['BreederSerialStrategyScore'] = (
-        0.38 * out['BreederAgentNetworkScore']
-        + 0.34 * out['BreederTrainerNetworkScore']
-        + 0.28 * out['BreederGaikyuCoordinationScore']
-    ).clip(lower=0.0, upper=100.0).astype(float)
-    out['OwnerPrizeExpectationScore'] = owner_prize_score.astype(float)
-    out['OwnerConditionSwitchScore'] = owner_condition_switch_score.astype(float)
-    out['OwnerRacePlacementScore'] = (
-        0.58 * out['OwnerPrizeExpectationScore']
-        + 0.42 * out['OwnerConditionSwitchScore']
-    ).clip(lower=0.0, upper=100.0).astype(float)
-    out['JockeyConnectionScore'] = _shrink_score_by_sample(0.60 * jockey_rate + 0.25 * jockey_roi + 0.15 * jockey_recent, jockey_n, max_n=36.0)
-    out['TrainerConnectionScore'] = _shrink_score_by_sample(0.60 * trainer_rate + 0.25 * trainer_roi + 0.15 * trainer_recent, trainer_n, max_n=36.0)
-    out['ConnectionRecentFormScore'] = (
-        0.24 * out['JockeyRecentFormScore']
-        + 0.20 * out['TrainerRecentFormScore']
-        + 0.26 * out['JockeyTrainerComboFormScore']
-        + 0.16 * out['MainJockeyShareScore']
-        + 0.14 * out['StableJockeyScore']
-    ).clip(lower=0.0, upper=100.0).astype(float)
+    breeder_gaikyu_heuristic_arr = np.clip(
+        42.0 + 10.0 * _mbf + 10.0 * _mgf + 10.0 * _grf
+        + 8.0 * (_gcs >= 60.0)
+        + 8.0 * (_tas >= 58.0)
+        + 6.0 * (_trr >= 58.0),
+        0.0, 100.0
+    )
+    _bjn_na = breeder_jockey_network_raw.isna().values
+    _btn_na = breeder_trainer_network_raw.isna().values
+    _bgt_na = breeder_gaikyu_trainer_raw.isna().values
+    breeder_agent_network_arr = np.where(_bjn_na, breeder_agent_heuristic_arr,
+        np.clip(0.62 * _bjn + 0.38 * breeder_agent_heuristic_arr, 0.0, 100.0))
+    breeder_trainer_network_arr = np.where(_btn_na, breeder_trainer_heuristic_arr,
+        np.clip(0.62 * _btn + 0.38 * breeder_trainer_heuristic_arr, 0.0, 100.0))
+    breeder_gaikyu_coord_arr = np.where(_bgt_na, breeder_gaikyu_heuristic_arr,
+        np.clip(0.60 * _bgt + 0.40 * breeder_gaikyu_heuristic_arr, 0.0, 100.0))
 
-    jockey_rel = (_num_series(jockey_n, 0.0, index=idx, lower=0.0).clip(0.0, 36.0) / 36.0)
-    trainer_rel = (_num_series(trainer_n, 0.0, index=idx, lower=0.0).clip(0.0, 36.0) / 36.0)
-    combo_rel = (_num_series(combo_n, 0.0, index=idx, lower=0.0).clip(0.0, 24.0) / 24.0)
-    breeder_owner_rel = (_first_existing_series(out, ['breeder_owner_affinity', '生産者馬主相性', '生産者馬主期待値'], default=np.nan).notna()).astype(float)
-    owner_class_rel = (_first_existing_series(out, ['owner_class_priority', '馬主クラス優先度', 'owner_class_bias'], default=np.nan).notna()).astype(float)
-    stable_rel = (_first_existing_series(out, ['is_stable_jockey', '主戦騎手', '厩舎主戦騎手', 'stable_jockey_flag'], default=np.nan).notna()).astype(float)
-    share_rel = (_first_existing_series(out, ['main_jockey_share', 'trainer_main_jockey_share', 'stable_main_jockey_share', '主戦騎手比率', '厩舎主戦騎手比率', '主戦割合', '主戦シェア', '厩舎騎手シェア'], default=np.nan).notna()).astype(float)
-    breeder_agent_rel = (breeder_jockey_network_raw.notna() | (major_breeder_flag > 0.0) | (agent_jockey_flag > 0.0)).astype(float)
-    breeder_trainer_rel = (breeder_trainer_network_raw.notna() | (major_breeder_flag > 0.0) | (elite_trainer_flag > 0.0)).astype(float)
-    breeder_gaikyu_rel = (breeder_gaikyu_trainer_raw.notna() | (major_gaikyu_flag > 0.0) | (gaikyu_return_flag_num > 0.0)).astype(float)
-    owner_prize_rel = (owner_prize_expectation_raw.notna() | owner_name_text.str.strip().ne('')).astype(float)
-    owner_cond_rel = (
+    owner_prize_heuristic_arr = np.clip(
+        46.0 + 12.0 * _osf + 8.0 * _cof
+        + 10.0 * (_ocp >= 58.0)
+        + 6.0 * (_boa >= 58.0),
+        0.0, 100.0
+    )
+    owner_condition_heuristic_arr = np.clip(
+        46.0 + 10.0 * _osw + 8.0 * _cof
+        + 8.0 * (_ocp >= 55.0)
+        + 6.0 * (_tas >= 58.0),
+        0.0, 100.0
+    )
+    owner_condition_base_arr = np.clip(0.50 * _oca + 0.25 * _oss + 0.25 * _ods, 0.0, 100.0)
+    _ope_na = owner_prize_expectation_raw.isna().values
+    owner_prize_arr = np.where(_ope_na, owner_prize_heuristic_arr,
+        np.clip(0.58 * _ope + 0.42 * owner_prize_heuristic_arr, 0.0, 100.0))
+    _ocs_na = (owner_condition_switch_raw.isna() & owner_surface_switch_raw.isna() & owner_distance_switch_raw.isna()).values
+    owner_cond_switch_arr = np.where(_ocs_na, owner_condition_heuristic_arr,
+        np.clip(0.65 * owner_condition_base_arr + 0.35 * owner_condition_heuristic_arr, 0.0, 100.0))
+
+    # Wrap back to Series for downstream use
+    breeder_agent_heuristic = _make_series(breeder_agent_heuristic_arr, idx)
+    breeder_trainer_heuristic = _make_series(breeder_trainer_heuristic_arr, idx)
+    breeder_gaikyu_heuristic = _make_series(breeder_gaikyu_heuristic_arr, idx)
+    breeder_agent_network_score = _make_series(breeder_agent_network_arr, idx)
+    breeder_trainer_network_score = _make_series(breeder_trainer_network_arr, idx)
+    breeder_gaikyu_coordination_score = _make_series(breeder_gaikyu_coord_arr, idx)
+    owner_prize_heuristic = _make_series(owner_prize_heuristic_arr, idx)
+    owner_condition_heuristic = _make_series(owner_condition_heuristic_arr, idx)
+    owner_condition_base = _make_series(owner_condition_base_arr, idx)
+    owner_prize_score = _make_series(owner_prize_arr, idx)
+    owner_condition_switch_score = _make_series(owner_cond_switch_arr, idx)
+
+    # ── 独立スコア群を一括で dict に計算してから pd.concat で追加 ──────────────
+    # 各スコアを Series として事前計算（_wsum0100 は Series を返す）
+    _jrfs  = _shrink_score_by_sample(jockey_recent, jockey_n, max_n=36.0)
+    _trfs  = _shrink_score_by_sample(trainer_recent, trainer_n, max_n=36.0)
+    _tjwrs = _shrink_score_by_sample(combo_win_rate, combo_n, max_n=24.0)
+    _tjprs = _shrink_score_by_sample(combo_place_rate, combo_n, max_n=24.0)
+    _mjss  = main_jockey_share_score
+    _jtcrs = _shrink_score_by_sample(
+        _wsum0100(idx, (0.25, combo_win_rate), (0.35, combo_place_rate), (0.40, combo_roi)),
+        combo_n, max_n=24.0,
+    )
+    _jtcfs = _shrink_score_by_sample(combo_recent, combo_n, max_n=24.0)
+    _tjcs  = _shrink_score_by_sample(
+        _wsum0100(idx, (0.30, combo_win_rate), (0.30, combo_place_rate), (0.22, combo_roi), (0.18, main_jockey_share_score)),
+        combo_n, max_n=24.0,
+    )
+    _sjs   = stable_jockey_score
+    _boas  = breeder_owner_affinity
+    _ocps  = owner_class_priority
+    _bans  = breeder_agent_network_score
+    _btns  = breeder_trainer_network_score
+    _bgcs  = breeder_gaikyu_coordination_score
+    _bsss  = _wsum0100(idx, (0.38, _bans), (0.34, _btns), (0.28, _bgcs))
+    _ops   = owner_prize_score
+    _ocss  = owner_condition_switch_score
+    _orps  = _wsum0100(idx, (0.58, _ops), (0.42, _ocss))
+    _jcons = _shrink_score_by_sample(_wsum0100(idx, (0.60, jockey_rate), (0.25, jockey_roi), (0.15, jockey_recent)), jockey_n, max_n=36.0)
+    _tcons = _shrink_score_by_sample(_wsum0100(idx, (0.60, trainer_rate), (0.25, trainer_roi), (0.15, trainer_recent)), trainer_n, max_n=36.0)
+    _crfs  = _wsum0100(idx, (0.24, _jrfs), (0.20, _trfs), (0.26, _jtcfs), (0.16, _mjss), (0.14, _sjs))
+
+    # 一括代入（BlockManager.insert を呼ぶ回数を最小化）
+    _batch1 = {
+        'JockeyRecentFormScore':       _jrfs,
+        'TrainerRecentFormScore':      _trfs,
+        'TrainerJockeyWinRateScore':   _tjwrs,
+        'TrainerJockeyPlaceRateScore': _tjprs,
+        'MainJockeyShareScore':        _mjss,
+        'JockeyTrainerComboROIScore':  _jtcrs,
+        'JockeyTrainerComboFormScore': _jtcfs,
+        'TrainerJockeyChemistryScore': _tjcs,
+        'StableJockeyScore':           _sjs,
+        'BreederOwnerAffinityScore':   _boas,
+        'OwnerClassPriorityScore':     _ocps,
+        'BreederAgentNetworkScore':    _bans,
+        'BreederTrainerNetworkScore':  _btns,
+        'BreederGaikyuCoordinationScore': _bgcs,
+        'BreederSerialStrategyScore':  _bsss,
+        'OwnerPrizeExpectationScore':  _ops,
+        'OwnerConditionSwitchScore':   _ocss,
+        'OwnerRacePlacementScore':     _orps,
+        'JockeyConnectionScore':       _jcons,
+        'TrainerConnectionScore':      _tcons,
+        'ConnectionRecentFormScore':   _crfs,
+    }
+    # 既存列は上書き、新規列は一括追加
+    _new_cols1 = {k: v for k, v in _batch1.items() if k not in out.columns}
+    _upd_cols1 = {k: v for k, v in _batch1.items() if k in out.columns}
+    if _new_cols1:
+        out = pd.concat([out, pd.DataFrame(_new_cols1, index=idx)], axis=1)
+    for k, v in _upd_cols1.items():
+        out[k] = v
+
+    # Reliability（信頼性）スコア：ndarray で計算して最後に一括書き込み
+    jockey_rel_arr  = np.clip(_arr(jockey_n if isinstance(jockey_n, pd.DataFrame) else
+                              pd.DataFrame({'v': jockey_n}, index=idx), 'v', 0.0) if isinstance(jockey_n, pd.DataFrame)
+                              else np.clip(np.nan_to_num(jockey_n.values if hasattr(jockey_n,'values') else np.array(jockey_n,dtype=float), nan=0.0), 0.0, 36.0) / 36.0,
+                              0.0, 1.0)
+    trainer_rel_arr = np.clip(np.nan_to_num(trainer_n.values if hasattr(trainer_n,'values') else np.array(trainer_n,dtype=float), nan=0.0), 0.0, 36.0) / 36.0
+    combo_rel_arr   = np.clip(np.nan_to_num(combo_n.values   if hasattr(combo_n,'values')   else np.array(combo_n,  dtype=float), nan=0.0), 0.0, 24.0) / 24.0
+    breeder_owner_rel_arr = (_first_existing_series(out, ['breeder_owner_affinity', '生産者馬主相性', '生産者馬主期待値'], default=np.nan).notna()).values.astype(float)
+    owner_class_rel_arr   = (_first_existing_series(out, ['owner_class_priority', '馬主クラス優先度', 'owner_class_bias'], default=np.nan).notna()).values.astype(float)
+    stable_rel_arr  = (_first_existing_series(out, ['is_stable_jockey', '主戦騎手', '厩舎主戦騎手', 'stable_jockey_flag'], default=np.nan).notna()).values.astype(float)
+    share_rel_arr   = (_first_existing_series(out, ['main_jockey_share', 'trainer_main_jockey_share', 'stable_main_jockey_share', '主戦騎手比率', '厩舎主戦騎手比率', '主戦割合', '主戦シェア', '厩舎騎手シェア'], default=np.nan).notna()).values.astype(float)
+    breeder_agent_rel_arr   = (breeder_jockey_network_raw.notna() | (major_breeder_flag > 0.0) | (agent_jockey_flag > 0.0)).values.astype(float)
+    breeder_trainer_rel_arr = (breeder_trainer_network_raw.notna() | (major_breeder_flag > 0.0) | (elite_trainer_flag > 0.0)).values.astype(float)
+    breeder_gaikyu_rel_arr  = (breeder_gaikyu_trainer_raw.notna() | (major_gaikyu_flag > 0.0) | (gaikyu_return_flag_num > 0.0)).values.astype(float)
+    owner_prize_rel_arr = (owner_prize_expectation_raw.notna() | owner_name_text.str.strip().ne('')).values.astype(float)
+    owner_cond_rel_arr  = (
         owner_condition_switch_raw.notna()
         | owner_surface_switch_raw.notna()
         | owner_distance_switch_raw.notna()
         | owner_name_text.str.strip().ne('')
-    ).astype(float)
-    out['HumanConnectionReliability'] = (
-        100.0 * (
-            jockey_rel + trainer_rel + combo_rel + breeder_owner_rel + owner_class_rel + stable_rel + share_rel
-            + breeder_agent_rel + breeder_trainer_rel + breeder_gaikyu_rel + owner_prize_rel + owner_cond_rel
-        ) / 12.0
-    ).clip(lower=0.0, upper=100.0).astype(float)
+    ).values.astype(float)
+    _rel_sum = (jockey_rel_arr + trainer_rel_arr + combo_rel_arr
+                + breeder_owner_rel_arr + owner_class_rel_arr + stable_rel_arr
+                + share_rel_arr + breeder_agent_rel_arr + breeder_trainer_rel_arr
+                + breeder_gaikyu_rel_arr + owner_prize_rel_arr + owner_cond_rel_arr)
+    _hcr = _make_series(np.clip(100.0 * _rel_sum / 12.0, 0.0, 100.0), idx)
 
-    out['HumanNetworkScore'] = (
-        0.12 * out['TrainerJockeyChemistryScore']
-        + 0.09 * out['JockeyTrainerComboROIScore']
-        + 0.06 * out['TrainerJockeyWinRateScore']
-        + 0.04 * out['TrainerJockeyPlaceRateScore']
-        + 0.04 * out['MainJockeyShareScore']
-        + 0.03 * out['StableJockeyScore']
-        + 0.13 * out['BreederAgentNetworkScore']
-        + 0.11 * out['BreederTrainerNetworkScore']
-        + 0.10 * out['BreederGaikyuCoordinationScore']
-        + 0.05 * out['BreederOwnerAffinityScore']
-        + 0.06 * out['OwnerClassPriorityScore']
-        + 0.08 * out['OwnerPrizeExpectationScore']
-        + 0.09 * out['OwnerConditionSwitchScore']
-    ).clip(lower=0.0, upper=100.0).astype(float)
+    # HumanNetworkScore / HumanConnectionScore を事前計算変数で算出（out[] 参照を排除）
+    _hns = _wsum0100(idx,
+        (0.12, _tjcs),  (0.09, _jtcrs), (0.06, _tjwrs), (0.04, _tjprs),
+        (0.04, _mjss),  (0.03, _sjs),   (0.13, _bans),  (0.11, _btns),
+        (0.10, _bgcs),  (0.05, _boas),  (0.06, _ocps),  (0.08, _ops),
+        (0.09, _ocss),
+    )
+    _hcs = _wsum0100(idx,
+        (0.18, _jcons), (0.14, _tcons), (0.13, _tjcs),  (0.09, _jtcrs),
+        (0.08, _crfs),  (0.12, _hns),   (0.10, _bsss),  (0.08, _orps),
+        (0.08, _bgcs),
+    )
 
-    out['HumanConnectionScore'] = (
-        0.18 * out['JockeyConnectionScore']
-        + 0.14 * out['TrainerConnectionScore']
-        + 0.13 * out['TrainerJockeyChemistryScore']
-        + 0.09 * out['JockeyTrainerComboROIScore']
-        + 0.08 * out['ConnectionRecentFormScore']
-        + 0.12 * out['HumanNetworkScore']
-        + 0.10 * out['BreederSerialStrategyScore']
-        + 0.08 * out['OwnerRacePlacementScore']
-        + 0.08 * out['BreederGaikyuCoordinationScore']
-    ).clip(lower=0.0, upper=100.0).astype(float)
+    # 残り列を一括追加
+    _batch2 = {
+        'HumanConnectionReliability': _hcr,
+        'HumanNetworkScore':          _hns,
+        'HumanConnectionScore':       _hcs,
+    }
+    _new_cols2 = {k: v for k, v in _batch2.items() if k not in out.columns}
+    _upd_cols2 = {k: v for k, v in _batch2.items() if k in out.columns}
+    if _new_cols2:
+        out = pd.concat([out, pd.DataFrame(_new_cols2, index=idx)], axis=1)
+    for k, v in _upd_cols2.items():
+        out[k] = v
     return out
 
 
@@ -17599,7 +21286,7 @@ def add_meta_derived_features(
     place = _num_series(out, 'PlaceAxisScore', 50.0, index=idx)
     p_place_pct = _num_series(out, 'p_place_est_pct', np.nan, index=idx)
     blended_place = p_place_pct.where(np.isfinite(p_place_pct), 0.55 * place + 0.45 * win)
-    model_score = (0.46 * win + 0.36 * place + 0.18 * blended_place).clip(lower=0.0, upper=100.0)
+    model_score = _clip0100((0.46 * win + 0.36 * place + 0.18 * blended_place))
     out['ModelScoreForMeta'] = model_score.astype(float)
 
     trainer_key = _first_existing_series(out, [
@@ -17616,37 +21303,37 @@ def add_meta_derived_features(
     cluster_size = cluster_key.map(cluster_key.value_counts()).astype(float)
     trainer_size = trainer_key.map(trainer_key.value_counts()).astype(float)
     cluster_baseline = cluster_mean.where(cluster_size >= 2.0, trainer_mean.where(trainer_size >= 2.0, global_mean))
-    cluster_delta = (model_score - cluster_baseline).clip(lower=-30.0, upper=30.0)
-    out['ClusterMeanDiffScore'] = (50.0 + 1.35 * cluster_delta).clip(lower=0.0, upper=100.0).astype(float)
+    cluster_delta = _clip_series((model_score - cluster_baseline), -30.0, 30.0)
+    out['ClusterMeanDiffScore'] = _clip0100((50.0 + 1.35 * cluster_delta))
 
     explain_inputs = np.column_stack([
-        _num_series(out, 'AbilityBaseScore', 50.0, index=idx).values,
-        _num_series(out, 'RecentFormScore', 50.0, index=idx).values,
-        _num_series(out, 'RaceConditionScore', 50.0, index=idx).values,
-        _num_series(out, 'TrainingAdjustmentScore', 50.0, index=idx).values,
-        _num_series(out, 'HorseConditionScore', 50.0, index=idx).values,
-        _num_series(out, 'HumanNetworkScore', 50.0, index=idx).values,
-        _num_series(out, 'HumanConnectionScore', 50.0, index=idx).values,
-        _num_series(out, 'DistanceSuitScore', 50.0, index=idx).values,
-        _num_series(out, 'PaceFit', 50.0, index=idx).values,
-        _num_series(out, 'ConditionFit', 50.0, index=idx).values,
-        _num_series(out, 'OwnerRacePlacementScore', 50.0, index=idx).values,
-        _num_series(out, 'BreederSerialStrategyScore', 50.0, index=idx).values,
+        _arr(out, 'AbilityBaseScore', 50.0),
+        _arr(out, 'RecentFormScore', 50.0),
+        _arr(out, 'RaceConditionScore', 50.0),
+        _arr(out, 'TrainingAdjustmentScore', 50.0),
+        _arr(out, 'HorseConditionScore', 50.0),
+        _arr(out, 'HumanNetworkScore', 50.0),
+        _arr(out, 'HumanConnectionScore', 50.0),
+        _arr(out, 'DistanceSuitScore', 50.0),
+        _arr(out, 'PaceFit', 50.0),
+        _arr(out, 'ConditionFit', 50.0),
+        _arr(out, 'OwnerRacePlacementScore', 50.0),
+        _arr(out, 'BreederSerialStrategyScore', 50.0),
     ])
     positive = np.clip(explain_inputs - 50.0, 0.0, 50.0)
     topn = min(3, positive.shape[1])
     top_vals = np.sort(positive, axis=1)[:, -topn:]
     explain_topn = top_vals.mean(axis=1)
     explain_spread = top_vals[:, -1] - top_vals[:, 0] if topn > 1 else top_vals[:, 0]
-    out['ExplainableAITopNScore'] = pd.Series((50.0 + 1.10 * explain_topn).clip(0.0, 100.0), index=idx, dtype=float)
-    out['ExplainableAISpreadScore'] = pd.Series((50.0 + 1.00 * explain_spread).clip(0.0, 100.0), index=idx, dtype=float)
+    out['ExplainableAITopNScore'] = pd.Series(_clip0100((50.0 + 1.10 * explain_topn)), index=idx, dtype=float)
+    out['ExplainableAISpreadScore'] = pd.Series(_clip0100((50.0 + 1.00 * explain_spread)), index=idx, dtype=float)
 
     ensemble_inputs = np.column_stack([
         win.values,
         place.values,
-        _num_series(out, 'WPS', 50.0, index=idx).values,
-        _num_series(out, 'HumanConnectionScore', 50.0, index=idx).values,
-        _num_series(out, 'TrainingAdjustmentScore', 50.0, index=idx).values,
+        _arr(out, 'WPS', 50.0),
+        _arr(out, 'HumanConnectionScore', 50.0),
+        _arr(out, 'TrainingAdjustmentScore', 50.0),
     ])
     support = np.clip((ensemble_inputs - 35.0) / 30.0, 0.0, 1.0)
     mean_support = np.clip(support.mean(axis=1), 1e-6, 1.0 - 1e-6)
@@ -17654,28 +21341,28 @@ def add_meta_derived_features(
     spread = np.std(support, axis=1) / 0.5
     diversity = 100.0 * np.clip(0.70 * entropy + 0.30 * spread, 0.0, 1.0)
     consensus = 100.0 - diversity
-    out['EnsembleDiversityScore'] = pd.Series(diversity.clip(0.0, 100.0), index=idx, dtype=float)
-    out['EnsembleConsensusScore'] = pd.Series(consensus.clip(0.0, 100.0), index=idx, dtype=float)
+    out['EnsembleDiversityScore'] = pd.Series(_clip0100(diversity), index=idx, dtype=float)
+    out['EnsembleConsensusScore'] = pd.Series(_clip0100(consensus), index=idx, dtype=float)
 
-    meta_confidence = (
+    meta_confidence = _clip0100((
         0.38 * out['ClusterMeanDiffScore']
         + 0.34 * out['ExplainableAITopNScore']
         + 0.28 * out['EnsembleConsensusScore']
-    ).clip(lower=0.0, upper=100.0)
+    ))
     uncertainty_penalty = np.clip((out['EnsembleDiversityScore'] - 62.0) / 6.0, 0.0, 8.0)
     out['MetaCognitionScore'] = meta_confidence.astype(float)
-    out['WinCandidateScore'] = (0.94 * win + 0.06 * meta_confidence - uncertainty_penalty).clip(lower=0.0, upper=100.0).astype(float)
-    out['PlaceAxisScore'] = (
+    out['WinCandidateScore'] = _clip0100((0.94 * win + 0.06 * meta_confidence - uncertainty_penalty)).astype(float)
+    out['PlaceAxisScore'] = _clip0100((
         0.95 * place
         + 0.05 * (0.60 * out['ClusterMeanDiffScore'] + 0.40 * out['EnsembleConsensusScore'])
         - 0.75 * uncertainty_penalty
-    ).clip(lower=0.0, upper=100.0).astype(float)
+    )).astype(float)
     if 'AnchorScore' in out.columns:
         anchor_base = _num_series(out, 'AnchorScore', np.nan, index=idx)
         anchor_base = anchor_base.where(np.isfinite(anchor_base), place)
-        out['AnchorScore'] = (0.95 * anchor_base + 0.05 * meta_confidence - 0.50 * uncertainty_penalty).clip(lower=0.0, upper=100.0).astype(float)
+        out['AnchorScore'] = _clip0100((0.95 * anchor_base + 0.05 * meta_confidence - 0.50 * uncertainty_penalty)).astype(float)
     if 'WinThroughScore' in out.columns:
-        out['WinThroughScore'] = (0.95 * _num_series(out, 'WinThroughScore', 50.0, index=idx) + 0.05 * meta_confidence).clip(lower=0.0, upper=100.0).astype(float)
+        out['WinThroughScore'] = _clip0100((0.95 * _num_series(out, 'WinThroughScore', 50.0, index=idx) + 0.05 * meta_confidence)).astype(float)
     return out
 
 
@@ -17686,101 +21373,130 @@ def _comp_position_accel(
 ) -> "pd.DataFrame":
     """GoodPositionScore・ReAccelScore・PositionReAccelScore・JockeyDistanceEvidenceScoreをdfに書き込む。"""
     df = add_connection_aggregate_features(df, params)
-    # ── local vars needed for position scores
-    z4 = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
-    pf3 = _num_series(df, 'pred_first3f', np.nan, index=df.index)
-    pl3 = _num_series(df, 'pred_last3f', np.nan, index=df.index)
-    pf3_rank = pf3.rank(method='min', ascending=True)
-    pl3_rank  = pl3.rank(method='min', ascending=True)
+    idx = df.index
+    N = len(df)
+
+    # ── Extract all inputs as numpy arrays (avoids Series arithmetic overhead) ──
+    z4_raw = df.get('zone_4c', pd.Series(['MIDDLE'] * N, index=idx)).astype(str)
+    z4_arr = z4_raw.values  # zone_4c already normalized in compute_scores_v1_1
+
+    pf3_arr = _arr(df, 'pred_first3f', np.nan)
+    pl3_arr = _arr(df, 'pred_last3f', np.nan)
+
+    # Ranks (still need Series for pandas rank)
+    pf3_s = _make_series(pf3_arr, idx)
+    pl3_s = _make_series(pl3_arr, idx)
+    pf3_rank_arr = pf3_s.rank(method='min', ascending=True).values
+
     pace_mode = str((meta or {}).get('pace_eval_mode', '') or '')
     wp = (params.get('win_pattern_rules', {}) or {})
     front_auto_rank  = int(wp.get('pace_front_auto_promote_rank_max', 3) or 3)
     front_auto_bonus = float(wp.get('pace_front_auto_promote_bonus', 4.5) or 4.5)
     front_keep_bonus = float(wp.get('pace_front_keep_wide_bonus', 2.0) or 2.0)
-    front_bias = ((z4 == 'FRONT') & (pf3_rank <= float(front_auto_rank))).astype(float) * front_auto_bonus
+
+    is_front = (z4_arr == 'FRONT')
+    is_front_or_mid = (z4_arr == 'FRONT') | (z4_arr == 'MIDDLE')
+
+    gatefit_arr  = _arr(df, 'GateFit', 50.0)
+    posfit_arr   = _arr(df, 'PosFit', 50.0)
+    condfit_arr  = _arr(df, 'ConditionFit', 50.0)
+
+    # stability: try StabilityComposite first, fallback to SAS
+    if 'StabilityComposite' in df.columns:
+        stability_arr = _arr(df, 'StabilityComposite', 50.0)
+    else:
+        stability_arr = _arr(df, 'SAS', 50.0)
+
+    pacefit_arr  = _arr(df, 'PaceFit', 50.0)
+    comment_trend_arr = _arr(df, 'CommentTrend', 50.0)
+    training_arr = _arr(df, 'TrainingScore', 50.0)
+    distance_arr = _arr(df, 'DistanceSuitScore', 50.0)
+    recent_arr   = _arr(df, 'RecentFormScore', 50.0)
+    conn_arr     = _arr(df, 'HumanConnectionScore', 50.0)
+    conn_rec_arr = _arr(df, 'ConnectionRecentFormScore', 50.0)
+    combo_roi_arr= _arr(df, 'JockeyTrainerComboROIScore', 50.0)
+    network_arr  = _arr(df, 'HumanNetworkScore', 50.0)
+    stable_jk_arr= _arr(df, 'StableJockeyScore', 50.0)
+
+    # front_bias (numpy)
+    front_bias_arr = (is_front & (pf3_rank_arr <= float(front_auto_rank))).astype(float) * front_auto_bonus
     if pace_mode == 'high':
-        front_bias = front_bias * 0.45
+        front_bias_arr *= 0.45
     elif pace_mode == 'high-mid':
-        front_bias = front_bias * 0.75
-    gatefit = _num_series(df, 'GateFit', 50.0)
-    front_bias = front_bias + (((z4 == 'FRONT') & (gatefit >= 58.0)).astype(float) * front_keep_bonus)
-    good_pos_mask = z4.isin(['FRONT', 'MIDDLE'])
-    if pf3.notna().sum() > 1 and float(pf3.max()) != float(pf3.min()):
-        pf3_fast01 = ((float(pf3.max()) - pf3) / (float(pf3.max()) - float(pf3.min()))).clip(lower=0.0, upper=1.0)
+        front_bias_arr *= 0.75
+    front_bias_arr += (is_front & (gatefit_arr >= 58.0)).astype(float) * front_keep_bonus
+
+    # last3f_fast01 (numpy)
+    pl3_valid = pl3_arr[np.isfinite(pl3_arr)]
+    if len(pl3_valid) > 1:
+        pl3_max = pl3_valid.max(); pl3_min = pl3_valid.min()
+        if pl3_max != pl3_min:
+            last3f_fast01_arr = np.clip((pl3_max - pl3_arr) / (pl3_max - pl3_min), 0.0, 1.0)
+        else:
+            last3f_fast01_arr = np.full(N, 0.5)
     else:
-        pf3_fast01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
-    if pl3.notna().sum() > 1 and float(pl3.max()) != float(pl3.min()):
-        last3f_fast01 = ((float(pl3.max()) - pl3) / (float(pl3.max()) - float(pl3.min()))).clip(lower=0.0, upper=1.0)
+        last3f_fast01_arr = np.full(N, 0.5)
+
+    # GoodPositionScore (pure numpy)
+    gps_arr = np.clip(
+        0.38 * posfit_arr
+        + 0.18 * gatefit_arr
+        + 0.12 * condfit_arr
+        + 0.14 * stability_arr
+        + 0.10 * pacefit_arr
+        + 0.08 * is_front_or_mid.astype(float) * 100.0,
+        0.0, 100.0
+    )
+    df['GoodPositionScore'] = _make_series(gps_arr, idx)
+
+    reaccel_gate_arr = (is_front_or_mid & ((pf3_rank_arr <= max(5, int(np.ceil(N * 0.40)))) | (posfit_arr >= 58.0))).astype(float)
+    ras_arr = np.clip(
+        0.34 * gps_arr
+        + 0.28 * last3f_fast01_arr * 100.0
+        + 0.14 * recent_arr
+        + 0.10 * comment_trend_arr
+        + 0.08 * training_arr
+        + 0.06 * distance_arr
+        + reaccel_gate_arr * (4.0 if pace_mode in {'mid', 'high-mid'} else 2.0),
+        0.0, 100.0
+    )
+    df['ReAccelScore'] = _make_series(ras_arr, idx)
+
+    pras_arr = np.clip(0.56 * gps_arr + 0.44 * ras_arr, 0.0, 100.0)
+    df['PositionReAccelScore'] = _make_series(pras_arr, idx)
+
+    # dist_rank_score (numpy via pandas rank)
+    dist_s = _make_series(distance_arr, idx)
+    dist_rank_s = dist_s.rank(method='min', ascending=False)
+    dist_rank_arr = dist_rank_s.values
+    dr_max = dist_rank_arr.max() if len(dist_rank_arr) > 0 else 1.0
+    if dr_max > 1.0:
+        dist_rank_score_arr = np.clip((dr_max - dist_rank_arr) / (dr_max - 1.0) * 100.0, 0.0, 100.0)
     else:
-        last3f_fast01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
-    posfit = _num_series(df, 'PosFit', 50.0)
-    condfit = _num_series(df, 'ConditionFit', 50.0)
-    stability = _num_series(df, ['StabilityComposite', 'SAS'], 50.0)
-    pacefit = _num_series(df, 'PaceFit', 50.0)
-    comment_trend_num = _num_series(df, 'CommentTrend', 50.0)
-    training_num = _num_series(df, 'TrainingScore', 50.0)
-    distance_num = _num_series(df, 'DistanceSuitScore', 50.0)
-    recent_num = _num_series(df, 'RecentFormScore', 50.0)
-    conn_num = _num_series(df, 'HumanConnectionScore', 50.0)
-    conn_recent_num = _num_series(df, 'ConnectionRecentFormScore', 50.0)
-    combo_roi_num = _num_series(df, 'JockeyTrainerComboROIScore', 50.0)
-    network_num = _num_series(df, 'HumanNetworkScore', 50.0)
-    stable_jockey_num = _num_series(df, 'StableJockeyScore', 50.0)
-    df['GoodPositionScore'] = (
-        0.38 * posfit
-        + 0.18 * gatefit
-        + 0.12 * condfit
-        + 0.14 * stability
-        + 0.10 * pacefit
-        + 0.08 * (good_pos_mask.astype(float) * 100.0)
-    ).clip(lower=0.0, upper=100.0).astype(float)
+        dist_rank_score_arr = np.full(N, 50.0)
 
-    reaccel_gate = (good_pos_mask & ((pf3_rank <= max(5, int(np.ceil(len(df) * 0.40)))) | (posfit >= 58.0))).astype(float)
-    df['ReAccelScore'] = (
-        0.34 * df['GoodPositionScore']
-        + 0.28 * (last3f_fast01 * 100.0)
-        + 0.14 * recent_num
-        + 0.10 * comment_trend_num
-        + 0.08 * training_num
-        + 0.06 * distance_num
-        + reaccel_gate * (4.0 if pace_mode in {'mid', 'high-mid'} else 2.0)
-    ).clip(lower=0.0, upper=100.0).astype(float)
-
-    df['PositionReAccelScore'] = (
-        0.56 * df['GoodPositionScore']
-        + 0.44 * df['ReAccelScore']
-    ).clip(lower=0.0, upper=100.0).astype(float)
-
-    dist_rank = distance_num.rank(method='min', ascending=False)
-    if float(dist_rank.max()) > 1.0:
-        dist_rank_score = ((float(dist_rank.max()) - dist_rank) / (float(dist_rank.max()) - 1.0) * 100.0).clip(lower=0.0, upper=100.0)
-    else:
-        dist_rank_score = pd.Series([50.0] * len(df), index=df.index, dtype=float)
-
-    jrank_col = None
+    jockey_rank_score_arr = np.full(N, 50.0)
     for _jc in ['JockeyRank', 'jockey_rank', 'jockeyRank', '騎手順位', '騎手Rank']:
         if _jc in df.columns:
-            jrank_col = _jc
+            jr_arr = _arr(df, _jc, np.nan)
+            jr_valid = jr_arr[np.isfinite(jr_arr)]
+            maxr = float(jr_valid.max()) if len(jr_valid) > 0 else float('nan')
+            if np.isfinite(maxr) and maxr > 1.0:
+                jr_filled = np.where(np.isfinite(jr_arr), jr_arr, maxr)
+                jockey_rank_score_arr = np.clip((maxr - jr_filled) / (maxr - 1.0) * 100.0, 0.0, 100.0)
             break
-    if jrank_col is not None:
-        jr = _num_series(df.get(jrank_col, np.nan), index=df.index)
-        maxr = float(jr.dropna().max()) if jr.notna().sum() > 0 else float('nan')
-        if np.isfinite(maxr) and maxr > 1.0:
-            jockey_rank_score = ((maxr - jr.fillna(maxr)) / (maxr - 1.0) * 100.0).clip(lower=0.0, upper=100.0)
-        else:
-            jockey_rank_score = pd.Series([50.0] * len(df), index=df.index, dtype=float)
-    else:
-        jockey_rank_score = pd.Series([50.0] * len(df), index=df.index, dtype=float)
 
-    df['JockeyDistanceEvidenceScore'] = (
-        0.34 * jockey_rank_score
-        + 0.30 * dist_rank_score
-        + 0.16 * conn_num
-        + 0.08 * combo_roi_num
-        + 0.05 * conn_recent_num
-        + 0.04 * network_num
-        + 0.03 * stable_jockey_num
-    ).clip(lower=0.0, upper=100.0).astype(float)
+    jdes_arr = np.clip(
+        0.34 * jockey_rank_score_arr
+        + 0.30 * dist_rank_score_arr
+        + 0.16 * conn_arr
+        + 0.08 * combo_roi_arr
+        + 0.05 * conn_rec_arr
+        + 0.04 * network_arr
+        + 0.03 * stable_jk_arr,
+        0.0, 100.0
+    )
+    df['JockeyDistanceEvidenceScore'] = _make_series(jdes_arr, idx)
 
     return df
 
@@ -17794,140 +21510,184 @@ def _comp_pace_lap_scores(
 
     R29 fix: _comp_position_accel分割後にローカル変数を再定義。
     """
-    # ── local vars needed for pace/lap scores (R29 fix: re-define after function split)
-    z4 = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
-    pf3 = _num_series(df, 'pred_first3f', np.nan, index=df.index)
-    pl3 = _num_series(df, 'pred_last3f', np.nan, index=df.index)
-    pf3_rank = pf3.rank(method='min', ascending=True)
+    idx = df.index
+    N = len(df)
+
+    # ── Extract all inputs as numpy arrays ──
+    z4_raw = df.get('zone_4c', pd.Series(['MIDDLE'] * N, index=idx)).astype(str)
+    z4_arr = z4_raw.values  # zone_4c already normalized in compute_scores_v1_1
+    is_front = (z4_arr == 'FRONT')
+    is_front_or_mid = is_front | (z4_arr == 'MIDDLE')
+
+    pf3_arr = _arr(df, 'pred_first3f', np.nan)
+    pl3_arr = _arr(df, 'pred_last3f', np.nan)
+    pf3_rank_arr = _make_series(pf3_arr, idx).rank(method='min', ascending=True).values
+
     pace_mode = str((meta or {}).get('pace_eval_mode', '') or '')
     wp = (params.get('win_pattern_rules', {}) or {})
     front_auto_rank  = int(wp.get('pace_front_auto_promote_rank_max', 3) or 3)
     front_auto_bonus = float(wp.get('pace_front_auto_promote_bonus', 4.5) or 4.5)
-    lap_meta = _lap_shape_meta_features(meta)
-    # shared score series
-    gatefit   = _num_series(df, 'GateFit',          50.0)
-    posfit    = _num_series(df, 'PosFit',            50.0)
-    condfit   = _num_series(df, 'ConditionFit',      50.0)
-    stability = _num_series(df, ['StabilityComposite', 'SAS'], 50.0)
-    pacefit   = _num_series(df, 'PaceFit',           50.0)
-    pace_match = _num_series(df, 'PaceMatchScore',     50.0)
-    pace_prof  = _num_series(df, 'PaceProfileAdvantage', 50.0)
-    pace_gap   = _num_series(df, 'PaceMatchDelta',      0.0)
-    if pl3.notna().sum() > 1 and float(pl3.max()) != float(pl3.min()):
-        last3f_fast01 = ((float(pl3.max()) - pl3) / (float(pl3.max()) - float(pl3.min()))).clip(lower=0.0, upper=1.0)
-    else:
-        last3f_fast01 = pd.Series([0.5] * len(df), index=df.index, dtype=float)
-    # front_bias: re-compute (mirrors _comp_position_accel logic)
     front_keep_bonus = float(wp.get('pace_front_keep_wide_bonus', 2.0) or 2.0)
-    front_bias = ((z4 == 'FRONT') & (pf3_rank <= float(front_auto_rank))).astype(float) * front_auto_bonus
+    lap_meta = _lap_shape_meta_features(meta)
+
+    gatefit_arr  = _arr(df, 'GateFit', 50.0)
+    posfit_arr   = _arr(df, 'PosFit', 50.0)
+    condfit_arr  = _arr(df, 'ConditionFit', 50.0)
+    if 'StabilityComposite' in df.columns:
+        stability_arr = _arr(df, 'StabilityComposite', 50.0)
+    else:
+        stability_arr = _arr(df, 'SAS', 50.0)
+    pacefit_arr  = _arr(df, 'PaceFit', 50.0)
+    pace_match_arr = _arr(df, 'PaceMatchScore', 50.0)
+    pace_prof_arr  = _arr(df, 'PaceProfileAdvantage', 50.0)
+    pace_gap_arr   = _arr(df, 'PaceMatchDelta', 0.0)
+
+    # last3f_fast01
+    pl3_valid = pl3_arr[np.isfinite(pl3_arr)]
+    if len(pl3_valid) > 1:
+        pl3_max = pl3_valid.max(); pl3_min = pl3_valid.min()
+        if pl3_max != pl3_min:
+            last3f_f01 = np.clip((pl3_max - pl3_arr) / (pl3_max - pl3_min), 0.0, 1.0)
+        else:
+            last3f_f01 = np.full(N, 0.5)
+    else:
+        last3f_f01 = np.full(N, 0.5)
+
+    # front_bias
+    front_bias_arr = (is_front & (pf3_rank_arr <= float(front_auto_rank))).astype(float) * front_auto_bonus
     if pace_mode == 'high':
-        front_bias = front_bias * 0.45
+        front_bias_arr *= 0.45
     elif pace_mode == 'high-mid':
-        front_bias = front_bias * 0.75
-    front_bias = front_bias + (((z4 == 'FRONT') & (gatefit >= 58.0)).astype(float) * front_keep_bonus)
-    # R29 fix: additional shared series (previously leaked from _comp_position_accel scope)
-    good_pos_mask    = z4.isin(['FRONT', 'MIDDLE'])
-    distance_num     = _num_series(df, 'DistanceSuitScore',   50.0)
-    recent_num       = _num_series(df, 'RecentFormScore',     50.0)
-    comment_trend_num = _num_series(df, 'CommentTrend',       50.0)
-    training_num     = _num_series(df, 'TrainingScore',       50.0)
-    conn_num         = _num_series(df, 'HumanConnectionScore', 50.0)
-    conn_recent_num  = _num_series(df, 'ConnectionRecentFormScore', 50.0)
-    network_num      = _num_series(df, 'HumanNetworkScore', 50.0)
-    breeder_owner_num = _num_series(df, 'BreederOwnerAffinityScore', 50.0)
-    pace_transition_num = _num_series(df, 'PaceTransitionScore', 50.0)
-    pace_rebound_num = _num_series(df, 'PaceReboundSignal', 50.0)
-    course_shape_num = _num_series(df, 'CourseShapeFit', 50.0)
-    favorite_num     = _num_series(df, 'FavoriteScore',       50.0)
-    anchor_base_num  = _num_series(df, ['AnchorScore', 'SAS'], 50.0)
-    win_num          = _num_series(df, 'WinCandidateScore',   50.0)
+        front_bias_arr *= 0.75
+    front_bias_arr += (is_front & (gatefit_arr >= 58.0)).astype(float) * front_keep_bonus
 
-    df['PaceScenarioAdvantage'] = (
-        0.20 * pacefit
-        + 0.15 * pace_match
-        + 0.10 * pace_prof
-        + 0.13 * posfit
-        + 0.10 * gatefit
-        + 0.08 * condfit
-        + 0.08 * stability
-        + 0.10 * df['PositionReAccelScore']
-        + 0.05 * (last3f_fast01 * 100.0)
-        + 0.04 * conn_num
-        + 0.04 * conn_recent_num
-        + 0.03 * network_num
-        + 0.03 * breeder_owner_num
-        + 0.03 * pace_transition_num
-        + 0.02 * pace_rebound_num
-        + 0.02 * course_shape_num
-        + front_bias
-        - 0.35 * _num_series(df, 'FrontCollapseRisk', 0.0)
-        - 0.24 * pace_gap
-    ).clip(lower=0.0, upper=100.0).astype(float)
+    distance_arr     = _arr(df, 'DistanceSuitScore', 50.0)
+    recent_arr       = _arr(df, 'RecentFormScore', 50.0)
+    comment_trend_arr = _arr(df, 'CommentTrend', 50.0)
+    training_arr     = _arr(df, 'TrainingScore', 50.0)
+    conn_arr         = _arr(df, 'HumanConnectionScore', 50.0)
+    conn_rec_arr     = _arr(df, 'ConnectionRecentFormScore', 50.0)
+    network_arr      = _arr(df, 'HumanNetworkScore', 50.0)
+    breeder_own_arr  = _arr(df, 'BreederOwnerAffinityScore', 50.0)
+    pace_trans_arr   = _arr(df, 'PaceTransitionScore', 50.0)
+    pace_reb_arr     = _arr(df, 'PaceReboundSignal', 50.0)
+    course_shape_arr = _arr(df, 'CourseShapeFit', 50.0)
+    favorite_arr     = _arr(df, 'FavoriteScore', 50.0)
+    if 'AnchorScore' in df.columns:
+        anchor_base_arr = _arr(df, 'AnchorScore', 50.0)
+    else:
+        anchor_base_arr = _arr(df, 'SAS', 50.0)
+    win_arr          = _arr(df, 'WinCandidateScore', 50.0)
+    fcr_arr          = _arr(df, 'FrontCollapseRisk', 0.0)
 
-    pop_proxy = pd.Series(np.nan, index=df.index, dtype=float)
+    # Grab already-computed columns
+    pos_reaccel_arr  = df['PositionReAccelScore'].values if 'PositionReAccelScore' in df.columns else np.full(N, 50.0)
+    gps_arr          = df['GoodPositionScore'].values if 'GoodPositionScore' in df.columns else np.full(N, 50.0)
+    jdes_arr         = df['JockeyDistanceEvidenceScore'].values if 'JockeyDistanceEvidenceScore' in df.columns else np.full(N, 50.0)
+
+    # PaceScenarioAdvantage (pure numpy)
+    psa_arr = np.clip(
+        0.20 * pacefit_arr
+        + 0.15 * pace_match_arr
+        + 0.10 * pace_prof_arr
+        + 0.13 * posfit_arr
+        + 0.10 * gatefit_arr
+        + 0.08 * condfit_arr
+        + 0.08 * stability_arr
+        + 0.10 * pos_reaccel_arr
+        + 0.05 * last3f_f01 * 100.0
+        + 0.04 * conn_arr
+        + 0.04 * conn_rec_arr
+        + 0.03 * network_arr
+        + 0.03 * breeder_own_arr
+        + 0.03 * pace_trans_arr
+        + 0.02 * pace_reb_arr
+        + 0.02 * course_shape_arr
+        + front_bias_arr
+        - 0.35 * fcr_arr
+        - 0.24 * pace_gap_arr,
+        0.0, 100.0
+    )
+    df['PaceScenarioAdvantage'] = _make_series(psa_arr, idx)
+
+    # pop_proxy_score
+    pop_proxy_arr = np.full(N, np.nan)
     for _pc in ['popularity', '人気', 'odds_rank', 'OddsRank']:
         if _pc in df.columns:
-            pop_proxy = _num_series(df.get(_pc, np.nan), index=df.index)
+            pop_proxy_arr = _arr(df, _pc, np.nan)
             break
-    if pop_proxy.notna().sum() > 0:
-        maxp = float(pop_proxy.dropna().max()) if pop_proxy.notna().sum() else float('nan')
+    pop_finite = np.isfinite(pop_proxy_arr)
+    if pop_finite.any():
+        maxp = pop_proxy_arr[pop_finite].max()
         if np.isfinite(maxp) and maxp > 1.0:
-            pop_proxy_score = ((maxp - pop_proxy.fillna(maxp)) / (maxp - 1.0) * 100.0).clip(lower=0.0, upper=100.0)
+            filled = np.where(pop_finite, pop_proxy_arr, maxp)
+            pop_proxy_score_arr = np.clip((maxp - filled) / (maxp - 1.0) * 100.0, 0.0, 100.0)
         else:
-            pop_proxy_score = pd.Series([50.0] * len(df), index=df.index, dtype=float)
+            pop_proxy_score_arr = np.full(N, 50.0)
     else:
-        pop_proxy_score = _num_series(df.get('p_win_field', favorite_num), favorite_num, index=df.index, lower=0.0, upper=100.0)
+        pwf_arr = _arr(df, 'p_win_field', np.nan)
+        pop_proxy_score_arr = np.where(np.isfinite(pwf_arr), np.clip(pwf_arr, 0.0, 100.0), favorite_arr)
 
     lap_closing_bias = float(lap_meta.get('closing_bias', 0.0) or 0.0)
     lap_goodpos_bias = float(lap_meta.get('goodpos_bias', 0.0) or 0.0)
-    df['LapSuitScore'] = (
-        0.30 * df['PaceScenarioAdvantage']
-        + 0.18 * df['PositionReAccelScore']
-        + 0.12 * pace_match
-        + 0.08 * pace_prof
-        + 0.14 * (last3f_fast01 * 100.0)
-        + 0.10 * distance_num
-        + 0.06 * recent_num
-        + 0.05 * pace_transition_num
-        + 0.04 * pace_rebound_num
-        + 0.04 * course_shape_num
-        + good_pos_mask.astype(float) * max(0.0, lap_goodpos_bias) * 0.80
-        + (~good_pos_mask).astype(float) * max(0.0, lap_closing_bias) * 0.70
-    ).clip(lower=0.0, upper=100.0).astype(float)
+    not_front_or_mid = ~is_front_or_mid
 
-    df['PopularityPositionLapScore'] = (
-        0.24 * pop_proxy_score
-        + 0.40 * df['GoodPositionScore']
-        + 0.36 * df['LapSuitScore']
-        + ((df['PositionReAccelScore'] >= 60.0).astype(float) * 2.4)
-    ).clip(lower=0.0, upper=100.0).astype(float)
-
-    second_col_signal = (
-        ((training_num >= 58.0) | (comment_trend_num >= 56.0)).astype(float) * 3.2
-        + ((df['JockeyDistanceEvidenceScore'] >= 60.0).astype(float) * 2.0)
-        + ((df['PositionReAccelScore'] >= 60.0).astype(float) * 2.4)
+    lap_arr = np.clip(
+        0.30 * psa_arr
+        + 0.18 * pos_reaccel_arr
+        + 0.12 * pace_match_arr
+        + 0.08 * pace_prof_arr
+        + 0.14 * last3f_f01 * 100.0
+        + 0.10 * distance_arr
+        + 0.06 * recent_arr
+        + 0.05 * pace_trans_arr
+        + 0.04 * pace_reb_arr
+        + 0.04 * course_shape_arr
+        + is_front_or_mid.astype(float) * max(0.0, lap_goodpos_bias) * 0.80
+        + not_front_or_mid.astype(float) * max(0.0, lap_closing_bias) * 0.70,
+        0.0, 100.0
     )
-    df['GoodPositionSecondColumnScore'] = (
-        0.32 * df['PositionReAccelScore']
-        + 0.22 * df['PopularityPositionLapScore']
-        + 0.18 * df['JockeyDistanceEvidenceScore']
-        + 0.08 * conn_num
-        + 0.08 * training_num
-        + 0.06 * comment_trend_num
-        + 0.06 * anchor_base_num
-        + second_col_signal
-    ).clip(lower=0.0, upper=100.0).astype(float)
+    df['LapSuitScore'] = _make_series(lap_arr, idx)
 
-    df['CloseScenarioScore'] = (
-        0.16 * (last3f_fast01 * 100.0)
-        + 0.20 * df['PaceScenarioAdvantage']
-        + 0.16 * win_num
-        + 0.12 * distance_num
-        + 0.08 * recent_num
-        + 0.20 * _num_series(df, 'PositionReAccelScore', 50.0)
-        + 0.08 * conn_recent_num
-        + max(0.0, lap_closing_bias) * (~good_pos_mask).astype(float) * 0.70
-    ).clip(lower=0.0, upper=100.0).astype(float)
+    ppls_arr = np.clip(
+        0.24 * pop_proxy_score_arr
+        + 0.40 * gps_arr
+        + 0.36 * lap_arr
+        + (pos_reaccel_arr >= 60.0).astype(float) * 2.4,
+        0.0, 100.0
+    )
+    df['PopularityPositionLapScore'] = _make_series(ppls_arr, idx)
+
+    second_col_signal_arr = (
+        ((training_arr >= 58.0) | (comment_trend_arr >= 56.0)).astype(float) * 3.2
+        + (jdes_arr >= 60.0).astype(float) * 2.0
+        + (pos_reaccel_arr >= 60.0).astype(float) * 2.4
+    )
+    gpscs_arr = np.clip(
+        0.32 * pos_reaccel_arr
+        + 0.22 * ppls_arr
+        + 0.18 * jdes_arr
+        + 0.08 * conn_arr
+        + 0.08 * training_arr
+        + 0.06 * comment_trend_arr
+        + 0.06 * anchor_base_arr
+        + second_col_signal_arr,
+        0.0, 100.0
+    )
+    df['GoodPositionSecondColumnScore'] = _make_series(gpscs_arr, idx)
+
+    css_arr = np.clip(
+        0.16 * last3f_f01 * 100.0
+        + 0.20 * psa_arr
+        + 0.16 * win_arr
+        + 0.12 * distance_arr
+        + 0.08 * recent_arr
+        + 0.20 * pos_reaccel_arr
+        + 0.08 * conn_rec_arr
+        + max(0.0, lap_closing_bias) * not_front_or_mid.astype(float) * 0.70,
+        0.0, 100.0
+    )
+    df['CloseScenarioScore'] = _make_series(css_arr, idx)
 
     return df
 
@@ -17940,108 +21700,140 @@ def _comp_axis_final(
     """AxisReadinessScore・WinAxisScore・PlaceAxisCoreScore・FinalMarkScoreをdfに書き込む。
 
     R29 fix: 分割後にローカル変数を再定義。
+    NumPy fast-path: すべての重み付き和をndarray演算で実行し、Series構築回数を最小化。
     """
-    # ── local vars needed for axis/final scores (R29 fix: re-define after function split)
-    z4 = df.get('zone_4c', pd.Series(['MIDDLE'] * len(df), index=df.index)).astype(str).apply(normalize_zone_token)
-    pf3 = _num_series(df, 'pred_first3f', np.nan, index=df.index)
-    pf3_rank = pf3.rank(method='min', ascending=True)
+    idx = df.index
+    N = len(df)
+    # ── Extract all inputs as numpy arrays (avoids Series arithmetic overhead) ──
+    z4_raw = df.get('zone_4c', pd.Series(['MIDDLE'] * N, index=idx)).astype(str)
+    z4_arr = z4_raw.values  # zone_4c already normalized in compute_scores_v1_1
+    pf3_arr = _arr(df, 'pred_first3f', np.nan)
+    pf3_rank_arr = _make_series(pf3_arr, idx).rank(method='min', ascending=True).values
     wp = (params.get('win_pattern_rules', {}) or {})
     front_auto_rank  = int(wp.get('pace_front_auto_promote_rank_max', 3) or 3)
-    training_num     = _num_series(df, 'TrainingScore',      50.0)
-    posfit           = _num_series(df, 'PosFit',             50.0)
-    gatefit          = _num_series(df, 'GateFit',            50.0)
-    stability        = _num_series(df, ['StabilityComposite', 'SAS'], 50.0)
-    distance_num     = _num_series(df, 'DistanceSuitScore',  50.0)
-    favorite_num     = _num_series(df, 'FavoriteScore',      50.0)
-    anchor_base_num  = _num_series(df, ['AnchorScore', 'SAS'], 50.0)
-    win_num          = _num_series(df, 'WinCandidateScore',  50.0)
-    ability_num       = _num_series(df, 'Ability',            50.0)
-    comment_trend_num = _num_series(df, 'CommentTrend',       50.0)
-    recent_num        = _num_series(df, 'RecentFormScore',    50.0)
-    conn_num          = _num_series(df, 'HumanConnectionScore', 50.0)
-    conn_recent_num   = _num_series(df, 'ConnectionRecentFormScore', 50.0)
-    network_num       = _num_series(df, 'HumanNetworkScore', 50.0)
-    owner_class_num   = _num_series(df, 'OwnerClassPriorityScore', 50.0)
-    breeder_owner_num = _num_series(df, 'BreederOwnerAffinityScore', 50.0)
-    pace_mode         = str((meta or {}).get('pace_eval_mode', '') or '')
-    course_fit_delta = _num_series(df, 'CourseProfileFit', 50.0) - 50.0
-    course_straight_delta = _num_series(df, 'CourseStraightFit', 50.0) - 50.0
-    course_corner_delta = _num_series(df, 'CourseCornerFit', 50.0) - 50.0
-    course_stamina_delta = _num_series(df, 'CourseStaminaFit', 50.0) - 50.0
-    df['AxisReadinessScore'] = (
-        0.24 * _num_series(df, 'PlaceAxisScore', 50.0)
-        + 0.18 * df['PaceScenarioAdvantage']
-        + 0.18 * df['PositionReAccelScore']
-        + 0.12 * posfit
-        + 0.10 * stability
-        + 0.08 * gatefit
-        + 0.08 * df['JockeyDistanceEvidenceScore']
-        + 0.05 * conn_num
-        + 0.03 * conn_recent_num
-        + 0.05 * network_num
-        + 0.03 * owner_class_num
-        + 0.02 * breeder_owner_num
+    pace_mode        = str((meta or {}).get('pace_eval_mode', '') or '')
+
+    training_arr     = _arr(df, 'TrainingScore', 50.0)
+    posfit_arr       = _arr(df, 'PosFit', 50.0)
+    gatefit_arr      = _arr(df, 'GateFit', 50.0)
+    stability_arr    = _arr(df, 'StabilityComposite', 50.0) if 'StabilityComposite' in df.columns else _arr(df, 'SAS', 50.0)
+    distance_arr     = _arr(df, 'DistanceSuitScore', 50.0)
+    favorite_arr     = _arr(df, 'FavoriteScore', 50.0)
+    ability_arr      = _arr(df, 'Ability', 50.0)
+    comment_trend_arr = _arr(df, 'CommentTrend', 50.0)
+    conn_arr         = _arr(df, 'HumanConnectionScore', 50.0)
+    conn_recent_arr  = _arr(df, 'ConnectionRecentFormScore', 50.0)
+    network_arr      = _arr(df, 'HumanNetworkScore', 50.0)
+    owner_class_arr  = _arr(df, 'OwnerClassPriorityScore', 50.0)
+    breeder_owner_arr = _arr(df, 'BreederOwnerAffinityScore', 50.0)
+    place_axis_arr   = _arr(df, 'PlaceAxisScore', 50.0)
+    win_cand_arr     = _arr(df, 'WinCandidateScore', 50.0)
+    race_cond_arr    = _arr(df, 'RaceConditionScore', 50.0)
+    sas_arr          = _arr(df, 'SAS', 50.0)
+    dev_wait_arr     = _arr(df, 'DevelopmentWaitRisk', 0.0)
+    start_risk_arr   = _arr(df, 'StartRiskShort', 0.0)
+    front_coll_arr   = _arr(df, 'FrontCollapseRisk', 0.0)
+    course_fit_delta = _arr(df, 'CourseProfileFit', 50.0) - 50.0
+    course_straight_delta = _arr(df, 'CourseStraightFit', 50.0) - 50.0
+    course_corner_delta = _arr(df, 'CourseCornerFit', 50.0) - 50.0
+    course_stamina_delta = _arr(df, 'CourseStaminaFit', 50.0) - 50.0
+    psa_arr          = df['PaceScenarioAdvantage'].values if 'PaceScenarioAdvantage' in df.columns else np.full(N, 50.0)
+    pos_ra_arr       = df['PositionReAccelScore'].values if 'PositionReAccelScore' in df.columns else np.full(N, 50.0)
+    jdes_arr         = df['JockeyDistanceEvidenceScore'].values if 'JockeyDistanceEvidenceScore' in df.columns else np.full(N, 50.0)
+    gpsc_arr         = df['GoodPositionSecondColumnScore'].values if 'GoodPositionSecondColumnScore' in df.columns else np.full(N, 50.0)
+    ppls_arr         = df['PopularityPositionLapScore'].values if 'PopularityPositionLapScore' in df.columns else np.full(N, 50.0)
+
+    # AxisReadinessScore (pure numpy)
+    ars_arr = np.clip(
+        0.24 * place_axis_arr
+        + 0.18 * psa_arr
+        + 0.18 * pos_ra_arr
+        + 0.12 * posfit_arr
+        + 0.10 * stability_arr
+        + 0.08 * gatefit_arr
+        + 0.08 * jdes_arr
+        + 0.05 * conn_arr
+        + 0.03 * conn_recent_arr
+        + 0.05 * network_arr
+        + 0.03 * owner_class_arr
+        + 0.02 * breeder_owner_arr
         + 0.10 * course_fit_delta
         + 0.05 * course_corner_delta
-        - 0.70 * _num_series(df, 'DevelopmentWaitRisk', 0.0)
-        - 0.45 * _num_series(df, 'StartRiskShort', 0.0)
-    ).clip(lower=0.0, upper=100.0).astype(float)
+        - 0.70 * dev_wait_arr
+        - 0.45 * start_risk_arr,
+        0.0, 100.0
+    )
+    df['AxisReadinessScore'] = _make_series(ars_arr, idx)
 
-    df['WinAxisScore'] = (
-        0.34 * ability_num
-        + 0.18 * _num_series(df, 'RaceConditionScore', 50.0)
-        + 0.20 * df['PositionReAccelScore']
-        + 0.12 * df['PaceScenarioAdvantage']
-        + 0.08 * posfit
-        + 0.08 * df['JockeyDistanceEvidenceScore']
-        + 0.06 * conn_num
-        + 0.04 * conn_recent_num
+    # WinAxisScore (pure numpy)
+    was_arr = np.clip(
+        0.34 * ability_arr
+        + 0.18 * race_cond_arr
+        + 0.20 * pos_ra_arr
+        + 0.12 * psa_arr
+        + 0.08 * posfit_arr
+        + 0.08 * jdes_arr
+        + 0.06 * conn_arr
+        + 0.04 * conn_recent_arr
         + 0.08 * course_fit_delta
         + 0.06 * course_straight_delta
-        - 0.65 * _num_series(df, 'DevelopmentWaitRisk', 0.0)
-        - 0.35 * _num_series(df, 'FrontCollapseRisk', 0.0)
-    ).clip(lower=0.0, upper=100.0).astype(float)
+        - 0.65 * dev_wait_arr
+        - 0.35 * front_coll_arr,
+        0.0, 100.0
+    )
+    df['WinAxisScore'] = _make_series(was_arr, idx)
 
-    df['PlaceAxisCoreScore'] = (
-        0.26 * _num_series(df, 'SAS', 50.0)
-        + 0.18 * df['PaceScenarioAdvantage']
-        + 0.18 * df['PositionReAccelScore']
-        + 0.12 * stability
-        + 0.10 * posfit
-        + 0.08 * distance_num
-        + 0.08 * df['JockeyDistanceEvidenceScore']
-        + 0.06 * conn_num
-        + 0.04 * conn_recent_num
+    # PlaceAxisCoreScore (pure numpy)
+    pacs_arr = np.clip(
+        0.26 * sas_arr
+        + 0.18 * psa_arr
+        + 0.18 * pos_ra_arr
+        + 0.12 * stability_arr
+        + 0.10 * posfit_arr
+        + 0.08 * distance_arr
+        + 0.08 * jdes_arr
+        + 0.06 * conn_arr
+        + 0.04 * conn_recent_arr
         + 0.10 * course_fit_delta
         + 0.06 * course_stamina_delta
-        - 0.45 * _num_series(df, 'DevelopmentWaitRisk', 0.0)
-    ).clip(lower=0.0, upper=100.0).astype(float)
+        - 0.45 * dev_wait_arr,
+        0.0, 100.0
+    )
+    df['PlaceAxisCoreScore'] = _make_series(pacs_arr, idx)
 
-    df['WinCandidateScore'] = (0.58 * _num_series(df, 'WinCandidateScore', 50.0) + 0.42 * df['WinAxisScore']).clip(lower=0.0, upper=100.0).astype(float)
-    df['PlaceAxisScore'] = (0.62 * _num_series(df, 'PlaceAxisScore', 50.0) + 0.38 * df['PlaceAxisCoreScore']).clip(lower=0.0, upper=100.0).astype(float)
+    # WinCandidateScore & PlaceAxisScore update (pure numpy)
+    win_cand_final = np.clip(0.58 * win_cand_arr + 0.42 * was_arr, 0.0, 100.0)
+    df['WinCandidateScore'] = _make_series(win_cand_final, idx)
+    place_axis_final = np.clip(0.62 * place_axis_arr + 0.38 * pacs_arr, 0.0, 100.0)
+    df['PlaceAxisScore'] = _make_series(place_axis_final, idx)
 
-    _mark_base = (
-        0.42 * df['WinCandidateScore']
-        + 0.16 * favorite_num
-        + 0.16 * df['PlaceAxisScore']
-        + 0.12 * df['PositionReAccelScore']
-        + 0.08 * df['PopularityPositionLapScore']
-        + 0.06 * df['PaceScenarioAdvantage']
+    # FinalMarkScore (pure numpy)
+    mark_base_arr = (
+        0.42 * win_cand_final
+        + 0.16 * favorite_arr
+        + 0.16 * place_axis_final
+        + 0.12 * pos_ra_arr
+        + 0.08 * ppls_arr
+        + 0.06 * psa_arr
         + 0.05 * course_fit_delta
-    ).astype(float)
-    _pace_rank = _num_series(df, 'PaceScenarioAdvantage', 0.0).rank(method='min', ascending=False)
-    _mark_rank = _mark_base.rank(method='min', ascending=False)
-    _promote = ((_pace_rank <= 5.0) & (_mark_rank >= 7.0)).astype(float) * 4.0
-    _promote = _promote + (((df['GoodPositionSecondColumnScore'] >= 62.0) & ((training_num >= 58.0) | (comment_trend_num >= 56.0))).astype(float) * 2.4)
-    _promote = _promote + (((z4 == 'FRONT') & (pf3_rank <= float(front_auto_rank)) & (_pace_rank <= 5.0)).astype(float) * 1.5)
+    )
+    # ranks (need pandas for rank; use fast _make_series + .values)
+    _pace_rank_arr = _make_series(psa_arr, idx).rank(method='min', ascending=False).values
+    _mark_rank_arr = _make_series(mark_base_arr, idx).rank(method='min', ascending=False).values
+    _promote_arr = ((_pace_rank_arr <= 5.0) & (_mark_rank_arr >= 7.0)).astype(float) * 4.0
+    _promote_arr += ((gpsc_arr >= 62.0) & ((training_arr >= 58.0) | (comment_trend_arr >= 56.0))).astype(float) * 2.4
+    _promote_arr += ((z4_arr == 'FRONT') & (pf3_rank_arr <= float(front_auto_rank)) & (_pace_rank_arr <= 5.0)).astype(float) * 1.5
     if pace_mode == 'high':
-        _promote = _promote * 0.65
-    df['PacePromotionBonus'] = _num_series(_promote, 0.0, index=df.index)
-    df['FinalMarkScore'] = (_mark_base + df['PacePromotionBonus']).clip(lower=0.0, upper=100.0).astype(float)
+        _promote_arr *= 0.65
+    df['PacePromotionBonus'] = _make_series(_promote_arr, idx)
+    df['FinalMarkScore'] = _make_series(np.clip(mark_base_arr + _promote_arr, 0.0, 100.0), idx)
 
     try:
+        _training_s = _make_series(training_arr, idx)
+        _comment_s  = _make_series(comment_trend_arr, idx)
+        _jdes_s     = _make_series(jdes_arr, idx)
         promoted_second = df.sort_values(['GoodPositionSecondColumnScore', 'PopularityPositionLapScore', 'num'], ascending=[False, False, True])
-        promoted_second = promoted_second.loc[((training_num >= 58.0) | (comment_trend_num >= 56.0) | (df['JockeyDistanceEvidenceScore'] >= 60.0)), 'num'].astype(str).tolist()[:4]
+        promoted_second = promoted_second.loc[((_training_s >= 58.0) | (_comment_s >= 56.0) | (_jdes_s >= 60.0)), 'num'].astype(str).tolist()[:4]
         meta['trio_race_type_mode'] = 'closing' if pace_mode in {'high', 'high-mid'} else 'good-position'
         meta['position_second_column_nums'] = ','.join(promoted_second)
         meta['pace_human_check'] = str((meta or {}).get('pace_human_check', '') or '')
@@ -18203,7 +21995,7 @@ def _csp_apply_pace_h_front_penalty(
         penalty[is_front & prev_front] += style_pen
         penalty[rsc_high] += extra_pen   # R27: HIGH確定の先行馬に追加減点
         df['AnchorScorePaceHPenalty'] = penalty
-        df['AnchorScore'] = (df['AnchorScore'] - penalty).clip(lower=0.0, upper=100.0)
+        df['AnchorScore'] = _clip0100((df['AnchorScore'] - penalty))
     except Exception:
         df['AnchorScorePaceHPenalty'] = 0.0
     return df
@@ -18275,7 +22067,7 @@ def _csp_apply_pace_h_rear_bonus(
 
         # AnchorScore に REAR + MIDDLE ボーナスを加算
         total_bonus = rear_bonus + mid_bonus
-        df['AnchorScore'] = (df['AnchorScore'] + total_bonus).clip(lower=0.0, upper=100.0).astype(float)
+        df['AnchorScore'] = _clip0100((df['AnchorScore'] + total_bonus)).astype(float)
     except Exception:
         df['AnchorScoreRearBonus'] = 0.0
         df['AnchorScoreMiddleGRBBonus'] = 0.0
@@ -18290,8 +22082,8 @@ def _csp_compute_win_place_probs(
     """AnchorScore・複勝/勝ち確率・タイトレース判定を df に書き込んで返す。(R21: _csv_compute_signal_probs から分離)"""
     # R32: フラグメント解消 -- 内部で複数列を追加するためコピーで連続化
     df = df.copy()  # noqa: PD901
-    df['WinCandidateScore'] = _num_series(df, 'WinCandidateScore', 50.0).clip(lower=0.0, upper=100.0).astype(float)
-    df['PlaceAxisScore'] = _num_series(df, 'PlaceAxisScore', 50.0).clip(lower=0.0, upper=100.0).astype(float)
+    df['WinCandidateScore'] = _clip0100(_num_series(df, 'WinCandidateScore', 50.0)).astype(float)
+    df['PlaceAxisScore'] = _clip0100(_num_series(df, 'PlaceAxisScore', 50.0)).astype(float)
     course_fit_delta = _num_series(df.get('CourseProfileFit', 50.0), 50.0, index=df.index) - 50.0
     course_stamina_delta = _num_series(df.get('CourseStaminaFit', 50.0), 50.0, index=df.index) - 50.0
     course_distance_specific_delta = _num_series(df.get('CourseDistanceSpecificFit', 50.0), 50.0, index=df.index) - 50.0
@@ -18299,19 +22091,22 @@ def _csp_compute_win_place_probs(
     course_rail_delta = _num_series(df.get('CourseRailBiasFit', 50.0), 50.0, index=df.index) - 50.0
     course_class_pace_delta = _num_series(df.get('CourseClassPaceFit', 50.0), 50.0, index=df.index) - 50.0
     course_tokyo1400_delta = _num_series(df.get('CourseTokyo1400Fit', 50.0), 50.0, index=df.index) - 50.0
-    df['AnchorScore'] = (
-        0.62 * df['PlaceAxisScore']
-        + 0.20 * _num_series(df.get('AxisReadinessScore', df['PlaceAxisScore']), df['PlaceAxisScore'], index=df.index)
-        + 0.10 * _num_series(df.get('PaceScenarioAdvantage', 50.0), 50.0, index=df.index)
-        + 0.08 * _num_series(df.get('StabilityComposite', df.get('SAS', 50.0)), 50.0, index=df.index)
-        + 0.10 * course_fit_delta
-        + 0.04 * course_stamina_delta
-        + 0.06 * course_distance_specific_delta
-        + 0.06 * course_special_delta
-        + 0.04 * course_class_pace_delta
-        + 0.03 * course_rail_delta
-        + 0.03 * course_tokyo1400_delta
-    ).clip(lower=0.0, upper=100.0).astype(float)
+    _csp_idx = df.index
+    _pas_arr = _arr(df, 'PlaceAxisScore', 50.0)
+    _ars_col = 'AxisReadinessScore' if 'AxisReadinessScore' in df.columns else 'PlaceAxisScore'
+    _ars_arr = _arr(df, _ars_col, 50.0)
+    _psa_arr = _arr(df, 'PaceScenarioAdvantage', 50.0)
+    _stab_arr = _arr(df, 'StabilityComposite', 50.0) if 'StabilityComposite' in df.columns else _arr(df, 'SAS', 50.0)
+    _cfd_arr = course_fit_delta.values; _csd_arr = course_stamina_delta.values
+    _cdsd_arr = course_distance_specific_delta.values; _cspd_arr = course_special_delta.values
+    _cpcd_arr = course_class_pace_delta.values; _crbd_arr = course_rail_delta.values
+    _ct14_arr = course_tokyo1400_delta.values
+    df['AnchorScore'] = _make_series(np.clip(
+        0.62 * _pas_arr + 0.20 * _ars_arr + 0.10 * _psa_arr + 0.08 * _stab_arr
+        + 0.10 * _cfd_arr + 0.04 * _csd_arr + 0.06 * _cdsd_arr + 0.06 * _cspd_arr
+        + 0.04 * _cpcd_arr + 0.03 * _crbd_arr + 0.03 * _ct14_arr,
+        0.0, 100.0
+    ), _csp_idx)
 
     # R26: ペースH時の先行馬 AnchorScore ペナルティ
     df = _csp_apply_pace_h_front_penalty(df, meta, params)
@@ -18334,15 +22129,15 @@ def _csp_compute_win_place_probs(
     distance_specific_place_weight = float(pr.get('distance_specific_place_weight', 0.10) or 0.10)
     course_special_place_weight = float(pr.get('course_special_place_weight', 0.08) or 0.08)
     tokyo1400_place_weight = float(pr.get('tokyo1400_place_weight', 0.08) or 0.08)
-    place_adj = (
-        course_place_weight * course_fit_delta
-        + pace_class_place_weight * course_class_pace_delta
-        + rail_bias_place_weight * course_rail_delta
-        + distance_specific_place_weight * course_distance_specific_delta
-        + course_special_place_weight * course_special_delta
-        + tokyo1400_place_weight * course_tokyo1400_delta
+    place_adj_arr = (
+        course_place_weight * _cfd_arr
+        + pace_class_place_weight * _cpcd_arr
+        + rail_bias_place_weight * _crbd_arr
+        + distance_specific_place_weight * _cdsd_arr
+        + course_special_place_weight * _cspd_arr
+        + tokyo1400_place_weight * _ct14_arr
     ) / 100.0
-    df["p_place_model"] = (df["p_place_model"] + place_adj).clip(lower=0.05, upper=0.72)
+    df["p_place_model"] = _make_series(np.clip(df["p_place_model"].values + place_adj_arr, 0.05, 0.72), _csp_idx)
 
     # --- Place probability (PURE_DATA) ---
     df["p_place_mkt"] = np.nan
@@ -18352,7 +22147,7 @@ def _csp_compute_win_place_probs(
                 df[_col] = np.nan if _col.startswith('p_') else 0.0
             except Exception:
                 pass
-    df["p_place_est"] = _num_series(df["p_place_model"], index=df.index).clip(lower=0.0, upper=1.0)
+    df["p_place_est"] = _clip_series(_num_series(df["p_place_model"], index=df.index), 0.0, 1.0)
     df["p_place_est_pct"] = (df["p_place_est"] * 100.0).astype(float)
 
     # --- Win probability field ---
@@ -18465,11 +22260,27 @@ def compute_scores_v1_1(entries: pd.DataFrame, meta: Dict[str, str], params: Opt
 
     params = params or DEFAULT_PARAMS
 
+    # ── 高速化: meta由来の重い計算を事前キャッシュ ──────────────────
+    # _is_wet_track / _track_context / _meta_distance_surface は
+    # 同一metaに対して複数の下位関数から繰り返し呼ばれるため、
+    # meta['_cached_wet'], meta['_cached_ctx'] に結果を格納して使い回す
+    if '_cached_wet' not in meta:
+        try:
+            meta = dict(meta)  # コピーして書き込み可能に
+            meta['_cached_wet'] = _is_wet_track(meta)
+            meta['_cached_ctx'] = _track_context(meta)
+            _d, _s = _meta_distance_surface(meta)
+            meta['_cached_dist'] = _d
+            meta['_cached_surface'] = _s
+            meta['_cached_is_tok'] = _is_tokyo_turf_1400(meta)
+        except Exception:
+            pass
+
     # MARKET_FEATURES_OFF_SCORE_V2: 市場市場由来特徴は予想に使わない（表示のみ可）
     try:
-        market_enabled = bool(params.get('market_features_enabled', False))
+        _ = bool(params.get('market_features_enabled', False))
     except Exception:
-        market_enabled = False
+        _ = False
 
     # R24: class_up_point 列が存在する場合は数値に正規化（entries.copy() 後の df に適用）
     # R29 fix: fillna(0.0) を削除。NaN は NaN のまま保持し valid_mask 方式で後段処理する。
@@ -18482,8 +22293,14 @@ def compute_scores_v1_1(entries: pd.DataFrame, meta: Dict[str, str], params: Opt
         if c not in df.columns:
             df[c] = ""
 
-    df["zone_3c"] = df["zone_3c"].apply(normalize_zone_token)
-    df["zone_4c"] = df["zone_4c"].apply(normalize_zone_token)
+    # normalize_zone_token は lru_cache 済み。pandas .map のオーバーヘッドを避け
+    # 一意値のみ変換してから numpy vectorize で高速展開する
+    _z3_raw = df["zone_3c"].values
+    _z4_raw = df["zone_4c"].values
+    _z3_uniq = {v: normalize_zone_token(str(v)) for v in set(_z3_raw.tolist())}
+    _z4_uniq = {v: normalize_zone_token(str(v)) for v in set(_z4_raw.tolist())}
+    df["zone_3c"] = np.array([_z3_uniq[v] for v in _z3_raw])
+    df["zone_4c"] = np.array([_z4_uniq[v] for v in _z4_raw])
 
     rating_num = _num_series(df, 'rating', np.nan, index=df.index)
     speed_num  = _num_series(df, 'speed_max', np.nan, index=df.index)
@@ -18764,10 +22581,9 @@ def _anchor_apply_risk_guard(d, best: dict, params: dict) -> dict:
             d['_risk'] = _num_series(d[risk_col], 0.0, index=d.index)
             penalty_scale = float(wr.get('anchor_comment_risk_penalty_scale', 0.005) or 0.005)
             penalty_max   = float(wr.get('anchor_comment_risk_penalty_max_pct', 3.0) or 3.0)
-            d['_p_low_adj'] = (
-                _num_series(d.get('p_place_low_pct', np.nan), 0.0, index=d.index)
-                - (d['_risk'] * penalty_scale * 100).clip(upper=penalty_max)
-            ).clip(lower=0.0)
+            _risk_pen = np.clip(d['_risk'].values * penalty_scale * 100, None, penalty_max)
+            _p_low_raw = _num_series(d.get('p_place_low_pct', np.nan), 0.0, index=d.index).values
+            d['_p_low_adj'] = np.clip(_p_low_raw - _risk_pen, 0.0, None)
             d = d.sort_values(['_p_low_adj', 'p_place_est_pct', 'AnchorScore', 'num'],
                               ascending=[False, False, False, True])
             if len(d):
@@ -18978,7 +22794,7 @@ def select_place_anchor_bestp(df: pd.DataFrame, place_rule: Optional[dict] = Non
     d = df.copy()
     d['p_place_est_pct'] = _num_series(d.get('p_place_est_pct', np.nan), index=d.index)
     try:
-        d['p_place_est_pct'] = d['p_place_est_pct'].clip(lower=0.0, upper=100.0)
+        d['p_place_est_pct'] = _clip0100(d['p_place_est_pct'])
     except Exception:
         pass
     m = d['p_place_est_pct'].notna() & np.isfinite(d['p_place_est_pct']) & (d['p_place_est_pct'] >= (min_p_place * 100.0))
@@ -19224,14 +23040,10 @@ def _add_trap_score_columns(dfin: pd.DataFrame) -> pd.DataFrame:
     """trap_score (float) と trap_reasons (str) 列を追加して返す。"""
     try:
         d = dfin.copy()
-        sc = []
-        rs = []
-        for _, r in d.iterrows():
-            s0, r0 = _compute_trap_score_row(r.to_dict())
-            sc.append(s0)
-            rs.append(r0)
-        d['trap_score'] = sc
-        d['trap_reasons'] = rs
+        # ── ベクトル化: iterrows → apply ─────────────────────────
+        _results = d.apply(lambda r: _compute_trap_score_row(r.to_dict()), axis=1)
+        d['trap_score'] = [v[0] for v in _results]
+        d['trap_reasons'] = [v[1] for v in _results]
         return d
     except Exception:
         d = dfin.copy()
@@ -20830,9 +24642,9 @@ def _sworm_precision_tune(
         try:
             l3 = _num_series(pool.get('pred_last3f', np.nan), index=pool.index)
             if l3.notna().sum() > 1 and float(l3.max()) != float(l3.min()):
-                l3_fast01 = (
+                l3_fast01 = _clip_series((
                     (float(l3.max()) - l3) / (float(l3.max()) - float(l3.min()))
-                ).clip(lower=0.0, upper=1.0)
+                ), 0.0, 1.0)
             else:
                 l3_fast01 = pd.Series([0.0] * len(pool), index=pool.index)
             pool['pick_last3f01'] = _num_series(l3_fast01, 0.0, index=pool.index)
@@ -20858,15 +24670,17 @@ def _sworm_precision_tune(
         try:
             cfv = _num_series(pool.get('CommentFit',  np.nan), index=pool.index)
             crv = _num_series(pool.get('CommentRisk', np.nan), index=pool.index)
+            _cfv_arr = cfv.values; _cfv_min = float(np.nanmin(_cfv_arr)); _cfv_max = float(np.nanmax(_cfv_arr))
             cf01 = (
-                ((cfv - float(cfv.min())) / (float(cfv.max()) - float(cfv.min()))).clip(0.0, 1.0)
-                if (cfv.notna().sum() > 1 and float(cfv.max()) != float(cfv.min()))
-                else pd.Series([0.0] * len(pool), index=pool.index)
+                np.clip((_cfv_arr - _cfv_min) / (_cfv_max - _cfv_min), 0.0, 1.0)
+                if (cfv.notna().sum() > 1 and _cfv_max != _cfv_min)
+                else np.zeros(len(pool))
             )
+            _crv_arr = crv.values; _crv_min = float(np.nanmin(_crv_arr)); _crv_max = float(np.nanmax(_crv_arr))
             cr01 = (
-                ((crv - float(crv.min())) / (float(crv.max()) - float(crv.min()))).clip(0.0, 1.0)
-                if (crv.notna().sum() > 1 and float(crv.max()) != float(crv.min()))
-                else pd.Series([0.0] * len(pool), index=pool.index)
+                np.clip((_crv_arr - _crv_min) / (_crv_max - _crv_min), 0.0, 1.0)
+                if (crv.notna().sum() > 1 and _crv_max != _crv_min)
+                else np.zeros(len(pool))
             )
             pool['pick_comment01']      = _num_series(cf01, 0.0, index=pool.index)
             pool['pick_comment_risk01'] = _num_series(cr01, 0.0, index=pool.index)
@@ -20901,10 +24715,11 @@ def _sworm_dual_score_support(
         _tight_mode = False
     try:
         pwin = _num_series(pool.get('p_win_field', np.nan), index=pool.index)
+        _pwin_arr = pwin.values; _pwin_min = float(np.nanmin(_pwin_arr)); _pwin_max = float(np.nanmax(_pwin_arr))
         pwin01 = (
-            ((pwin - float(pwin.min())) / (float(pwin.max()) - float(pwin.min()))).clip(0.0, 1.0)
-            if (pwin.notna().sum() > 1 and float(pwin.max()) != float(pwin.min()))
-            else pd.Series([0.0] * len(pool), index=pool.index)
+            np.clip((_pwin_arr - _pwin_min) / (_pwin_max - _pwin_min), 0.0, 1.0)
+            if (pwin.notna().sum() > 1 and _pwin_max != _pwin_min)
+            else np.zeros(len(pool))
         )
         pool['pick_pwin01'] = _num_series(pwin01, 0.0, index=pool.index)
         pool['pick_score_base'] = (
@@ -21021,14 +24836,14 @@ def _sworm_pace_adjust(
             _front_fast_pen = float(rules.get('high_pace_front_fast_penalty', 0.03) or 0.03)
             _middle_bonus = float(rules.get('high_pace_middle_bonus', 0.04) or 0.04)
             _rear_bonus = float(rules.get('high_pace_rear_bonus', 0.02) or 0.02)
-            zn = pool.get('zone_4c', 'MIDDLE').apply(normalize_zone_token)
+            zn = pool.get('zone_4c', 'MIDDLE').map(normalize_zone_token)
             adj = pd.Series([0.0]*len(pool), index=pool.index, dtype=float)
             adj.loc[zn == 'FRONT'] -= _front_pen
             adj.loc[zn == 'MIDDLE'] += _middle_bonus
             adj.loc[zn == 'REAR'] += _rear_bonus
             pf = _num_series(pool.get('pred_first3f', np.nan), index=pool.index)
             if pf.notna().sum() > 1 and float(pf.max()) != float(pf.min()):
-                pf01 = ((float(pf.max()) - pf) / (float(pf.max()) - float(pf.min()))).clip(lower=0.0, upper=1.0)
+                pf01 = _clip_series(((float(pf.max()) - pf) / (float(pf.max()) - float(pf.min()))), 0.0, 1.0)
                 adj.loc[zn == 'FRONT'] -= (_front_fast_pen * pf01.loc[zn == 'FRONT']).astype(float)
             pool['pick_score_base'] = (pool['pick_score_base'] + adj).astype(float)
         except Exception:
@@ -21067,7 +24882,7 @@ def _sworm_pace_adjust(
 
     if _sp_rear_enabled and pace_key == 'S':
         try:
-            zn = pool.get('zone_4c', 'MIDDLE').apply(normalize_zone_token)
+            zn = pool.get('zone_4c', 'MIDDLE').map(normalize_zone_token)
             rear_mask = zn.isin(['REAR', 'MIDDLE'])
 
             # speed_max: numeric preferred
@@ -21100,7 +24915,7 @@ def _sworm_pace_adjust(
                 sh01 = pd.Series([0.0]*len(pool), index=pool.index)
 
             # Combine (clamped), then apply only to REAR/MIDDLE
-            perf01 = (0.7*sm01.fillna(0.0) + 0.3*sh01.fillna(0.0)).clip(lower=0.0, upper=1.0)
+            perf01 = _clip_series((0.7*sm01.fillna(0.0) + 0.3*sh01.fillna(0.0)), 0.0, 1.0)
             pool.loc[rear_mask, 'pick_score_base'] = (pool.loc[rear_mask, 'pick_score_base'] + _sp_bonus*perf01.loc[rear_mask]).astype(float)
         except Exception:
             pass
@@ -21111,7 +24926,7 @@ def _sworm_pace_adjust(
         _wsm = rules.get('wide_scoring_matrix', {})
         if _wsm_enabled and pace_key in _wsm:
             _pace_weights = dict(_wsm[pace_key] or {})
-            zn2 = pool.get('zone_4c', pd.Series(['MIDDLE'] * len(pool), index=pool.index)).apply(normalize_zone_token)
+            zn2 = pool.get('zone_4c', pd.Series(['MIDDLE'] * len(pool), index=pool.index)).map(normalize_zone_token)
             adj2 = zn2.map(lambda z: float(_pace_weights.get(z, 0.0))).fillna(0.0)
             pool['pick_score_base'] = (pool['pick_score_base'] + adj2).astype(float)
             pool['pick_pace_matrix_bonus'] = adj2
@@ -21789,9 +25604,9 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
 
     if "zone_3c" in df.columns:
-        df["zone_3c"] = df["zone_3c"].apply(normalize_zone_token)
+        df["zone_3c"] = df["zone_3c"].map(normalize_zone_token)
     if "zone_4c" in df.columns:
-        df["zone_4c"] = df["zone_4c"].apply(normalize_zone_token)
+        df["zone_4c"] = df["zone_4c"].map(normalize_zone_token)
 
     return df
 
@@ -21815,8 +25630,8 @@ def _bam_init_params(params, place_model_bundle, pair_model_bundle, meta) -> dic
     pace = str((meta or {}).get('pace', 'M') or 'M')
     if pace.upper().strip() not in ['H','M','S']:
         pace = 'M'
-    bias = (meta or {}).get('bias', 'Unknown')
-    map_summary = (meta or {}).get('map_summary', 'Unknown')
+    _ = (meta or {}).get('_bias', 'Unknown')
+    _ = (meta or {}).get('_map_summary', 'Unknown')
 
     out = ''
     out += '# STELLA v1.18 RULES-ONLY (LITE) + PLACE-ISO (AUTOFEATURE) 予想\n\n'
@@ -21873,8 +25688,22 @@ def _bam_section_header(meta: dict, race: str, pace: str, bias: str, map_summary
         out += f'- race: {race}\n'
     out += f'- pace: {pace}\n- bias: {bias}\n- map_summary: {map_summary}\n\n'
 
-
-
+    # ---- 重賞バッジ表示 ----
+    try:
+        _gr_hdr = _detect_graded_race(meta)
+        if _gr_hdr is not None:
+            _gr_grade = str(_gr_hdr.get('grade', ''))
+            _gr_name  = str(_gr_hdr.get('_matched_name', ''))
+            _gr_venue = str(_gr_hdr.get('venue', ''))
+            _gr_surf  = '芝' if _gr_hdr.get('surface') == 'turf' else 'ダート'
+            _gr_dist  = int(_gr_hdr.get('distance', 0) or 0)
+            _gr_pace  = str(_gr_hdr.get('pace_tendency', 'M'))
+            _pace_jp  = {'H': 'ハイ', 'MH': 'ミドルハイ', 'M': 'ミドル', 'ML': 'ミドルロー', 'S': 'スロー'}.get(_gr_pace, _gr_pace)
+            _gr_draw  = str(_gr_hdr.get('draw_tendency', 'neutral'))
+            _draw_jp  = {'inner': '内枠有利', 'outer': '外枠有利', 'neutral': '枠不問'}.get(_gr_draw, _gr_draw)
+            out += f'> **🏆 {_gr_grade}: {_gr_name}** | {_gr_venue} {_gr_surf} {_gr_dist}m | ペース傾向: {_pace_jp} | {_draw_jp}\n\n'
+    except Exception:
+        pass
 
     # -------------------------
     # 調教（keibabook）サマリ：全体時計+終い（表示は監査用）
@@ -21983,14 +25812,14 @@ def _bam_section_anchor_place(df, params: dict) -> dict:
     """
     out = ''
     anchor = select_anchor(df, params=params)
-    score_col = str(params.get('anchor_score_col', 'AnchorScore'))
-    score_mode = str(params.get('anchor_score_mode', 'mul'))
+    _ = str(params.get('anchor_score_col', 'AnchorScore'))
+    _ = str(params.get('anchor_score_mode', 'mul'))
 
     # --- place rules ---
     place_rule = params.get('place_rules', {}) or {}
     stake_place = int(place_rule.get('stake_place', 1000) or 1000)
     min_p_place = float(place_rule.get('min_p_place_est', 0.26) or 0.26)
-    min_place_market = 0.0  # PURE_DATA: market gate removed
+    _ = 0.0  # PURE_DATA: market gate removed
 
     p_place_pct = float(anchor.get('p_place_est_pct', float('nan')))
     # strict: clamp for display and gating
@@ -22121,7 +25950,8 @@ def _bam_section_anchor_place(df, params: dict) -> dict:
 
 def _bam_prepare_wide(df, params: dict, anchor: dict,
                       pair_model_bundle, wide_market_df,
-                      analysis_cache, p_place: float) -> dict:
+                      analysis_cache, p_place: float,
+                      meta: dict = None) -> dict:
     """ワイド相手候補確率を計算し、ルールモード選択と表示候補を返す。
 
     Returns:
@@ -22433,18 +26263,10 @@ def _bam_fp_apply_sprint_penalty(dI, sprint_mode: bool, pen_per_kg: float) -> No
         try:
             dI['_pwide_low_raw']  = dI['_pwide_low_pct']
             dI['_pwide_mean_raw'] = dI['_pwide_mean_pct']
-            dI['_pwide_low_pct']  = (
-                dI['_pwide_low_pct']
-                - dI['num'].astype(str).map(
-                    lambda n: _bam_fp_weight_penalty_pct(dI, n, sprint_mode, pen_per_kg)
-                ).astype(float)
-            ).clip(lower=0.0)
-            dI['_pwide_mean_pct'] = (
-                dI['_pwide_mean_pct']
-                - dI['num'].astype(str).map(
-                    lambda n: _bam_fp_weight_penalty_pct(dI, n, sprint_mode, pen_per_kg)
-                ).astype(float)
-            ).clip(lower=0.0)
+            _pen_low  = dI['num'].astype(str).map(lambda n: _bam_fp_weight_penalty_pct(dI, n, sprint_mode, pen_per_kg)).astype(float).values
+            _pen_mean = dI['num'].astype(str).map(lambda n: _bam_fp_weight_penalty_pct(dI, n, sprint_mode, pen_per_kg)).astype(float).values
+            dI['_pwide_low_pct']  = np.clip(dI['_pwide_low_pct'].values  - _pen_low,  0.0, None)
+            dI['_pwide_mean_pct'] = np.clip(dI['_pwide_mean_pct'].values - _pen_mean, 0.0, None)
         except Exception:
             pass
     return dI
@@ -22574,7 +26396,7 @@ def _bam_fp_speed(dI, A: list, d0, wr_ft: dict, anchor_num: str,
     speed_removed = ''
     if force_speed:
         try:
-            import numpy as np
+            # import numpy as np
             if 'speed' in d0.columns:
                 _tmp = d0[['num', 'speed']].copy()
                 _tmp['speed'] = _num_series(_tmp['speed'], index=_tmp.index)
@@ -22870,6 +26692,12 @@ def _bam_build_ab_candidates(
     wr_ft: dict,
     tilt: float,
     opps_display,
+    meta: dict = None,
+    d0=None,
+    pace_union_enabled: bool = True,
+    topk: int = 8,
+    p_mean_pct=None,
+    p_low_pct=None,
 ) -> tuple:
     """ワイド相手 A (4頭) / 三連複 3列目 B (10頭) / extras を選出する。
 
@@ -22883,10 +26711,26 @@ def _bam_build_ab_candidates(
         wr_ft: wide_rules サブ辞書。
         tilt: ペース傾き係数。
         opps_display: ワイド表示候補 DataFrame（fallback 用）。
+        meta: レースメタ情報辞書。
+        d0: 全馬 DataFrame（アンカー含む）。
+        pace_union_enabled: ペースユニオン有効フラグ。
+        topk: ユニオン上位k頭。
+        p_mean_pct: ワイド平均確率 Series。
+        p_low_pct: ワイド下限確率 Series。
 
     Returns:
         (A, B, extras, fixed_info) タプル。
     """
+    # import numpy as np
+    import pandas as pd
+    if meta is None:
+        meta = {}
+    if d0 is None:
+        d0 = dI  # fallback: アンカー含む全馬DFがなければdIで代用
+    if p_mean_pct is None:
+        p_mean_pct = pd.Series([float('nan')] * len(dI), index=dI.index)
+    if p_low_pct is None:
+        p_low_pct = pd.Series([float('nan')] * len(dI), index=dI.index)
     fixed_info: dict = {}
     A: list = []
     B: list = []
@@ -23076,7 +26920,7 @@ def _bsa_score_table(d0, meta: dict, params: dict) -> str:
 
 def _bsa_next_race(d0, params: dict) -> str:
     """次走推奨馬（先物注目）セクションを Markdown 文字列で返す。"""
-    import numpy as np
+    # import numpy as np
     out = '## 次走推奨馬（先物注目）\n'
     try:
         if 'comment_tags' in d0.columns:
@@ -23102,12 +26946,17 @@ def _bsa_next_race(d0, params: dict) -> str:
 def _bam_section_analysis(d0, meta: dict, anchor_num: str, params: dict) -> str:
     """調教×コメント要点・最終結論（印）・スコア表を Markdown 文字列で返す。
 
-    4つのサブセクション (_bsa_*) を呼び出すオーケストレータ。
+    4つのサブセクション (_bsa_*) + 重賞特化分析セクションを呼び出すオーケストレータ。
     """
     out = ''
     out += _bsa_training_table(d0)
     out += _bsa_final_verdict(d0, anchor_num, params)
     out += _bsa_score_table(d0, meta, params)
+    # ---- 重賞特化分析セクション（重賞レース検出時のみ出力）----
+    try:
+        out += _bam_section_graded_race_analysis(d0, meta, anchor_num, params)
+    except Exception:
+        pass
     out += _bsa_next_race(d0, params)
     return out
 
@@ -23115,8 +26964,16 @@ def _bam_section_analysis(d0, meta: dict, anchor_num: str, params: dict) -> str:
 def _bam_section_betting_plan(
     d0, anchor_num: str, A: list, B: list,
     params: dict, dI, meta: dict, df,
+    fixed_info: dict = None,
+    opps=None,
+    opps_display=None,
+    anchor: dict = None,
 ) -> str:
     """買い目・三連複フォーメーション・データ使用状況を Markdown 文字列で返す。"""
+    if fixed_info is None:
+        fixed_info = {}
+    if anchor is None:
+        anchor = {}
     out = ''
     # -------------------------
     # 買い目（複勝＋ワイド）※固定テンプレ（画像準拠）
@@ -23328,6 +27185,11 @@ def _bam_fixed_template(
     tilt = _bam_apply_senkyo_chui_tilt(tilt, meta, wr_ft)
     A, B, extras, fixed_info = _bam_build_ab_candidates(
         dI, anchor_num, params, wr_ft, tilt, opps_display,
+        meta=meta, d0=d0,
+        pace_union_enabled=pace_union_enabled,
+        topk=topk,
+        p_mean_pct=opps_display.get('p_wide_est_pct', None) if (opps_display is not None and hasattr(opps_display, 'get')) else None,
+        p_low_pct=opps_display.get('p_wide_low_pct', None) if (opps_display is not None and hasattr(opps_display, 'get')) else None,
     )
     if len(A) < 4 or len(B) < 10:
         try:
@@ -23341,13 +27203,19 @@ def _bam_fixed_template(
             pass
     A = A[:4]
     B = B[:10]
-    extras = [x for x in B if x not in A][:6]
+    _ = [x for x in B if x not in A][:6]
 
     # 30点固定（B=10, A=4 を想定）
-    points = 30
+    _ = 30
     # ---- セクション出力 ----
     out += _bam_section_analysis(d0, meta, anchor_num, params)
-    out += _bam_section_betting_plan(d0, anchor_num, A, B, params, dI, meta, df)
+    out += _bam_section_betting_plan(
+        d0, anchor_num, A, B, params, dI, meta, df,
+        fixed_info=fixed_info,
+        opps=None,
+        opps_display=opps_display,
+        anchor=anchor,
+    )
     return out
 
 def _bfw_alloc_units_by_weights(weights: list, base_units: int) -> "List[int]":
@@ -23387,7 +27255,7 @@ def _bfw_alloc_units_low_market_heavy(opps_head: "pd.DataFrame", base_units: int
         mid = _num_series(opps_head.get('wide_market', np.nan), index=opps_head.index)
     mid      = mid.astype(float).replace([np.inf, -np.inf], np.nan)
     fillv    = float(mid.mean()) if mid.notna().sum() else 10.0
-    mid_filled = mid.fillna(fillv).clip(lower=1e-6, upper=1e6)
+    mid_filled = pd.Series(np.clip(np.where(np.isfinite(mid.values), mid.values, fillv), 1e-6, 1e6), index=mid.index)
     weights  = (1.0 / mid_filled.values).tolist()
     s        = float(np.sum(weights)) if len(weights) else 0.0
     if (not np.isfinite(s)) or s <= 0:
@@ -23599,7 +27467,7 @@ def _bft_sample_trio(df, te: dict, analysis_cache: dict) -> object:
 
     キャッシュヒット時はキャッシュから返す。
     """
-    import numpy as np
+    # import numpy as np
     base_samples = int(te.get('n_samples', 20000) or 20000)
     n_runs = int(te.get('n_runs', 3) or 3)
     seed   = int(te.get('seed', 0) or 0)
@@ -23614,7 +27482,7 @@ def _bft_sample_trio(df, te: dict, analysis_cache: dict) -> object:
         return trio_df
     # SPEED_OPT_TRIO_SAMPLE_ONCE_V1: sample once (n_runs*base_samples)
     try:
-        from itertools import combinations
+        # from itertools import combinations
         trio_df = _estimate_trio_probabilities(
             df, n_samples=n_runs * base_samples, top_mass=top_mass,
             seed=seed, mode=mode, z_ci=z_ci
@@ -23626,12 +27494,12 @@ def _bft_sample_trio(df, te: dict, analysis_cache: dict) -> object:
 
 def _bft_build_formation(trio_df, df, opps_display, params: dict, anchor: dict) -> str:
     """三連複フォーメーション買い目 Markdown セクションを返す。"""
-    import numpy as np
+    # import numpy as np
     out = ''
     try:
         wr = (params.get('wide_rules') or {})
-        trio_formation_max_points = int(wr.get('trio_formation_max_points', 30) or 30)
-        trio_budget = float(wr.get('trio_formation_budget_yen', 3000) or 3000)
+        _ = int(wr.get('_trio_formation_max_points', 30) or 30)
+        _ = float(wr.get('trio_formation_budget_yen', 3000) or 3000)
         anchor_num  = str(anchor.get('num', ''))
 
         if trio_df is None or not hasattr(trio_df, 'columns') or len(trio_df) < 3:
@@ -23656,7 +27524,7 @@ def _bft_build_formation(trio_df, df, opps_display, params: dict, anchor: dict) 
 
         # ABSOLUTE: trio TOP 30 only
         out += '## 三連複フォーメーション（参考）\n'
-        out += f'上位30組（確率計算）\n\n'
+        out += '上位30組（確率計算）\n\n'
         try:
             wide_nums = []
             if opps_display is not None and hasattr(opps_display, '__iter__'):
@@ -23691,7 +27559,7 @@ def _bft_checklist(df, anchor: dict, params: dict, rule_info: dict) -> str:
     import numpy as np
     out = '\n## ✅ 試運転後チェック（絶対厳守 / report.md）\n'
     try:
-        wr = (params.get('wide_rules') or {})
+        _ = (params.get('wide_rules') or {})
         anchor_num = str(anchor.get('num', ''))
 
         # 1) ◎ p_place_est display
@@ -23840,12 +27708,13 @@ def build_audit_markdown(
 
     # ---- ワイド相手候補 ----
     wp = _bam_prepare_wide(df, params, anchor, pair_model_bundle,
-                           wide_market_df, analysis_cache, p_place)
+                           wide_market_df, analysis_cache, p_place,
+                           meta=meta)
     opps         = wp['opps']
     opps_display = wp['opps_display']
     rule_info    = wp['rule_info']
     wr           = wp['wr']
-    _thr_skip    = wp['_thr_skip']
+    _ = wp['_thr_skip']
     anchor_num   = str(anchor.get('num', ''))
 
     # ---- 固定テンプレ（主経路） ----
@@ -24451,7 +28320,7 @@ def backtest_pnl_from_row(row: dict) -> dict:
     for (a, b) in wide_pairs:
         pair = {a, b}
         if pair.issubset(result3):
-            key = f'payout_wide_{min(a,b,key=lambda x:int(x) if x.isdigit() else 99)}'
+            _ = f'payout_wide_{min(a,b,_key=lambda x:int(x) if x.isdigit() else 99)}'
             # payout_wide_12/13/23 のいずれかを参照
             w12 = float(row.get('payout_wide_12', 0.0) or 0.0)
             w13 = float(row.get('payout_wide_13', 0.0) or 0.0)
@@ -24614,7 +28483,7 @@ def _main_score_and_anchor(args, entries: "pd.DataFrame", meta: dict, params: di
             p_cal = predict_place_probs(place_model_bundle, Xp)
             scored['p_place_est'] = p_cal
             scored['p_place_est'] = _num_series(scored['p_place_est'], index=scored.index)
-            scored['p_place_est'] = scored['p_place_est'].clip(lower=0.0, upper=1.0)
+            scored['p_place_est'] = _clip_series(scored['p_place_est'], 0.0, 1.0)
             scored['p_place_est_pct'] = (scored['p_place_est'] * 100.0).astype(float)
 
             pr = params.get('place_rules', {}) or {}
@@ -24632,6 +28501,21 @@ def _main_score_and_anchor(args, entries: "pd.DataFrame", meta: dict, params: di
                 pass
 
     scored = add_meta_derived_features(scored, meta, params)
+
+    # ---- 重賞特化スコア補正（重賞検出時のみ適用）----
+    try:
+        scored = compute_graded_race_bonus(scored, meta, params)
+        _gr = _detect_graded_race(meta)
+        if _gr is not None:
+            import sys as _sys_gr
+            print(f"[重賞] {_gr.get('grade','')} {_gr.get('_matched_name','')} 検出 → 脚質/適性バイアス補正適用", file=_sys_gr.stderr)
+    except Exception as _e_gr:
+        try:
+            import sys as _sys_gr2
+            print(f'[WARN] graded_race_bonus failed: {_e_gr}', file=_sys_gr2.stderr)
+        except Exception:
+            pass
+
     anchor = select_anchor(scored, params=params)
     anchor_num = str(anchor.get('num', '')).strip()
 
@@ -24805,7 +28689,7 @@ def main() -> None:
                 print(f'[R41] result saved -> {_r39_result_path}')
                 # R57: Markdownも同ディレクトリに自動保存
                 try:
-                    import shutil as _shutil
+                    # import shutil as _shutil
                     _r57_report_dir = Path(str(args.result_dir)) / 'reports'
                     _r57_report_dir.mkdir(parents=True, exist_ok=True)
                     _r57_safe_id = str(
