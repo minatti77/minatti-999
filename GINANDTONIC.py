@@ -869,6 +869,26 @@ DEFAULT_PARAMS = {
         'MIDDLE': {'FRONT': 1.02, 'MIDDLE': 1.00, 'REAR': 0.99},
         'REAR':   {'FRONT': 1.01, 'MIDDLE': 0.99, 'REAR': 0.97},
     },
+
+    # ===== 重賞特化パラメータ (graded_race_params) =====
+    # JRA_GRADED_RACES_DATA で検出された重賞レース時のみ適用される追加補正パラメータ。
+    # enabled=False で全無効化（一般レースと同じ挙動に戻す）。
+    'graded_race_params': {
+        'enabled': True,
+        # 脚質バイアス補正スケール: style_bias × このスケールを AnchorScore に加算
+        # 例: style_bias['REAR']=0.78 × 3.0 = +2.34点
+        'style_bias_scale': 3.0,
+        # スタミナ適性補正スケール: StaminaScore の偏差 × (stamina_index-0.5) × スケール
+        'stamina_scale': 2.5,
+        # スピード適性補正スケール
+        'speed_scale': 2.0,
+        # key_factors 補正スケール（各キーファクターのスコア偏差に乗算）
+        'key_factor_scale': 1.5,
+        # AnchorScore ボーナスの上限（1馬あたり最大加点）
+        'bonus_cap': 6.0,
+        # AnchorScore ペナルティの上限（1馬あたり最大減点）
+        'penalty_cap': 4.0,
+    },
 }
 
 
@@ -12051,6 +12071,1454 @@ STYLE_FAMILY_TRIO_PRIORS = {
 }
 
 
+# =============================================================================
+# JRA 全重賞データ辞書（JRA_GRADED_RACES_DATA）
+# =============================================================================
+# キー構造:
+#   race_name (str): 正式レース名（表記ゆれに対応するエイリアスは aliases リスト）
+#   grade (str): 'G1' / 'G2' / 'G3'
+#   venue (str): 競馬場名（JRA_COURSE_PROFILE_DATA のキーと一致）
+#   surface (str): 'turf' / 'dirt'
+#   distance (int): 距離（m）
+#   month (list[int]): 通常施行月
+#   style_bias (dict): 脚質傾向補正 {'FRONT': float, 'MIDDLE': float, 'REAR': float}
+#                      正=有利, 負=不利（絶対値0.5程度が目安の最大）
+#   pace_tendency (str): 'H' / 'MH' / 'M' / 'ML' / 'S' - レース固有ペース傾向
+#   pace_adj (float): AnchorScore へのペース予測信頼度加点（0.0 = 補正なし）
+#   ability_weight (float): 能力重視度（1.0=標準, >1.0=能力重視, <1.0=適性重視）
+#   stamina_index (float): スタミナ要求度（0.0-1.0, 高いほど長距離適性が重要）
+#   speed_index (float): 瞬発力要求度（0.0-1.0）
+#   notes (str): 重賞固有の特記事項・傾向コメント
+#   aliases (list[str]): レース名の表記ゆれリスト（OCR誤認対策）
+#   anchor_score_bonus (float): 重賞検出時に◎のAnchorScoreへ加算するボーナス（0=なし）
+#   rival_penalty (float): ライバル馬（2位以下）へのペナルティ（0=なし）
+#   class_jump_penalty (float): 格上げ初戦馬へのペナルティ
+#   repeat_winner_bonus (float): リピーターへのボーナス（同コース・同条件実績）
+# =============================================================================
+JRA_GRADED_RACES_DATA: Dict[str, Dict] = {
+    # ============================================================
+    # G1 レース（芝）
+    # ============================================================
+    '有馬記念': {
+        'grade': 'G1', 'venue': '中山', 'surface': 'turf', 'distance': 2500,
+        'month': [12],
+        'style_bias': {'FRONT': 0.12, 'MIDDLE': 0.28, 'REAR': 0.06},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.15, 'stamina_index': 0.82, 'speed_index': 0.55,
+        'notes': '内枠有利・先行有利・スタミナ必須。2・3コーナーのロングスパート戦になりやすく先行力が問われる。フルゲート16頭でも内枠先行馬が粘ることが多い。',
+        'aliases': ['有馬', 'ありまきねん', 'グランプリ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 2.0,
+        'key_factors': ['stamina', 'corner', 'power'],
+        'draw_tendency': 'inner',  # 内枠有利
+    },
+    '天皇賞（春）': {
+        'grade': 'G1', 'venue': '京都', 'surface': 'turf', 'distance': 3200,
+        'month': [4, 5],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.10, 'REAR': 0.14},
+        'pace_tendency': 'S', 'pace_adj': 0.8,
+        'ability_weight': 1.20, 'stamina_index': 0.95, 'speed_index': 0.40,
+        'notes': '最もスタミナが問われるG1。京都内回り3200mは坂越えを2度経験し消耗戦になりやすい。長距離適性・底力型の馬が有利。近年はスローからの上り勝負になることも。',
+        'aliases': ['天皇賞春', '春天', 'てんのうしょうはる'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 2.5,
+        'key_factors': ['stamina', 'power', 'corner'],
+        'draw_tendency': 'neutral',
+    },
+    '天皇賞（秋）': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 2000,
+        'month': [10, 11],
+        'style_bias': {'FRONT': -0.08, 'MIDDLE': 0.16, 'REAR': 0.22},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.20, 'stamina_index': 0.62, 'speed_index': 0.72,
+        'notes': '東京2000mの長い直線で差し・追い込みが決まりやすい最高峰レース。瞬発力・上がり能力が最重要。ペースが上がった場合は差し有利が顕著。',
+        'aliases': ['天皇賞秋', '秋天', 'てんのうしょうあき'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'straight', 'stamina'],
+        'draw_tendency': 'neutral',
+    },
+    'ジャパンカップ': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 2400,
+        'month': [11],
+        'style_bias': {'FRONT': -0.10, 'MIDDLE': 0.12, 'REAR': 0.18},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.25, 'stamina_index': 0.75, 'speed_index': 0.65,
+        'notes': '国際G1。世界一線級と対戦する大一番。東京2400mで差し・追い込みが有利。総合能力No.1が問われるが馬場適性（良馬場）も重要。長い直線でのキレが決め手。',
+        'aliases': ['JC', 'ジャパンC', 'じゃぱんかっぷ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['speed', 'stamina', 'straight'],
+        'draw_tendency': 'outer',
+    },
+    '安田記念': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 1600,
+        'month': [6],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.18, 'REAR': 0.20},
+        'pace_tendency': 'MH', 'pace_adj': 0.7,
+        'ability_weight': 1.15, 'stamina_index': 0.48, 'speed_index': 0.82,
+        'notes': 'マイル最高峰。東京1600mの差し馬有利な舞台。スピード・瞬発力が最重要。ペースが速くなると後方からの差しが届きやすい。外枠は不利になりやすい。',
+        'aliases': ['安田', 'やすだきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'agility', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    'マイルチャンピオンシップ': {
+        'grade': 'G1', 'venue': '京都', 'surface': 'turf', 'distance': 1600,
+        'month': [11],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.16, 'REAR': 0.10},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.15, 'stamina_index': 0.50, 'speed_index': 0.78,
+        'notes': '秋のマイル王者決定戦。京都外回り1600mはコーナー4回で先行馬も残りやすい。差し馬も届く万能コース。マイラーの総合力が問われる。',
+        'aliases': ['マイルCS', 'マイルチャンピオン', 'マイルシャンピオンシップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'agility', 'corner'],
+        'draw_tendency': 'inner',
+    },
+    'スプリンターズステークス': {
+        'grade': 'G1', 'venue': '中山', 'surface': 'turf', 'distance': 1200,
+        'month': [9, 10],
+        'style_bias': {'FRONT': 0.22, 'MIDDLE': 0.10, 'REAR': -0.08},
+        'pace_tendency': 'H', 'pace_adj': 0.8,
+        'ability_weight': 1.10, 'stamina_index': 0.28, 'speed_index': 0.95,
+        'notes': '短距離最高峰。中山芝1200mは先行が有利で速いラップが要求される。スプリント専門馬が圧倒的有利。内枠・先行脚質・速いゲートスタートが重要。',
+        'aliases': ['スプリンターズS', 'スプリンターズ', 'スプリンターズステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 2.0,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    '高松宮記念': {
+        'grade': 'G1', 'venue': '中京', 'surface': 'turf', 'distance': 1200,
+        'month': [3],
+        'style_bias': {'FRONT': 0.02, 'MIDDLE': 0.12, 'REAR': 0.18},
+        'pace_tendency': 'H', 'pace_adj': 0.7,
+        'ability_weight': 1.10, 'stamina_index': 0.35, 'speed_index': 0.90,
+        'notes': '春の短距離王者決定戦。中京芝1200mは直線が長く差し馬も届きやすい。ハイペース必至で後半の踏ん張りも重要。良馬場なら差し有利、道悪なら先行有利の傾向。',
+        'aliases': ['高松宮', 'たかまつのみやきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'outer',
+    },
+    '宝塚記念': {
+        'grade': 'G1', 'venue': '阪神', 'surface': 'turf', 'distance': 2200,
+        'month': [6],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.20, 'REAR': 0.16},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.20, 'stamina_index': 0.78, 'speed_index': 0.60,
+        'notes': '上半期グランプリ。阪神2200mは内回りでタフな消耗戦になりやすい。パワー・スタミナが必要。道悪になると内枠・先行が一層有利。ファン投票で人気馬が集まるため能力上位が来やすい。',
+        'aliases': ['宝塚', 'たからづかきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'power', 'corner'],
+        'draw_tendency': 'inner',
+    },
+    'エリザベス女王杯': {
+        'grade': 'G1', 'venue': '京都', 'surface': 'turf', 'distance': 2200,
+        'month': [11],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.18},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.15, 'stamina_index': 0.72, 'speed_index': 0.58,
+        'notes': '牝馬最高峰の一つ。京都外回り2200mで差し・追い込み有利。牝馬特有の気性面・調教仕上がりが重要。道悪は荒れる傾向あり。秋華賞組が充実していることが多い。',
+        'aliases': ['エリザベス女王杯', 'エリ女', 'えりざべすじょおうはい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'stamina', 'straight'],
+        'draw_tendency': 'outer',
+    },
+    'ヴィクトリアマイル': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 1600,
+        'month': [5],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.18},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.50, 'speed_index': 0.80,
+        'notes': '牝馬マイル最高峰。東京1600mの差し馬有利舞台。安田記念と同コースで瞬発力・上がり能力が勝敗を分ける。前哨戦でのパフォーマンスが重要。',
+        'aliases': ['ヴィクトリアM', 'ビクトリアマイル'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'agility', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '秋華賞': {
+        'grade': 'G1', 'venue': '京都', 'surface': 'turf', 'distance': 2000,
+        'month': [10],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.14, 'REAR': 0.10},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.60, 'speed_index': 0.65,
+        'notes': '牝馬三冠最終戦。京都内回り2000mで先行・差し馬が混戦になりやすい。オークス組・ローズS組の仕上がりが鍵。コーナー技術が問われる。',
+        'aliases': ['秋華賞', 'しゅうかしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['corner', 'stamina', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'オークス': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 2400,
+        'month': [5],
+        'style_bias': {'FRONT': -0.08, 'MIDDLE': 0.12, 'REAR': 0.16},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.15, 'stamina_index': 0.80, 'speed_index': 0.58,
+        'notes': '牝馬クラシック第2弾。東京2400mの過酷な距離適性テスト。桜花賞組・フラワーカップ組の選択眼が重要。距離実績・スタミナが問われる。道悪で穴馬が台頭しやすい。',
+        'aliases': ['優駿牝馬', 'オークス', 'おーくす'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['stamina', 'straight', 'speed'],
+        'draw_tendency': 'outer',
+    },
+    '桜花賞': {
+        'grade': 'G1', 'venue': '阪神', 'surface': 'turf', 'distance': 1600,
+        'month': [4],
+        'style_bias': {'FRONT': 0.02, 'MIDDLE': 0.14, 'REAR': 0.12},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.48, 'speed_index': 0.80,
+        'notes': '牝馬クラシック第1弾。阪神外回り1600mで高速上がりが要求される。チューリップ賞・アネモネS組が中心。先行力・キレどちらも問われるオールラウンダー向き。',
+        'aliases': ['桜花賞', 'おうかしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'agility', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '皐月賞': {
+        'grade': 'G1', 'venue': '中山', 'surface': 'turf', 'distance': 2000,
+        'month': [4],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.22, 'REAR': 0.04},
+        'pace_tendency': 'MH', 'pace_adj': 0.7,
+        'ability_weight': 1.15, 'stamina_index': 0.68, 'speed_index': 0.68,
+        'notes': '牡馬クラシック第1弾。中山2000mのタフな馬場で先行・差し混戦。コーナー技術と先行力のバランスが重要。弥生賞・スプリングS組が中心。内枠有利傾向。',
+        'aliases': ['皐月賞', 'さつきしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '日本ダービー': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 2400,
+        'month': [5, 6],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.25, 'stamina_index': 0.78, 'speed_index': 0.68,
+        'notes': '競馬の最高峰・東京優駿。東京2400mで総合能力No.1が決まる。皐月賞組・青葉賞組が中心。距離適性・末脚・精神力すべてが問われる最高峰。最後の直線での瞬発力勝負。',
+        'aliases': ['ダービー', '東京優駿', 'にほんだーびー', '日本ダービー'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 0.0,
+        'key_factors': ['speed', 'stamina', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '菊花賞': {
+        'grade': 'G1', 'venue': '京都', 'surface': 'turf', 'distance': 3000,
+        'month': [10],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.08, 'REAR': 0.12},
+        'pace_tendency': 'S', 'pace_adj': 0.7,
+        'ability_weight': 1.15, 'stamina_index': 0.92, 'speed_index': 0.48,
+        'notes': '牡馬三冠最終戦・最長クラシック。京都外回り3000mで底力・スタミナが最重要。神戸新聞杯・セントライト記念組が中心。ゆったり流れるスローからの上り勝負になることも。',
+        'aliases': ['菊花賞', 'きっかしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['stamina', 'corner', 'power'],
+        'draw_tendency': 'neutral',
+    },
+    '朝日杯フューチュリティステークス': {
+        'grade': 'G1', 'venue': '阪神', 'surface': 'turf', 'distance': 1600,
+        'month': [12],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.14, 'REAR': 0.08},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.05, 'stamina_index': 0.45, 'speed_index': 0.82,
+        'notes': '2歳マイル最高峰。阪神外回り1600mでスピードが最重要。新馬・未勝利からの快速馬が集まる。仕上がり早の先行型が台頭しやすい。素質馬同士の純粋な能力比較。',
+        'aliases': ['朝日杯FS', '朝日杯フューチュリティS', '朝日杯'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.0,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'ホープフルステークス': {
+        'grade': 'G1', 'venue': '中山', 'surface': 'turf', 'distance': 2000,
+        'month': [12],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.20, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.65, 'speed_index': 0.60,
+        'notes': '2歳中距離最高峰。中山2000mでスタミナ・先行力が求められる。ダービー路線の一里塚として重要な位置付け。コーナー4回をうまく立ち回れる馬が有利。',
+        'aliases': ['ホープフルS', 'ホープフル'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.0,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '阪神ジュベナイルフィリーズ': {
+        'grade': 'G1', 'venue': '阪神', 'surface': 'turf', 'distance': 1600,
+        'month': [12],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.14, 'REAR': 0.08},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.05, 'stamina_index': 0.45, 'speed_index': 0.82,
+        'notes': '2歳牝馬最高峰。阪神外回り1600mで桜花賞へのステップ。スピード・キレが重要。新馬戦から直行する素質馬も上位争いに加わる。前哨戦の内容より絶対能力が問われる。',
+        'aliases': ['阪神JF', '阪神ジュベナイルF', 'ジュベナイルフィリーズ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.0,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'フェブラリーステークス': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'dirt', 'distance': 1600,
+        'month': [2],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.14, 'REAR': 0.04},
+        'pace_tendency': 'MH', 'pace_adj': 0.7,
+        'ability_weight': 1.15, 'stamina_index': 0.50, 'speed_index': 0.82,
+        'notes': '唯一の東京ダートG1。スタートの速さとコーナリングが重要。大外枠は不利になりやすい（砂をかぶる）。根岸S組・チャンピオンズC組が中心。ダート実績が最重要。',
+        'aliases': ['フェブラリーS', 'フェブラリー'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'チャンピオンズカップ': {
+        'grade': 'G1', 'venue': '中京', 'surface': 'dirt', 'distance': 1800,
+        'month': [12],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.16, 'REAR': 0.10},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.20, 'stamina_index': 0.62, 'speed_index': 0.75,
+        'notes': 'ダート中距離最高峰。中京1800mは直線が長く後方からも差しが届く。前走チェック重要。スタミナ・パワーとスピードのバランスが問われる。',
+        'aliases': ['チャンピオンズC', 'チャンピオンズカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['power', 'stamina', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    'かしわ記念': {
+        'grade': 'G1', 'venue': '船橋', 'surface': 'dirt', 'distance': 1600,
+        'month': [5],
+        'style_bias': {'FRONT': 0.12, 'MIDDLE': 0.16, 'REAR': 0.02},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.50, 'speed_index': 0.80,
+        'notes': '地方交流G1（JRA馬参戦）。先行有利の傾向。スピード・先行力が最重要。',
+        'aliases': ['かしわ記念', 'かしわきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'power'],
+        'draw_tendency': 'inner',
+    },
+    '帝王賞': {
+        'grade': 'G1', 'venue': '大井', 'surface': 'dirt', 'distance': 2000,
+        'month': [6],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.18, 'REAR': 0.06},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.15, 'stamina_index': 0.68, 'speed_index': 0.62,
+        'notes': '地方大井のダート2000m G1。大井の長い直線で差しも届く。JRA馬と地方馬の実力差が問われる一戦。',
+        'aliases': ['帝王賞', 'ていおうしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'power', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    'マイルチャンピオンシップ南部杯': {
+        'grade': 'G1', 'venue': '盛岡', 'surface': 'dirt', 'distance': 1600,
+        'month': [10],
+        'style_bias': {'FRONT': 0.10, 'MIDDLE': 0.14, 'REAR': 0.04},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.48, 'speed_index': 0.82,
+        'notes': '地方交流G1。盛岡のダート1600mはスピード重視。地方特有の砂質への適応が重要。',
+        'aliases': ['南部杯', 'なんぶはい', 'マイルCS南部杯'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'JBCスプリント': {
+        'grade': 'G1', 'venue': '各地', 'surface': 'dirt', 'distance': 1200,
+        'month': [11],
+        'style_bias': {'FRONT': 0.18, 'MIDDLE': 0.10, 'REAR': -0.04},
+        'pace_tendency': 'H', 'pace_adj': 0.7,
+        'ability_weight': 1.10, 'stamina_index': 0.30, 'speed_index': 0.92,
+        'notes': 'JBC開催地によってコース変化あり。ダートスプリント専門馬が有利。先行・ゲートスタートが最重要。',
+        'aliases': ['JBCスプリント'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'JBCクラシック': {
+        'grade': 'G1', 'venue': '各地', 'surface': 'dirt', 'distance': 2000,
+        'month': [11],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.16, 'REAR': 0.08},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.15, 'stamina_index': 0.68, 'speed_index': 0.65,
+        'notes': 'JBC開催地によってコース変化あり。ダート中距離の最高峰の一つ。',
+        'aliases': ['JBCクラシック'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'power', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    '東京大賞典': {
+        'grade': 'G1', 'venue': '大井', 'surface': 'dirt', 'distance': 2000,
+        'month': [12],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.18, 'REAR': 0.08},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.15, 'stamina_index': 0.68, 'speed_index': 0.62,
+        'notes': '年末ダート最高峰の一つ。大井2000mで前後から差しが届く。JRA勢有利だが地方馬の台頭もあり。',
+        'aliases': ['東京大賞典', 'とうきょうだいしょうてん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'power', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    # ============================================================
+    # G2 レース（主要）
+    # ============================================================
+    '中山記念': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 1800,
+        'month': [2],
+        'style_bias': {'FRONT': 0.10, 'MIDDLE': 0.22, 'REAR': 0.04},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.65, 'speed_index': 0.62,
+        'notes': '春のマイル・中距離路線の前哨戦。中山内回り1800mで先行・差し混戦。コーナリング技術が重要。',
+        'aliases': ['中山記念', 'なかやまきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '産経大阪杯': {
+        'grade': 'G2', 'venue': '阪神', 'surface': 'turf', 'distance': 2000,
+        'month': [4],
+        'style_bias': {'FRONT': -0.02, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.68, 'speed_index': 0.62,
+        'notes': '大阪杯（G1昇格後は大阪杯）。阪神内回り2000mで中距離最高峰のひとつ。先行も差しも届く。',
+        'aliases': ['大阪杯', 'おおさかはい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'stamina', 'speed'],
+        'draw_tendency': 'inner',
+    },
+    '大阪杯': {
+        'grade': 'G1', 'venue': '阪神', 'surface': 'turf', 'distance': 2000,
+        'month': [4],
+        'style_bias': {'FRONT': 0.02, 'MIDDLE': 0.16, 'REAR': 0.12},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.20, 'stamina_index': 0.70, 'speed_index': 0.65,
+        'notes': 'G1昇格後の春の中距離決定戦。阪神内回り2000mで先行有利傾向。前走宝塚・天皇賞組が中心。タフな先行争いを制した馬が台頭しやすい。',
+        'aliases': ['大阪杯', 'おおさかはい', '産経大阪杯'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'stamina', 'speed'],
+        'draw_tendency': 'inner',
+    },
+    '日経賞': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 2500,
+        'month': [3],
+        'style_bias': {'FRONT': 0.10, 'MIDDLE': 0.24, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.82, 'speed_index': 0.50,
+        'notes': '天皇賞春への最重要前哨戦。中山2500mで長距離適性を問う。スタミナ・コーナリングが重要。内枠有利傾向。',
+        'aliases': ['日経賞', 'にっけいしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 2.0,
+        'key_factors': ['stamina', 'corner', 'power'],
+        'draw_tendency': 'inner',
+    },
+    '阪神大賞典': {
+        'grade': 'G2', 'venue': '阪神', 'surface': 'turf', 'distance': 3000,
+        'month': [3],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.10, 'REAR': 0.12},
+        'pace_tendency': 'S', 'pace_adj': 0.7,
+        'ability_weight': 1.10, 'stamina_index': 0.90, 'speed_index': 0.42,
+        'notes': '天皇賞春への前哨戦（関西）。阪神3000mで長距離適性テスト。スタミナ・底力が問われる。スロー流れから上り競馬になることも。',
+        'aliases': ['阪神大賞典', 'はんしんだいしょうてん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 2.0, 'repeat_winner_bonus': 2.0,
+        'key_factors': ['stamina', 'power', 'corner'],
+        'draw_tendency': 'neutral',
+    },
+    'AJCC': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 2200,
+        'month': [1],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.22, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.74, 'speed_index': 0.55,
+        'notes': '年明け初戦として重要。中山内回り2200mで先行有利。スタミナ・先行力が問われる。',
+        'aliases': ['アメリカジョッキークラブカップ', 'AJCC'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'corner', 'power'],
+        'draw_tendency': 'inner',
+    },
+    '京都記念': {
+        'grade': 'G2', 'venue': '阪神', 'surface': 'turf', 'distance': 2200,
+        'month': [2],
+        'style_bias': {'FRONT': -0.02, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.74, 'speed_index': 0.58,
+        'notes': '大阪杯・宝塚記念への前哨戦。阪神2200m（京都改修中は代替開催）。バランス型が有利。',
+        'aliases': ['京都記念', 'きょうときねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'corner', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    '毎日王冠': {
+        'grade': 'G2', 'venue': '東京', 'surface': 'turf', 'distance': 1800,
+        'month': [10],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.16, 'REAR': 0.18},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.58, 'speed_index': 0.72,
+        'notes': '天皇賞秋への最重要前哨戦。東京1800mで差し有利。上がり競馬になりやすく瞬発力が最重要。',
+        'aliases': ['毎日王冠', 'まいにちおうかん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'neutral',
+    },
+    '府中牝馬ステークス': {
+        'grade': 'G2', 'venue': '東京', 'surface': 'turf', 'distance': 1800,
+        'month': [10],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.16, 'REAR': 0.18},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.58, 'speed_index': 0.72,
+        'notes': 'エリザベス女王杯への前哨戦（牝馬）。東京1800mで差し有利。牝馬特有の気性・仕上がりが重要。',
+        'aliases': ['府中牝馬S', '府中牝馬ステークス', 'ふちゅうひんばすてーくす'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'neutral',
+    },
+    '札幌記念': {
+        'grade': 'G2', 'venue': '札幌', 'surface': 'turf', 'distance': 2000,
+        'month': [8],
+        'style_bias': {'FRONT': 0.12, 'MIDDLE': 0.24, 'REAR': 0.00},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.60, 'speed_index': 0.58,
+        'notes': '夏の北海道G2。洋芝・小回りの札幌2000mで先行有利。外厩仕上げの馬や夏場に仕上がる馬が台頭する。洋芝適性が特に重要。',
+        'aliases': ['札幌記念', 'さっぽろきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 2.0,
+        'key_factors': ['corner', 'stamina', 'power'],
+        'draw_tendency': 'inner',
+    },
+    'オールカマー': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 2200,
+        'month': [9],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.22, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.74, 'speed_index': 0.55,
+        'notes': '天皇賞秋への前哨戦。中山内回り2200mで先行有利。スタミナ・先行力が問われる。',
+        'aliases': ['オールカマー', 'おーるかまー'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'corner', 'power'],
+        'draw_tendency': 'inner',
+    },
+    '神戸新聞杯': {
+        'grade': 'G2', 'venue': '中京', 'surface': 'turf', 'distance': 2200,
+        'month': [9],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.74, 'speed_index': 0.60,
+        'notes': '菊花賞への前哨戦（関西）。中京2200mで力のある差し馬が有利。スタミナ・末脚が重要。',
+        'aliases': ['神戸新聞杯', 'こうべしんぶんはい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['stamina', 'speed', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    'セントライト記念': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 2200,
+        'month': [9],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.20, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.74, 'speed_index': 0.55,
+        'notes': '菊花賞への前哨戦（関東）。中山内回り2200mで先行有利。コーナリング技術と先行力が問われる。',
+        'aliases': ['セントライト記念', 'せんとらいときねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '京都大賞典': {
+        'grade': 'G2', 'venue': '京都', 'surface': 'turf', 'distance': 2400,
+        'month': [10],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.08, 'REAR': 0.12},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.10, 'stamina_index': 0.78, 'speed_index': 0.58,
+        'notes': '天皇賞秋・ジャパンカップへの前哨戦。京都外回り2400mで差し有利。スタミナ・末脚が問われる。',
+        'aliases': ['京都大賞典', 'きょうとだいしょうてん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'speed', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    'チャレンジカップ': {
+        'grade': 'G2', 'venue': '中京', 'surface': 'turf', 'distance': 2000,
+        'month': [11],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.68, 'speed_index': 0.62,
+        'notes': '重賞昇格後の秋の中距離。中京2000mは差しも届く。バランス型が有利。',
+        'aliases': ['チャレンジC', 'チャレンジカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['stamina', 'speed', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '中山牝馬ステークス': {
+        'grade': 'G3', 'venue': '中山', 'surface': 'turf', 'distance': 1800,
+        'month': [3],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.20, 'REAR': 0.06},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.60, 'speed_index': 0.60,
+        'notes': '牝馬の中山1800m重賞。コーナリング・先行力が問われる。',
+        'aliases': ['中山牝馬S', '中山牝馬ステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['corner', 'stamina', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'スプリングステークス': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 1800,
+        'month': [3],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.20, 'REAR': 0.06},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.62, 'speed_index': 0.62,
+        'notes': '皐月賞への前哨戦。中山内回り1800mでコーナリング・先行力が問われる。',
+        'aliases': ['スプリングS', 'スプリングステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '弥生賞': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 2000,
+        'month': [3],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.22, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.66, 'speed_index': 0.60,
+        'notes': '皐月賞への最重要前哨戦。中山2000mで先行有利。3歳馬の仕上がり早が台頭しやすい。',
+        'aliases': ['弥生賞', 'やよいしょう', 'ディープインパクト記念'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    'ローズステークス': {
+        'grade': 'G2', 'venue': '中京', 'surface': 'turf', 'distance': 1800,
+        'month': [9],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.58, 'speed_index': 0.68,
+        'notes': '秋華賞への前哨戦（関西牝馬）。中京1800mで差し有利の傾向。',
+        'aliases': ['ローズS', 'ローズステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'stamina', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '紫苑ステークス': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 2000,
+        'month': [9],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.18, 'REAR': 0.08},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.65, 'speed_index': 0.60,
+        'notes': '秋華賞への前哨戦（関東牝馬）。中山2000mで先行・差し混戦。',
+        'aliases': ['紫苑S', '紫苑ステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    # ============================================================
+    # G2 ダートレース（主要）
+    # ============================================================
+    '東海ステークス': {
+        'grade': 'G2', 'venue': '中京', 'surface': 'dirt', 'distance': 1800,
+        'month': [1],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.16, 'REAR': 0.08},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.62, 'speed_index': 0.72,
+        'notes': 'チャンピオンズカップへの最重要前哨戦。中京ダート1800mで後半力が問われる。',
+        'aliases': ['東海S', '東海ステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['power', 'stamina', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    'シリウスステークス': {
+        'grade': 'G3', 'venue': '阪神', 'surface': 'dirt', 'distance': 2000,
+        'month': [10],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.16, 'REAR': 0.06},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.65, 'speed_index': 0.62,
+        'notes': 'JBCクラシックへの前哨戦。阪神ダート2000mでスタミナ・パワーが重要。',
+        'aliases': ['シリウスS', 'シリウスステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['stamina', 'power', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    # ============================================================
+    # G3 レース（主要・芝）
+    # ============================================================
+    '小倉記念': {
+        'grade': 'G3', 'venue': '小倉', 'surface': 'turf', 'distance': 2000,
+        'month': [8],
+        'style_bias': {'FRONT': 0.14, 'MIDDLE': 0.22, 'REAR': 0.00},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.62, 'speed_index': 0.62,
+        'notes': '夏の小倉2000m重賞。先行有利のコースで先行力・コーナリング技術が問われる。',
+        'aliases': ['小倉記念', 'こくらきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'speed', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '福島記念': {
+        'grade': 'G3', 'venue': '福島', 'surface': 'turf', 'distance': 2000,
+        'month': [11],
+        'style_bias': {'FRONT': 0.16, 'MIDDLE': 0.26, 'REAR': 0.02},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.62, 'speed_index': 0.58,
+        'notes': '福島の秋2000m重賞。小回りコースで先行有利。先行力・コーナリングが問われる。',
+        'aliases': ['福島記念', 'ふくしまきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '中京記念': {
+        'grade': 'G3', 'venue': '中京', 'surface': 'turf', 'distance': 1600,
+        'month': [7],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.48, 'speed_index': 0.78,
+        'notes': '夏の中京マイル重賞。差し有利の中京1600mでスピード・末脚が重要。',
+        'aliases': ['中京記念', 'ちゅうきょうきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'neutral',
+    },
+    '新潟大賞典': {
+        'grade': 'G3', 'venue': '新潟', 'surface': 'turf', 'distance': 2000,
+        'month': [5],
+        'style_bias': {'FRONT': -0.08, 'MIDDLE': 0.10, 'REAR': 0.26},
+        'pace_tendency': 'M', 'pace_adj': 0.6,
+        'ability_weight': 1.00, 'stamina_index': 0.58, 'speed_index': 0.65,
+        'notes': '新潟外回り2000m。直線が長く差し・追い込みが決まりやすい特殊コース。末脚能力が最重要。',
+        'aliases': ['新潟大賞典', 'にいがただいしょうてん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['straight', 'speed', 'agility'],
+        'draw_tendency': 'outer',
+    },
+    '七夕賞': {
+        'grade': 'G3', 'venue': '福島', 'surface': 'turf', 'distance': 2000,
+        'month': [7],
+        'style_bias': {'FRONT': 0.14, 'MIDDLE': 0.24, 'REAR': 0.02},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.62, 'speed_index': 0.56,
+        'notes': '夏の福島2000m重賞。小回りで先行有利。',
+        'aliases': ['七夕賞', 'たなばたしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '鳴尾記念': {
+        'grade': 'G3', 'venue': '中京', 'surface': 'turf', 'distance': 2000,
+        'month': [5, 6],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.68, 'speed_index': 0.60,
+        'notes': '宝塚記念への前哨戦。中京2000mで後半力が問われる。',
+        'aliases': ['鳴尾記念', 'なるおきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['stamina', 'speed', 'corner'],
+        'draw_tendency': 'neutral',
+    },
+    '金鯱賞': {
+        'grade': 'G2', 'venue': '中京', 'surface': 'turf', 'distance': 2000,
+        'month': [3],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.68, 'speed_index': 0.65,
+        'notes': '大阪杯への前哨戦。中京2000mで差し有利の舞台。前走の内容が重要。',
+        'aliases': ['金鯱賞', 'きんこしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'stamina', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '中山金杯': {
+        'grade': 'G3', 'venue': '中山', 'surface': 'turf', 'distance': 2000,
+        'month': [1],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.22, 'REAR': 0.04},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.66, 'speed_index': 0.58,
+        'notes': '年明け初戦のG3。中山内回り2000mで先行有利。ハンデ戦で斤量の読みが重要。',
+        'aliases': ['中山金杯', 'なかやまきんぱい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '京都金杯': {
+        'grade': 'G3', 'venue': '中京', 'surface': 'turf', 'distance': 1600,
+        'month': [1],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.48, 'speed_index': 0.78,
+        'notes': '年明け初戦のマイルG3（代替開催中は中京）。ハンデ戦で穴馬が台頭しやすい。',
+        'aliases': ['京都金杯', 'きょうときんぱい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'agility', 'gate'],
+        'draw_tendency': 'neutral',
+    },
+    '関屋記念': {
+        'grade': 'G3', 'venue': '新潟', 'surface': 'turf', 'distance': 1600,
+        'month': [8],
+        'style_bias': {'FRONT': -0.08, 'MIDDLE': 0.12, 'REAR': 0.20},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.00, 'stamina_index': 0.48, 'speed_index': 0.82,
+        'notes': '夏の新潟マイル重賞。長い直線で差し・追い込みが決まりやすい。末脚能力が最重要。',
+        'aliases': ['関屋記念', 'せきやきねん'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'outer',
+    },
+    '富士ステークス': {
+        'grade': 'G2', 'venue': '東京', 'surface': 'turf', 'distance': 1600,
+        'month': [10],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.16, 'REAR': 0.18},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.48, 'speed_index': 0.82,
+        'notes': 'マイルチャンピオンシップへの前哨戦。東京1600mで差し有利。',
+        'aliases': ['富士S', '富士ステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'agility', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    'スワンステークス': {
+        'grade': 'G2', 'venue': '京都', 'surface': 'turf', 'distance': 1400,
+        'month': [10, 11],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.14, 'REAR': 0.10},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.42, 'speed_index': 0.84,
+        'notes': 'マイルチャンピオンシップへの前哨戦（1400m組）。スピード・先行力が重要。',
+        'aliases': ['スワンS', 'スワンステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'ターコイズステークス': {
+        'grade': 'G3', 'venue': '中山', 'surface': 'turf', 'distance': 1600,
+        'month': [12],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.16, 'REAR': 0.10},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.50, 'speed_index': 0.78,
+        'notes': '牝馬の中山マイル重賞。ハンデ戦で荒れやすい。',
+        'aliases': ['ターコイズS', 'ターコイズステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'agility', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '愛知杯': {
+        'grade': 'G3', 'venue': '中京', 'surface': 'turf', 'distance': 2000,
+        'month': [1],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.65, 'speed_index': 0.62,
+        'notes': '牝馬の中京2000m重賞。差しも届く舞台。',
+        'aliases': ['愛知杯', 'あいちはい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['stamina', 'speed', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    # ============================================================
+    # G3 ダートレース（主要）
+    # ============================================================
+    '根岸ステークス': {
+        'grade': 'G3', 'venue': '東京', 'surface': 'dirt', 'distance': 1400,
+        'month': [1, 2],
+        'style_bias': {'FRONT': 0.10, 'MIDDLE': 0.12, 'REAR': 0.00},
+        'pace_tendency': 'H', 'pace_adj': 0.6,
+        'ability_weight': 1.05, 'stamina_index': 0.38, 'speed_index': 0.88,
+        'notes': 'フェブラリーステークスへの前哨戦（ダートスプリント組）。東京ダート1400mで先行力・速いスタートが重要。',
+        'aliases': ['根岸S', '根岸ステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'みやこステークス': {
+        'grade': 'G3', 'venue': '京都', 'surface': 'dirt', 'distance': 1800,
+        'month': [11],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.14, 'REAR': 0.02},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.58, 'speed_index': 0.70,
+        'notes': 'チャンピオンズカップへの前哨戦。京都ダート1800mで先行力・スピードが重要。',
+        'aliases': ['みやこS', 'みやこステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'power', 'stamina'],
+        'draw_tendency': 'inner',
+    },
+    'プロキオンステークス': {
+        'grade': 'G3', 'venue': '中京', 'surface': 'dirt', 'distance': 1400,
+        'month': [7],
+        'style_bias': {'FRONT': 0.10, 'MIDDLE': 0.12, 'REAR': 0.00},
+        'pace_tendency': 'H', 'pace_adj': 0.6,
+        'ability_weight': 1.00, 'stamina_index': 0.38, 'speed_index': 0.88,
+        'notes': '夏のダートスプリント重賞。中京ダート1400mで先行・スピードが最重要。',
+        'aliases': ['プロキオンS', 'プロキオンステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'マーキュリーカップ': {
+        'grade': 'G3', 'venue': '盛岡', 'surface': 'dirt', 'distance': 2000,
+        'month': [7],
+        'style_bias': {'FRONT': 0.08, 'MIDDLE': 0.16, 'REAR': 0.06},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.65, 'speed_index': 0.62,
+        'notes': '地方交流G3。盛岡ダート2000mでスタミナ・先行力が問われる。',
+        'aliases': ['マーキュリーC', 'マーキュリーカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['stamina', 'power', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    'レパードステークス': {
+        'grade': 'G3', 'venue': '新潟', 'surface': 'dirt', 'distance': 1800,
+        'month': [8],
+        'style_bias': {'FRONT': -0.02, 'MIDDLE': 0.12, 'REAR': 0.14},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.58, 'speed_index': 0.68,
+        'notes': '3歳ダートG3。新潟ダート1800mで後半力・末脚が問われる。3歳馬の素質比較。',
+        'aliases': ['レパードS', 'レパードステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['power', 'stamina', 'speed'],
+        'draw_tendency': 'neutral',
+    },
+    'ユニコーンステークス': {
+        'grade': 'G3', 'venue': '東京', 'surface': 'dirt', 'distance': 1600,
+        'month': [6],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.14, 'REAR': 0.04},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.00, 'stamina_index': 0.50, 'speed_index': 0.80,
+        'notes': '3歳ダートマイルG3。東京ダート1600mで先行力・スピードが問われる。',
+        'aliases': ['ユニコーンS', 'ユニコーンステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.0,
+        'key_factors': ['speed', 'gate', 'power'],
+        'draw_tendency': 'inner',
+    },
+    '武蔵野ステークス': {
+        'grade': 'G3', 'venue': '東京', 'surface': 'dirt', 'distance': 1600,
+        'month': [11],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.14, 'REAR': 0.04},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.50, 'speed_index': 0.80,
+        'notes': 'チャンピオンズカップ・フェブラリーへの前哨戦。東京ダート1600mで先行力・スピードが重要。',
+        'aliases': ['武蔵野S', '武蔵野ステークス'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    # ============================================================
+    # その他主要重賞（追加）
+    # ============================================================
+    'ダービー卿チャレンジトロフィー': {
+        'grade': 'G3', 'venue': '中山', 'surface': 'turf', 'distance': 1600,
+        'month': [4],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.16, 'REAR': 0.08},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.50, 'speed_index': 0.78,
+        'notes': '中山マイル重賞（ハンデ）。コーナリング・先行力が問われる。',
+        'aliases': ['ダービー卿CT', 'ダービー卿チャレンジ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 1.5,
+        'key_factors': ['speed', 'corner', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    'ニュージーランドトロフィー': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 1600,
+        'month': [4],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.16, 'REAR': 0.10},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.48, 'speed_index': 0.80,
+        'notes': 'NHKマイルカップへの前哨戦（3歳マイル）。中山内回り1600mで先行・差し混戦。',
+        'aliases': ['NZT', 'ニュージーランドトロフィー'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'NHKマイルカップ': {
+        'grade': 'G1', 'venue': '東京', 'surface': 'turf', 'distance': 1600,
+        'month': [5],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.18},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.10, 'stamina_index': 0.48, 'speed_index': 0.84,
+        'notes': '3歳マイル最高峰。東京1600mで差し・瞬発力が問われる。外国産馬・地方交流馬も参戦。',
+        'aliases': ['NHKマイルC', 'NHKマイルカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'agility', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '青葉賞': {
+        'grade': 'G2', 'venue': '東京', 'surface': 'turf', 'distance': 2400,
+        'month': [4, 5],
+        'style_bias': {'FRONT': -0.06, 'MIDDLE': 0.12, 'REAR': 0.14},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.78, 'speed_index': 0.60,
+        'notes': 'ダービーへの最重要前哨戦（関東）。東京2400mで差し有利。スタミナ・末脚が問われる。',
+        'aliases': ['青葉賞', 'あおばしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['stamina', 'speed', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    '京都新聞杯': {
+        'grade': 'G2', 'venue': '中京', 'surface': 'turf', 'distance': 2200,
+        'month': [5],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.12, 'REAR': 0.14},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.74, 'speed_index': 0.60,
+        'notes': 'ダービーへの前哨戦（関西）。中京2200mで差し有利。スタミナ・末脚が重要。',
+        'aliases': ['京都新聞杯', 'きょうとしんぶんはい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['stamina', 'speed', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+    'フラワーカップ': {
+        'grade': 'G3', 'venue': '中山', 'surface': 'turf', 'distance': 1800,
+        'month': [3],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.18, 'REAR': 0.08},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.60, 'speed_index': 0.65,
+        'notes': 'オークスへの前哨戦（牝馬）。中山内回り1800mで先行・差し混戦。',
+        'aliases': ['フラワーC', 'フラワーカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    'チューリップ賞': {
+        'grade': 'G2', 'venue': '阪神', 'surface': 'turf', 'distance': 1600,
+        'month': [3],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.14, 'REAR': 0.10},
+        'pace_tendency': 'MH', 'pace_adj': 0.6,
+        'ability_weight': 1.05, 'stamina_index': 0.48, 'speed_index': 0.80,
+        'notes': '桜花賞への最重要前哨戦。阪神外回り1600mでスピード・キレが問われる。',
+        'aliases': ['チューリップ賞', 'チューリップしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'フィリーズレビュー': {
+        'grade': 'G2', 'venue': '阪神', 'surface': 'turf', 'distance': 1400,
+        'month': [3],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.12, 'REAR': 0.08},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.42, 'speed_index': 0.84,
+        'notes': '桜花賞への前哨戦（スプリント組）。阪神1400mで先行力・スピードが最重要。',
+        'aliases': ['フィリーズレビュー'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'アーリントンカップ': {
+        'grade': 'G3', 'venue': '阪神', 'surface': 'turf', 'distance': 1600,
+        'month': [4],
+        'style_bias': {'FRONT': 0.04, 'MIDDLE': 0.14, 'REAR': 0.10},
+        'pace_tendency': 'MH', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.48, 'speed_index': 0.82,
+        'notes': 'NHKマイルカップへの前哨戦。阪神外回り1600mでスピード・キレが問われる。',
+        'aliases': ['アーリントンC', 'アーリントンカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'gate', 'agility'],
+        'draw_tendency': 'inner',
+    },
+    'スプリングステークス': {
+        'grade': 'G2', 'venue': '中山', 'surface': 'turf', 'distance': 1800,
+        'month': [3],
+        'style_bias': {'FRONT': 0.06, 'MIDDLE': 0.18, 'REAR': 0.08},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.60, 'speed_index': 0.62,
+        'notes': '皐月賞への前哨戦。中山内回り1800mでコーナリング・先行力が問われる。',
+        'aliases': ['スプリングS'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['corner', 'stamina', 'gate'],
+        'draw_tendency': 'inner',
+    },
+    '共同通信杯': {
+        'grade': 'G3', 'venue': '東京', 'surface': 'turf', 'distance': 1800,
+        'month': [2],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.05, 'stamina_index': 0.58, 'speed_index': 0.72,
+        'notes': '3歳クラシック路線への登竜門。東京1800mで差し有利。上がり能力が最重要。',
+        'aliases': ['共同通信杯', 'きょうどうつうしんはい'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 1.0, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'neutral',
+    },
+    'きさらぎ賞': {
+        'grade': 'G3', 'venue': '中京', 'surface': 'turf', 'distance': 1800,
+        'month': [2],
+        'style_bias': {'FRONT': -0.02, 'MIDDLE': 0.14, 'REAR': 0.14},
+        'pace_tendency': 'ML', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.60, 'speed_index': 0.68,
+        'notes': '3歳クラシック路線の前哨戦（関西）。中京1800mで差しも届く。上がり能力が問われる。',
+        'aliases': ['きさらぎ賞', 'きさらぎしょう'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'straight', 'agility'],
+        'draw_tendency': 'neutral',
+    },
+    'クイーンカップ': {
+        'grade': 'G3', 'venue': '東京', 'surface': 'turf', 'distance': 1600,
+        'month': [2],
+        'style_bias': {'FRONT': -0.04, 'MIDDLE': 0.14, 'REAR': 0.16},
+        'pace_tendency': 'M', 'pace_adj': 0.5,
+        'ability_weight': 1.00, 'stamina_index': 0.48, 'speed_index': 0.80,
+        'notes': '牝馬クラシック路線への前哨戦。東京1600mで差し有利。上がり能力が問われる。',
+        'aliases': ['クイーンC', 'クイーンカップ'],
+        'anchor_score_bonus': 0.0, 'rival_penalty': 0.0,
+        'class_jump_penalty': 0.5, 'repeat_winner_bonus': 0.5,
+        'key_factors': ['speed', 'agility', 'straight'],
+        'draw_tendency': 'neutral',
+    },
+}
+
+# =============================================================================
+# JRA 重賞データ – エイリアス逆引きインデックス
+# =============================================================================
+_GRADED_RACE_ALIAS_INDEX: Dict[str, str] = {}
+for _rname, _rdat in JRA_GRADED_RACES_DATA.items():
+    _GRADED_RACE_ALIAS_INDEX[_rname] = _rname
+    for _al in (_rdat.get('aliases') or []):
+        _GRADED_RACE_ALIAS_INDEX[_al] = _rname
+
+
+def _detect_graded_race(meta: Dict[str, str]) -> Optional[Dict]:
+    """meta からレース名を解析して JRA_GRADED_RACES_DATA の該当レース辞書を返す。
+
+    マッチしなければ None を返す。
+
+    検索順:
+      1. meta の 'race_name' / 'race' / 'course_info' / 'class_name' キーをそれぞれ走査
+      2. エイリアスインデックス（部分一致でも可）で最長マッチを採用
+      3. 距離・馬場のクロスチェックで誤検出を排除（距離が±200m以上離れている場合は不採用）
+    """
+    meta = meta or {}
+    candidate_keys = ['race_name', 'race', 'course_info', 'class_name', 'grade']
+    texts = []
+    for k in candidate_keys:
+        v = str(meta.get(k, '') or '')
+        if v:
+            texts.append(v)
+    search_text = ' '.join(texts).replace('　', ' ')
+
+    # 完全一致 → エイリアス完全一致 → 部分一致 の順で試みる
+    best_key: Optional[str] = None
+    best_len = 0
+
+    for alias, canonical in _GRADED_RACE_ALIAS_INDEX.items():
+        if alias in search_text:
+            if len(alias) > best_len:
+                best_len = len(alias)
+                best_key = canonical
+
+    if best_key is None:
+        return None
+
+    race_data = JRA_GRADED_RACES_DATA.get(best_key)
+    if race_data is None:
+        return None
+
+    # 距離クロスチェック（meta に距離情報があれば）
+    try:
+        dist_m, surface = _meta_distance_surface(meta)
+        if np.isfinite(dist_m) and dist_m > 0:
+            expected_dist = int(race_data.get('distance', 0) or 0)
+            if expected_dist > 0 and abs(float(dist_m) - float(expected_dist)) > 300.0:
+                # 距離が300m以上ずれている場合は別レースと判断し不採用
+                return None
+    except Exception:
+        pass
+
+    result = dict(race_data)
+    result['_matched_name'] = best_key
+    return result
+
+
+def compute_graded_race_bonus(
+    df: pd.DataFrame,
+    meta: Dict[str, str],
+    params: Optional[dict] = None,
+) -> pd.DataFrame:
+    """重賞特化傾向に基づいて AnchorScore および関連スコアを補正する。
+
+    重賞レースが検出された場合のみ補正を行う。
+
+    補正内容:
+      1. style_bias 補正: 脚質（RunningStyleLabel）に応じた AnchorScore 加点
+      2. stamina 補正: StaminaScore と race の stamina_index の乖離によるペナルティ/ボーナス
+      3. speed 補正: SpeedScore と race の speed_index の乖離によるペナルティ/ボーナス
+      4. key_factors 補正: レース固有の key_factors が高い馬へのボーナス
+      5. repeat_winner_bonus: 同コース実績のある馬へのボーナス（course_track_exp 列があれば）
+      6. class_jump_penalty: 格上げ初戦馬へのペナルティ（class_jump 列があれば）
+
+    Returns:
+        補正済み DataFrame（元の df をコピーして修正）
+    """
+    params = params or {}
+    race_data = _detect_graded_race(meta)
+    if race_data is None:
+        return df  # 重賞でなければ無補正
+
+    df = df.copy()
+    graded_params = (params.get('graded_race_params', {}) or {})
+    enabled = bool(graded_params.get('enabled', True))
+    if not enabled:
+        return df
+
+    style_bias_scale = float(graded_params.get('style_bias_scale', 3.0) or 3.0)
+    stamina_scale    = float(graded_params.get('stamina_scale', 2.5) or 2.5)
+    speed_scale      = float(graded_params.get('speed_scale', 2.0) or 2.0)
+    key_factor_scale = float(graded_params.get('key_factor_scale', 1.5) or 1.5)
+    bonus_cap        = float(graded_params.get('bonus_cap', 6.0) or 6.0)
+    penalty_cap      = float(graded_params.get('penalty_cap', 4.0) or 4.0)
+
+    style_bias      = race_data.get('style_bias', {}) or {}
+    stamina_index   = float(race_data.get('stamina_index', 0.5) or 0.5)
+    speed_index     = float(race_data.get('speed_index', 0.5) or 0.5)
+    key_factors     = list(race_data.get('key_factors', []) or [])
+    repeat_bonus    = float(race_data.get('repeat_winner_bonus', 0.0) or 0.0)
+    class_pen       = float(race_data.get('class_jump_penalty', 0.0) or 0.0)
+
+    anchor_col = 'AnchorScore'
+    if anchor_col not in df.columns:
+        df[anchor_col] = 50.0
+
+    # ---- 1. 脚質スタイルバイアス補正 ----
+    if style_bias:
+        style_col = 'RunningStyleLabel'
+        if style_col in df.columns:
+            for style_key, bias_val in style_bias.items():
+                mask = df[style_col].astype(str).str.upper() == str(style_key).upper()
+                adj = float(bias_val) * style_bias_scale
+                adj = float(np.clip(adj, -penalty_cap, bonus_cap))
+                df.loc[mask, anchor_col] = _num_series(df.loc[mask, anchor_col], 50.0, index=df.loc[mask].index) + adj
+
+    # ---- 2. スタミナ適性補正 ----
+    stamina_col = 'StaminaScore'
+    if stamina_col in df.columns:
+        stam = _num_series(df[stamina_col], 50.0, index=df.index)
+        # StaminaScore 50=平均、高いほど長距離向き。差分を重賞のstamina_index基準で補正
+        stam_norm = (stam - 50.0) / 25.0  # -2.0 〜 +2.0
+        stam_adj  = stam_norm * (stamina_index - 0.5) * stamina_scale
+        stam_adj  = stam_adj.clip(lower=-penalty_cap, upper=bonus_cap).fillna(0.0)
+        df[anchor_col] = _num_series(df[anchor_col], 50.0, index=df.index) + stam_adj
+
+    # ---- 3. スピード適性補正 ----
+    speed_col = 'SpeedScore'
+    if speed_col not in df.columns:
+        speed_col = 'speed_max'
+    if speed_col in df.columns:
+        spd = _num_series(df[speed_col], 50.0, index=df.index)
+        spd_norm  = (spd - 50.0) / 25.0
+        spd_adj   = spd_norm * (speed_index - 0.5) * speed_scale
+        spd_adj   = spd_adj.clip(lower=-penalty_cap, upper=bonus_cap).fillna(0.0)
+        df[anchor_col] = _num_series(df[anchor_col], 50.0, index=df.index) + spd_adj
+
+    # ---- 4. key_factors 補正 ----
+    key_factor_col_map = {
+        'stamina': 'StaminaScore',
+        'speed': ['SpeedScore', 'speed_max'],
+        'corner': 'CornerScore',
+        'power': 'PowerScore',
+        'gate': 'GateFit',
+        'agility': 'AgilityScore',
+        'straight': 'StraightScore',
+    }
+    for kf in key_factors:
+        cols = key_factor_col_map.get(kf, [])
+        if isinstance(cols, str):
+            cols = [cols]
+        for col in cols:
+            if col in df.columns:
+                kf_val = _num_series(df[col], 50.0, index=df.index)
+                kf_adj = (kf_val - 50.0) / 25.0 * key_factor_scale
+                kf_adj = kf_adj.clip(lower=-(penalty_cap*0.5), upper=(bonus_cap*0.5)).fillna(0.0)
+                df[anchor_col] = _num_series(df[anchor_col], 50.0, index=df.index) + kf_adj
+                break
+
+    # ---- 5. リピーターボーナス ----
+    if repeat_bonus > 0:
+        for col in ['course_track_exp', 'same_course_win', 'venue_win']:
+            if col in df.columns:
+                rep_mask = _num_series(df[col], 0.0, index=df.index) > 0
+                df.loc[rep_mask, anchor_col] = _num_series(df.loc[rep_mask, anchor_col], 50.0, index=df.loc[rep_mask].index) + repeat_bonus
+                break
+
+    # ---- 6. 格上げ初戦ペナルティ ----
+    if class_pen > 0:
+        for col in ['class_jump', 'class_up', 'is_class_jump']:
+            if col in df.columns:
+                jump_mask = _num_series(df[col], 0.0, index=df.index) > 0
+                df.loc[jump_mask, anchor_col] = _num_series(df.loc[jump_mask, anchor_col], 50.0, index=df.loc[jump_mask].index) - class_pen
+                break
+
+    # ---- AnchorScore をクリップ（0-100）----
+    df[anchor_col] = _num_series(df[anchor_col], 50.0, index=df.index).clip(lower=0.0, upper=100.0)
+
+    # ---- 補正フラグを記録 ----
+    df['_graded_race_bonus_applied'] = True
+    df['_graded_race_name']          = race_data.get('_matched_name', '')
+    df['_graded_race_grade']         = race_data.get('grade', '')
+
+    return df
+
+
+def _bam_section_graded_race_analysis(
+    df: pd.DataFrame,
+    meta: Dict[str, str],
+    anchor_num: str,
+    params: Optional[dict] = None,
+) -> str:
+    """重賞特化傾向セクションを Markdown 文字列で返す。
+
+    重賞レースが検出された場合のみ詳細セクションを出力し、
+    一般レースの場合は空文字列を返す（出力に影響しない）。
+    """
+    race_data = _detect_graded_race(meta)
+    if race_data is None:
+        return ''
+
+    grade       = str(race_data.get('grade', ''))
+    race_name   = str(race_data.get('_matched_name', '重賞'))
+    venue       = str(race_data.get('venue', ''))
+    surface_raw = str(race_data.get('surface', ''))
+    distance    = int(race_data.get('distance', 0) or 0)
+    surface_jp  = '芝' if surface_raw == 'turf' else 'ダート' if surface_raw == 'dirt' else surface_raw
+    pace_tend   = str(race_data.get('pace_tendency', 'M'))
+    style_bias  = race_data.get('style_bias', {}) or {}
+    stamina_idx = float(race_data.get('stamina_index', 0.5) or 0.5)
+    speed_idx   = float(race_data.get('speed_index', 0.5) or 0.5)
+    key_factors = list(race_data.get('key_factors', []) or [])
+    notes       = str(race_data.get('notes', '') or '')
+    draw_tend   = str(race_data.get('draw_tendency', 'neutral') or 'neutral')
+    month_list  = race_data.get('month', []) or []
+
+    out = f'## 【重賞特化分析】{grade}: {race_name}\n\n'
+
+    # --- 基本情報テーブル ---
+    out += '### レース基本情報\n'
+    out += '| 項目 | 内容 |\n'
+    out += '|---|---|\n'
+    out += f'| グレード | **{grade}** |\n'
+    out += f'| 条件 | {venue} {surface_jp} {distance}m |\n'
+    pace_jp = {'H': 'ハイ', 'MH': 'ミドルハイ', 'M': 'ミドル', 'ML': 'ミドルロー', 'S': 'スロー'}.get(pace_tend, pace_tend)
+    out += f'| ペース傾向 | {pace_jp} |\n'
+    draw_jp = {'inner': '内枠有利', 'outer': '外枠有利', 'neutral': '枠不問'}.get(draw_tend, draw_tend)
+    out += f'| 枠順傾向 | {draw_jp} |\n'
+    if month_list:
+        out += f'| 施行月 | {", ".join(str(m)+"月" for m in month_list)} |\n'
+    out += '\n'
+
+    # --- 脚質傾向 ---
+    out += '### 脚質傾向（重賞固有バイアス）\n'
+    out += '| 脚質 | バイアス | 評価 |\n'
+    out += '|---|---:|---|\n'
+    style_jp = {'FRONT': '先行', 'MIDDLE': '差し', 'REAR': '追い込み'}
+    for style_key in ['FRONT', 'MIDDLE', 'REAR']:
+        bias_val = float(style_bias.get(style_key, 0.0))
+        bar = '◎' if bias_val >= 0.20 else '○' if bias_val >= 0.05 else '△' if bias_val >= -0.05 else '▲' if bias_val >= -0.20 else '×'
+        out += f'| {style_jp.get(style_key, style_key)} | {bias_val:+.2f} | {bar} |\n'
+    out += '\n'
+
+    # --- 要求適性 ---
+    out += '### 要求適性指数\n'
+    out += '| 適性 | 指数 | コメント |\n'
+    out += '|---|---:|---|\n'
+    stam_lv = 'very high' if stamina_idx >= 0.80 else 'high' if stamina_idx >= 0.65 else 'medium' if stamina_idx >= 0.45 else 'low'
+    spd_lv  = 'very high' if speed_idx  >= 0.80 else 'high' if speed_idx  >= 0.65 else 'medium' if speed_idx  >= 0.45 else 'low'
+    stam_jp = {'very high': '最重要', 'high': '重要', 'medium': '標準', 'low': '軽微'}
+    spd_jp  = stam_jp
+    out += f'| スタミナ | {stamina_idx:.2f} | {stam_jp[stam_lv]} |\n'
+    out += f'| スピード | {speed_idx:.2f} | {spd_jp[spd_lv]} |\n'
+    if key_factors:
+        kf_jp = {'stamina': 'スタミナ', 'speed': 'スピード', 'corner': 'コーナリング',
+                 'power': 'パワー', 'gate': 'ゲート', 'agility': '機動力', 'straight': '直線適性'}
+        out += f'| キーファクター | — | {", ".join(kf_jp.get(kf, kf) for kf in key_factors)} |\n'
+    out += '\n'
+
+    # --- 重賞固有コメント ---
+    if notes:
+        out += '### 重賞傾向メモ\n'
+        out += f'> {notes}\n\n'
+
+    # --- 出走馬への適性評価サマリー ---
+    try:
+        out += '### 出走馬 重賞適性サマリー\n'
+        sdf = df.copy()
+        style_col = 'RunningStyleLabel'
+        has_style = style_col in sdf.columns
+
+        rows = []
+        for _, row in sdf.iterrows():
+            num  = str(row.get('num', ''))
+            name = str(row.get('name', ''))
+            sas  = float(_num_scalar(row.get('AnchorScore', 50.0), 50.0))
+
+            # 脚質評価
+            style_eval = ''
+            if has_style:
+                st = str(row.get(style_col, '')).upper()
+                bv = float(style_bias.get(st, 0.0))
+                style_eval = '◎' if bv >= 0.20 else '○' if bv >= 0.05 else '△' if bv >= -0.05 else '▲'
+            else:
+                style_eval = '—'
+
+            # スタミナ評価
+            stam_score = float(_num_scalar(row.get('StaminaScore', 50.0), 50.0))
+            stam_match = '◎' if (abs(stam_score - 50) < 5 and stamina_idx >= 0.7) or (stam_score >= 60 and stamina_idx >= 0.7) else \
+                         '○' if stam_score >= 55 and stamina_idx >= 0.5 else '△'
+
+            rows.append((num, name, f'{sas:.1f}', style_eval, stam_match))
+
+        # AnchorScore 降順にソート
+        rows.sort(key=lambda x: float(x[2]), reverse=True)
+        out += '| 馬番 | 馬名 | AnchorScore | 脚質適合 | スタミナ適合 |\n'
+        out += '|---|---|---:|---:|---:|\n'
+        for r in rows[:8]:
+            out += f'| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} |\n'
+        out += '\n'
+    except Exception:
+        out += '- 適性サマリー: 算出失敗\n\n'
+
+    return out
+
+
 def _course_patch(*, style: Optional[Dict[str, float]] = None, straight: float = 0.0, corner: float = 0.0,
                   stamina: float = 0.0, power: float = 0.0, speed: float = 0.0, gate: float = 0.0,
                   agility: float = 0.0, draw: Optional[Dict[str, float]] = None, label: str = '') -> Dict[str, object]:
@@ -22139,8 +23607,22 @@ def _bam_section_header(meta: dict, race: str, pace: str, bias: str, map_summary
         out += f'- race: {race}\n'
     out += f'- pace: {pace}\n- bias: {bias}\n- map_summary: {map_summary}\n\n'
 
-
-
+    # ---- 重賞バッジ表示 ----
+    try:
+        _gr_hdr = _detect_graded_race(meta)
+        if _gr_hdr is not None:
+            _gr_grade = str(_gr_hdr.get('grade', ''))
+            _gr_name  = str(_gr_hdr.get('_matched_name', ''))
+            _gr_venue = str(_gr_hdr.get('venue', ''))
+            _gr_surf  = '芝' if _gr_hdr.get('surface') == 'turf' else 'ダート'
+            _gr_dist  = int(_gr_hdr.get('distance', 0) or 0)
+            _gr_pace  = str(_gr_hdr.get('pace_tendency', 'M'))
+            _pace_jp  = {'H': 'ハイ', 'MH': 'ミドルハイ', 'M': 'ミドル', 'ML': 'ミドルロー', 'S': 'スロー'}.get(_gr_pace, _gr_pace)
+            _gr_draw  = str(_gr_hdr.get('draw_tendency', 'neutral'))
+            _draw_jp  = {'inner': '内枠有利', 'outer': '外枠有利', 'neutral': '枠不問'}.get(_gr_draw, _gr_draw)
+            out += f'> **🏆 {_gr_grade}: {_gr_name}** | {_gr_venue} {_gr_surf} {_gr_dist}m | ペース傾向: {_pace_jp} | {_draw_jp}\n\n'
+    except Exception:
+        pass
 
     # -------------------------
     # 調教（keibabook）サマリ：全体時計+終い（表示は監査用）
@@ -23391,12 +24873,17 @@ def _bsa_next_race(d0, params: dict) -> str:
 def _bam_section_analysis(d0, meta: dict, anchor_num: str, params: dict) -> str:
     """調教×コメント要点・最終結論（印）・スコア表を Markdown 文字列で返す。
 
-    4つのサブセクション (_bsa_*) を呼び出すオーケストレータ。
+    4つのサブセクション (_bsa_*) + 重賞特化分析セクションを呼び出すオーケストレータ。
     """
     out = ''
     out += _bsa_training_table(d0)
     out += _bsa_final_verdict(d0, anchor_num, params)
     out += _bsa_score_table(d0, meta, params)
+    # ---- 重賞特化分析セクション（重賞レース検出時のみ出力）----
+    try:
+        out += _bam_section_graded_race_analysis(d0, meta, anchor_num, params)
+    except Exception:
+        pass
     out += _bsa_next_race(d0, params)
     return out
 
@@ -24941,6 +26428,21 @@ def _main_score_and_anchor(args, entries: "pd.DataFrame", meta: dict, params: di
                 pass
 
     scored = add_meta_derived_features(scored, meta, params)
+
+    # ---- 重賞特化スコア補正（重賞検出時のみ適用）----
+    try:
+        scored = compute_graded_race_bonus(scored, meta, params)
+        _gr = _detect_graded_race(meta)
+        if _gr is not None:
+            import sys as _sys_gr
+            print(f"[重賞] {_gr.get('grade','')} {_gr.get('_matched_name','')} 検出 → 脚質/適性バイアス補正適用", file=_sys_gr.stderr)
+    except Exception as _e_gr:
+        try:
+            import sys as _sys_gr2
+            print(f'[WARN] graded_race_bonus failed: {_e_gr}', file=_sys_gr2.stderr)
+        except Exception:
+            pass
+
     anchor = select_anchor(scored, params=params)
     anchor_num = str(anchor.get('num', '')).strip()
 
