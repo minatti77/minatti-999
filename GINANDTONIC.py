@@ -911,6 +911,46 @@ DEFAULT_PARAMS = {
         # ペースクラスタ表示（重賞/OP レースのみ）
         'show_pace_cluster': True,
     },
+
+    # ===== WINDEX指数統合設定 (v1.35) =====
+    # WINDEXは競馬専門AI予想の5軸スコア（基礎能力値・血統・枠順展開・走破タイム・騎手×調教師）
+    # 入力カラム: windex_score(総合), windex_kiso(基礎), windex_blood(血統),
+    #             windex_hatten(展開), windex_time(走破タイム), windex_jockey(騎手×調教師)
+    # いずれも 0〜100 スケール（生データはそのまま渡す）
+    'windex_params': {
+        # True の間は WINDEX データがある行のみ反映（ない行は従来計算をそのまま使用）
+        'enabled': True,
+
+        # --- 各サブスコアの内部特徴量への反映強度 ---
+        # windex_kiso(基礎能力) → Ability へのブレンド率 (0.0〜1.0)
+        #   0.0 = 既存Abilityをそのまま使用, 1.0 = windex_kisoで完全置換
+        'kiso_blend': 0.30,
+
+        # windex_hatten(展開適性) → PosFit へのブレンド率
+        'hatten_blend': 0.25,
+
+        # windex_time(走破タイム) → Consist へのブレンド率
+        'time_blend': 0.20,
+
+        # windex_blood(血統) → FactorFit へのブレンド率
+        'blood_blend': 0.20,
+
+        # windex_jockey(騎手×調教師) → 独自ボーナスとして AnchorScore に加算
+        # windex_jockey_scale × (windex_jockey - 50) / 50 を AnchorScore に加算
+        # 例: windex_jockey=70 → +1.0点, windex_jockey=30 → -1.0点
+        'jockey_scale': 2.5,
+
+        # --- AnchorScore への直接ブレンド ---
+        # windex_score(総合) を AnchorScore に直接ブレンドする割合
+        # final_anchor = (1 - anchor_blend) * existing_anchor + anchor_blend * windex_score
+        'anchor_blend': 0.15,
+
+        # windex_score が有効とみなす最低値（これ未満の行は windex を無視）
+        'min_valid_score': 1.0,
+
+        # 正規化方式: 'raw'=そのまま使用, 'race'=レース内相対正規化(0〜100)
+        'normalize_mode': 'race',
+    },
 }
 
 
@@ -14490,6 +14530,171 @@ def _detect_graded_race(meta: Dict[str, str]) -> Optional[Dict]:
     return result
 
 
+def compute_windex_features(
+    df: pd.DataFrame,
+    params: dict,
+) -> pd.DataFrame:
+    """WINDEX指数（5軸スコア）を入力特徴量として内部スコアに反映する。(v1.35)
+
+    入力カラム（0〜100スケール）:
+        windex_score  : WINDEX総合指数
+        windex_kiso   : 基礎能力値
+        windex_blood  : 血統
+        windex_hatten : 枠順・展開
+        windex_time   : 走破タイム
+        windex_jockey : 騎手×調教師
+
+    反映先:
+        Ability    ← windex_kiso とのブレンド
+        PosFit     ← windex_hatten とのブレンド
+        Consist    ← windex_time とのブレンド
+        FactorFit  ← windex_blood とのブレンド
+        AnchorScore← windex_score を直接ブレンド + windex_jockey ボーナス
+
+    WINDEXデータが存在しない行（windex_score が NaN または min_valid_score 未満）は
+    既存の計算値をそのまま使用する（透過）。
+    """
+    wp = (params.get('windex_params', {}) or {})
+    if not wp.get('enabled', True):
+        return df
+
+    _n = len(df)
+    _idx = df.index
+
+    # --- 入力カラムを数値に変換 ---
+    def _wdx_arr(col: str) -> np.ndarray:
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors='coerce').values.astype(np.float64)
+        return np.full(_n, np.nan, dtype=np.float64)
+
+    w_score   = _wdx_arr('windex_score')
+    w_kiso    = _wdx_arr('windex_kiso')
+    w_blood   = _wdx_arr('windex_blood')
+    w_hatten  = _wdx_arr('windex_hatten')
+    w_time    = _wdx_arr('windex_time')
+    w_jockey  = _wdx_arr('windex_jockey')
+
+    # --- 有効マスク（windex_score が存在し min_valid_score 以上の行のみ反映） ---
+    min_valid = float(wp.get('min_valid_score', 1.0))
+    valid_mask = np.isfinite(w_score) & (w_score >= min_valid)
+
+    if not np.any(valid_mask):
+        # WINDEXデータが全行ない → 何もしない
+        return df
+
+    # --- レース内相対正規化（normalize_mode='race'の場合） ---
+    norm_mode = str(wp.get('normalize_mode', 'race'))
+
+    def _race_norm(arr: np.ndarray) -> np.ndarray:
+        """有効行のみ 0〜100 に再正規化（全行無効の場合はそのまま）。"""
+        if norm_mode != 'race':
+            return arr.copy()
+        out = arr.copy()
+        valid = np.isfinite(arr) & valid_mask
+        if valid.sum() < 2:
+            return out
+        v_min = arr[valid].min()
+        v_max = arr[valid].max()
+        rng = v_max - v_min
+        if rng < 1e-6:
+            out[valid] = 50.0
+        else:
+            out[valid] = (arr[valid] - v_min) / rng * 100.0
+        return out
+
+    wn_score  = _race_norm(w_score)
+    wn_kiso   = _race_norm(w_kiso)
+    wn_blood  = _race_norm(w_blood)
+    wn_hatten = _race_norm(w_hatten)
+    wn_time   = _race_norm(w_time)
+    wn_jockey = _race_norm(w_jockey)
+
+    # --- ブレンド率 ---
+    kiso_blend   = float(wp.get('kiso_blend',   0.30))
+    hatten_blend = float(wp.get('hatten_blend', 0.25))
+    time_blend   = float(wp.get('time_blend',   0.20))
+    blood_blend  = float(wp.get('blood_blend',  0.20))
+    anchor_blend = float(wp.get('anchor_blend', 0.15))
+    jockey_scale = float(wp.get('jockey_scale', 2.5))
+
+    # --- Ability ← windex_kiso ブレンド ---
+    if 'Ability' in df.columns and np.any(valid_mask & np.isfinite(wn_kiso)):
+        ability_arr = pd.to_numeric(df['Ability'], errors='coerce').fillna(50.0).values.astype(np.float64)
+        blended = np.where(
+            valid_mask & np.isfinite(wn_kiso),
+            np.clip((1.0 - kiso_blend) * ability_arr + kiso_blend * wn_kiso, 0.0, 100.0),
+            ability_arr
+        )
+        df['Ability'] = _make_series(blended, _idx)
+
+    # --- PosFit ← windex_hatten ブレンド ---
+    if 'PosFit' in df.columns and np.any(valid_mask & np.isfinite(wn_hatten)):
+        posfit_arr = pd.to_numeric(df['PosFit'], errors='coerce').fillna(50.0).values.astype(np.float64)
+        blended = np.where(
+            valid_mask & np.isfinite(wn_hatten),
+            np.clip((1.0 - hatten_blend) * posfit_arr + hatten_blend * wn_hatten, 0.0, 100.0),
+            posfit_arr
+        )
+        df['PosFit'] = _make_series(blended, _idx)
+
+    # --- Consist ← windex_time ブレンド ---
+    if 'Consist' in df.columns and np.any(valid_mask & np.isfinite(wn_time)):
+        consist_arr = pd.to_numeric(df['Consist'], errors='coerce').fillna(50.0).values.astype(np.float64)
+        blended = np.where(
+            valid_mask & np.isfinite(wn_time),
+            np.clip((1.0 - time_blend) * consist_arr + time_blend * wn_time, 0.0, 100.0),
+            consist_arr
+        )
+        df['Consist'] = _make_series(blended, _idx)
+
+    # --- FactorFit ← windex_blood ブレンド ---
+    if 'FactorFit' in df.columns and np.any(valid_mask & np.isfinite(wn_blood)):
+        factorfit_arr = pd.to_numeric(df['FactorFit'], errors='coerce').fillna(50.0).values.astype(np.float64)
+        blended = np.where(
+            valid_mask & np.isfinite(wn_blood),
+            np.clip((1.0 - blood_blend) * factorfit_arr + blood_blend * wn_blood, 0.0, 100.0),
+            factorfit_arr
+        )
+        df['FactorFit'] = _make_series(blended, _idx)
+
+    # --- AnchorScore ← windex_score 直接ブレンド + jockey ボーナス ---
+    if 'AnchorScore' in df.columns and np.any(valid_mask & np.isfinite(wn_score)):
+        anchor_arr = pd.to_numeric(df['AnchorScore'], errors='coerce').fillna(50.0).values.astype(np.float64)
+
+        # windex_score ブレンド
+        blended_anchor = np.where(
+            valid_mask & np.isfinite(wn_score),
+            np.clip((1.0 - anchor_blend) * anchor_arr + anchor_blend * wn_score, 0.0, 100.0),
+            anchor_arr
+        )
+
+        # windex_jockey ボーナス（±jockey_scale 点の範囲）
+        jockey_bonus = np.where(
+            valid_mask & np.isfinite(wn_jockey),
+            jockey_scale * (wn_jockey - 50.0) / 50.0,
+            0.0
+        )
+        final_anchor = np.clip(blended_anchor + jockey_bonus, 0.0, 100.0)
+        df['AnchorScore'] = _make_series(final_anchor, _idx)
+
+        # SASにも同様に反映（AnchorScoreと整合性を保つ）
+        if 'SAS' in df.columns:
+            sas_arr = pd.to_numeric(df['SAS'], errors='coerce').fillna(50.0).values.astype(np.float64)
+            blended_sas = np.where(
+                valid_mask & np.isfinite(wn_score),
+                np.clip((1.0 - anchor_blend) * sas_arr + anchor_blend * wn_score, 0.0, 100.0),
+                sas_arr
+            )
+            df['SAS'] = _make_series(blended_sas, _idx)
+
+    # --- WINDEX生値カラムを保存（audit用） ---
+    for _col in ['windex_score', 'windex_kiso', 'windex_blood', 'windex_hatten', 'windex_time', 'windex_jockey']:
+        if _col not in df.columns:
+            df[_col] = np.nan
+
+    return df
+
+
 def compute_graded_race_bonus(
     df: pd.DataFrame,
     meta: Dict[str, str],
@@ -20121,6 +20326,11 @@ def _csv_neutral_return(
         df = pd.concat([df, pd.DataFrame(_all_computed, index=_df_idx)], axis=1)
 
         logs = {"rating_min": None, "rating_max": None, "speed_min": None, "speed_max": None}
+        # ── WINDEX統合（ニュートラルパスでも反映）────────────────
+        try:
+            df = compute_windex_features(df, params)
+        except Exception:
+            pass
         return df, logs, AuditFlags(audit_flag="NO_BET(data_missing)", reason="rating/speed_max missing")
     return None
 
@@ -22331,6 +22541,15 @@ def compute_scores_v1_1(entries: pd.DataFrame, meta: Dict[str, str], params: Opt
 
     # ── SAS / AnchorScore ───────────────────────────────────────
     df = _csv_compute_sas(df, meta, params)
+
+    # ── WINDEX指数統合 (v1.35) ──────────────────────────────────
+    # windex_score/kiso/blood/hatten/time/jockey 列が存在する場合に
+    # Ability/PosFit/Consist/FactorFit/AnchorScore へブレンド適用。
+    # 列が存在しない行・データなし行は透過（既存計算値をそのまま使用）。
+    try:
+        df = compute_windex_features(df, params)
+    except Exception:
+        pass  # WINDEX処理失敗時は既存スコアで継続
 
     # ── WPS / 勝ち馬・複勝軸候補スコア ─────────────────────────
     df = _csv_compute_wps_win_scores(df, meta, params)
