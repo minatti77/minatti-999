@@ -208,9 +208,9 @@ def _estimate_trio_probabilities(
         for combo, cnt in combo_counts.items():
             p_mean = cnt / n_samples
             # ベータ分布の CI 下限（簡易）
-            _ = cnt + 1.0
-            _ = n_samples - cnt + 1.0
-            p_low = max(0.0, p_mean - z_ci * _np.sqrt(p_mean * (1 - p_mean) / n_samples))
+            _alpha = cnt + 1.0
+            _beta  = n_samples - cnt + 1.0
+            p_low = max(0.0, p_mean - z_ci * _np.sqrt(_alpha * _beta / ((n_samples + 2) ** 2 * (n_samples + 3))))
             rows.append({'num1': combo[0], 'num2': combo[1], 'num3': combo[2],
                          'p_trio_mean': p_mean * 100.0,
                          'p_trio_low':  p_low  * 100.0,
@@ -3307,8 +3307,8 @@ def _r43_wide_strategy_grid(
     for n in n_range:
         n_races = len(sub)
         invest = n_races * n * stake_per
-        wh = _pd52.to_numeric(sub['wide_hit_count'], errors='coerce').fillna(0.0)
-        payouts = _pd52.to_numeric(sub['payout_wide_max'], errors='coerce').fillna(0.0)
+        wh = pd.to_numeric(sub['wide_hit_count'], errors='coerce').fillna(0.0)
+        payouts = pd.to_numeric(sub['payout_wide_max'], errors='coerce').fillna(0.0)
         ret_total = float((wh * payouts * (stake_per / 100.0)).sum())
         n_hit = int((wh > 0).sum())
         roi = (ret_total - invest) / invest * 100.0 if invest > 0 else 0.0
@@ -3864,7 +3864,7 @@ def _r44_trio_cost_benefit(
     n_hit = int(hit_mask.sum())
     hit_rate = n_hit / n if n > 0 else 0.0
 
-    payouts = _pd52.to_numeric(sub['payout_sanrenpuku'], errors='coerce').fillna(0.0) if 'payout_sanrenpuku' in sub.columns else pd.Series([0.0]*n)
+    payouts = pd.to_numeric(sub['payout_sanrenpuku'], errors='coerce').fillna(0.0) if 'payout_sanrenpuku' in sub.columns else pd.Series([0.0]*n)
     ret_total = float((payouts * hit_mask.astype(float) * (stake_per / 100.0)).sum())
     roi = (ret_total - invest_total) / invest_total * 100.0 if invest_total > 0 else 0.0
     avg_pay = float(payouts[hit_mask].mean()) if n_hit > 0 else 0.0
@@ -29218,7 +29218,7 @@ def backtest_pnl_from_row(row: dict) -> dict:
     for (a, b) in wide_pairs:
         pair = {a, b}
         if pair.issubset(result3):
-            _ = f'payout_wide_{min(a,b,_key=lambda x:int(x) if x.isdigit() else 99)}'
+            _ = f'payout_wide_{min([a, b], key=lambda x: int(x) if x.isdigit() else 99)}'
             # payout_wide_12/13/23 のいずれかを参照
             w12 = float(row.get('payout_wide_12', 0.0) or 0.0)
             w13 = float(row.get('payout_wide_13', 0.0) or 0.0)
