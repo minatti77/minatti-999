@@ -912,6 +912,25 @@ DEFAULT_PARAMS = {
         'show_pace_cluster': True,
     },
 
+    # ===== 各競馬場コース別血統適性設定 (v1.36) =====
+    'course_pedigree_params': {
+        'enabled': True,
+        # 父が top_sires に入っていた場合の加点
+        'top_sire_score': 15.0,
+        # 系統（sire_line）がマッチした場合の加点
+        'sire_line_score': 8.0,
+        # 母父が top_sires に入っていた場合の加点
+        'dam_sire_score': 10.0,
+        # 道悪時に wet_affinity 種牡馬への加点
+        'wet_affinity_score': 5.0,
+        # 父×母父クロスボーナス
+        'cross_bonus_score': 5.0,
+        # CoursePedigreeBonus の AnchorScore 加算上限（±点）
+        'bonus_cap': 4.0,
+        # CoursePedigreeFit を AnchorScore に反映する割合
+        'anchor_apply_scale': 0.06,
+    },
+
     # ===== WINDEX指数統合設定 (v1.35) =====
     # WINDEXは競馬専門AI予想の5軸スコア（基礎能力値・血統・枠順展開・走破タイム・騎手×調教師）
     # 入力カラム: windex_score(総合), windex_kiso(基礎), windex_blood(血統),
@@ -13332,6 +13351,634 @@ def _lgbm_skeleton_train(
 
 
 # =============================================================================
+# JRA 各競馬場×コース別 血統適性データ (v1.36)
+# JRA_COURSE_PEDIGREE_DATA
+# =============================================================================
+# キー構造:
+#   競馬場名 → surface(turf/dirt) → 距離(m) → 血統データ
+#
+# 各エントリ:
+#   top_sires      : 好成績種牡馬リスト（勝利数・複勝率上位）
+#   sire_lines     : 有利な種牡馬系統 (SS系/ND系/RB系/NT系/KK系 等)
+#   cross_bonus    : クロス血統ボーナス（〇〇×〇〇の組み合わせで加点）
+#   speed_sires    : スピード型に有利な種牡馬（短距離・高速馬場向き）
+#   stamina_sires  : スタミナ型に有利な種牡馬（長距離・タフ馬場向き）
+#   dirt_affinity  : ダート適性が高い血統系統
+#   wet_affinity   : 重・不良馬場で好成績の血統
+#   notes          : コース・血統傾向コメント
+# =============================================================================
+JRA_COURSE_PEDIGREE_DATA: Dict[str, Dict] = {
+
+    # =====================================================================
+    # 東京競馬場
+    # =====================================================================
+    '東京': {
+        'turf': {
+            1400: {
+                'top_sires': ['ロードカナロア', 'ダイワメジャー', 'キズナ', 'エピファネイア', 'モーリス',
+                              'ハービンジャー', 'ルーラーシップ', 'ディープインパクト'],
+                'sire_lines': ['ロベルト系', 'SS系', 'キングマンボ系', 'ストームキャット系'],
+                'speed_sires': ['ロードカナロア', 'ダイワメジャー', 'モーリス', 'ディープインパクト'],
+                'stamina_sires': ['キズナ', 'エピファネイア', 'ハービンジャー'],
+                'wet_affinity': ['ハービンジャー', 'ルーラーシップ', 'キズナ'],
+                'cross_bonus': [('サンデーサイレンス', 'ノーザンダンサー'), ('ディープインパクト', 'ストームキャット')],
+                'notes': '東京芝1400m。スピード・器用さが求められる。内枠有利。ロードカナロア・ダイワメジャー産駒が得意。直線長く末脚も重要。',
+            },
+            1600: {
+                'top_sires': ['ディープインパクト', 'キズナ', 'エピファネイア', 'モーリス', 'ロードカナロア',
+                              'ダイワメジャー', 'ハービンジャー', 'ルーラーシップ'],
+                'sire_lines': ['SS系', 'キングマンボ系', 'ロベルト系'],
+                'speed_sires': ['ロードカナロア', 'ダイワメジャー', 'モーリス'],
+                'stamina_sires': ['ディープインパクト', 'キズナ', 'エピファネイア', 'ハービンジャー'],
+                'wet_affinity': ['ハービンジャー', 'キズナ', 'ルーラーシップ'],
+                'cross_bonus': [('ディープインパクト', 'ストームキャット'), ('サンデーサイレンス', 'キングカメハメハ')],
+                'notes': '東京芝1600m。マイルCSへ続く名コース。直線長く差し馬有利。ディープ系・キズナ産駒が安定。',
+            },
+            2000: {
+                'top_sires': ['ディープインパクト', 'エピファネイア', 'キズナ', 'ハービンジャー', 'ルーラーシップ',
+                              'モーリス', 'サートゥルナーリア', 'ゴールドシップ'],
+                'sire_lines': ['SS系', 'ロベルト系', 'ND系'],
+                'speed_sires': ['モーリス', 'エピファネイア'],
+                'stamina_sires': ['ディープインパクト', 'キズナ', 'ハービンジャー', 'ルーラーシップ'],
+                'wet_affinity': ['ハービンジャー', 'キズナ', 'ルーラーシップ', 'ゴールドシップ'],
+                'cross_bonus': [('ディープインパクト', 'ストームキャット'), ('エピファネイア', 'キングカメハメハ')],
+                'notes': '東京芝2000m（天皇賞秋コース）。末脚・スタミナ両立が必要。ディープ系圧倒的優位。',
+            },
+            2400: {
+                'top_sires': ['ディープインパクト', 'キズナ', 'エピファネイア', 'ハービンジャー',
+                              'ゴールドシップ', 'ルーラーシップ', 'オルフェーヴル'],
+                'sire_lines': ['SS系', 'ND系', 'RB系'],
+                'speed_sires': ['エピファネイア'],
+                'stamina_sires': ['ディープインパクト', 'キズナ', 'ハービンジャー', 'オルフェーヴル', 'ゴールドシップ'],
+                'wet_affinity': ['ハービンジャー', 'キズナ', 'ゴールドシップ'],
+                'cross_bonus': [('ディープインパクト', 'ノーザンダンサー'), ('サンデーサイレンス', 'グレイソブリン')],
+                'notes': '東京芝2400m（日本ダービーコース）。スタミナ・末脚の総合力が必要。ディープ・キズナ産駒が非常に強い。',
+            },
+        },
+        'dirt': {
+            1400: {
+                'top_sires': ['ヘニーヒューズ', 'キングカメハメハ', 'ロードカナロア', 'パイロ', 'ゴールドアリュール'],
+                'sire_lines': ['MR系', 'デピュティミニスター系', 'キングマンボ系'],
+                'speed_sires': ['ヘニーヒューズ', 'ロードカナロア', 'パイロ'],
+                'stamina_sires': ['ゴールドアリュール', 'キングカメハメハ'],
+                'wet_affinity': ['ゴールドアリュール', 'キングカメハメハ'],
+                'cross_bonus': [('ヘニーヒューズ', 'サンデーサイレンス'), ('キングカメハメハ', 'デピュティミニスター')],
+                'notes': '東京ダート1400m。スピード型ダート血統が優位。ヘニーヒューズ産駒が強い。',
+            },
+            1600: {
+                'top_sires': ['ヘニーヒューズ', 'ゴールドアリュール', 'キングカメハメハ', 'パイロ', 'エスポワールシチー'],
+                'sire_lines': ['MR系', 'デピュティミニスター系', 'キングマンボ系'],
+                'speed_sires': ['ヘニーヒューズ', 'パイロ'],
+                'stamina_sires': ['ゴールドアリュール', 'キングカメハメハ'],
+                'wet_affinity': ['ゴールドアリュール'],
+                'cross_bonus': [('ヘニーヒューズ', 'サンデーサイレンス')],
+                'notes': '東京ダート1600m（フェブラリーS）。先行有利。パワー型が有利。',
+            },
+        },
+    },
+
+    # =====================================================================
+    # 中山競馬場
+    # =====================================================================
+    '中山': {
+        'turf': {
+            1200: {
+                'top_sires': ['ロードカナロア', 'ダイワメジャー', 'キングカメハメハ', 'ディープインパクト', 'スワーヴリチャード'],
+                'sire_lines': ['SS系', 'キングマンボ系', 'MR系'],
+                'speed_sires': ['ロードカナロア', 'ダイワメジャー'],
+                'stamina_sires': ['ディープインパクト', 'キングカメハメハ'],
+                'wet_affinity': ['キングカメハメハ', 'スワーヴリチャード'],
+                'cross_bonus': [('ロードカナロア', 'サンデーサイレンス')],
+                'notes': '中山芝1200m。小回りコーナー技術と先行力が重要。スピード血統有利。',
+            },
+            1600: {
+                'top_sires': ['ディープインパクト', 'エピファネイア', 'ダイワメジャー', 'ロードカナロア', 'モーリス'],
+                'sire_lines': ['SS系', 'ロベルト系'],
+                'speed_sires': ['ダイワメジャー', 'ロードカナロア', 'モーリス'],
+                'stamina_sires': ['ディープインパクト', 'エピファネイア'],
+                'wet_affinity': ['エピファネイア', 'ルーラーシップ'],
+                'cross_bonus': [('ディープインパクト', 'ストームキャット')],
+                'notes': '中山芝1600m（皐月賞前哨戦等）。先行有利。コーナリング能力が問われる。',
+            },
+            2000: {
+                'top_sires': ['ディープインパクト', 'エピファネイア', 'キズナ', 'ハーツクライ', 'サートゥルナーリア'],
+                'sire_lines': ['SS系', 'ロベルト系', 'NT系'],
+                'speed_sires': ['エピファネイア', 'サートゥルナーリア'],
+                'stamina_sires': ['ディープインパクト', 'キズナ', 'ハーツクライ'],
+                'wet_affinity': ['ハーツクライ', 'キズナ'],
+                'cross_bonus': [('ディープインパクト', 'サンデーサイレンス'), ('エピファネイア', 'キングカメハメハ')],
+                'notes': '中山芝2000m（皐月賞コース）。コーナリング・パワーが必要。先行有利。ディープ系・エピファネイア産駒が安定。',
+            },
+            2500: {
+                'top_sires': ['ディープインパクト', 'オルフェーヴル', 'ゴールドシップ', 'キズナ', 'ハービンジャー'],
+                'sire_lines': ['SS系', 'ND系'],
+                'speed_sires': [],
+                'stamina_sires': ['ディープインパクト', 'オルフェーヴル', 'ゴールドシップ', 'キズナ', 'ハービンジャー'],
+                'wet_affinity': ['ゴールドシップ', 'ハービンジャー', 'キズナ'],
+                'cross_bonus': [('サンデーサイレンス', 'ブライアンズタイム'), ('ディープインパクト', 'ノーザンダンサー')],
+                'notes': '中山芝2500m（有馬記念コース）。究極のスタミナ・コーナリング・総合力が問われる。ゴールドシップ・ディープ産駒が強い。',
+            },
+        },
+        'dirt': {
+            1800: {
+                'top_sires': ['ゴールドアリュール', 'ヘニーヒューズ', 'キングカメハメハ', 'シニスターミニスター'],
+                'sire_lines': ['MR系', 'デピュティミニスター系'],
+                'speed_sires': ['ヘニーヒューズ'],
+                'stamina_sires': ['ゴールドアリュール', 'シニスターミニスター'],
+                'wet_affinity': ['ゴールドアリュール'],
+                'cross_bonus': [('ゴールドアリュール', 'サンデーサイレンス')],
+                'notes': '中山ダート1800m。パワー・スタミナが必要。ゴールドアリュール系が強い。',
+            },
+        },
+    },
+
+    # =====================================================================
+    # 阪神競馬場
+    # =====================================================================
+    '阪神': {
+        'turf': {
+            1200: {
+                'top_sires': ['ロードカナロア', 'ダイワメジャー', 'キングカメハメハ', 'ディープインパクト',
+                              'ビッグアーサー', 'サクラバクシンオー'],
+                'sire_lines': ['SS系', 'キングマンボ系', 'MR系'],
+                'speed_sires': ['ロードカナロア', 'ダイワメジャー', 'ビッグアーサー'],
+                'stamina_sires': ['キングカメハメハ', 'ディープインパクト'],
+                'wet_affinity': ['キングカメハメハ', 'ディープインパクト'],
+                'cross_bonus': [('ロードカナロア', 'サンデーサイレンス')],
+                'notes': '阪神芝1200m（高松宮記念前哨戦等）。純粋なスピード能力が問われる。外回りも内回りも先行型有利。',
+            },
+            1600: {
+                'top_sires': ['ディープインパクト', 'エピファネイア', 'モーリス', 'ダイワメジャー',
+                              'ルーラーシップ', 'キズナ'],
+                'sire_lines': ['SS系', 'ロベルト系'],
+                'speed_sires': ['ダイワメジャー', 'モーリス'],
+                'stamina_sires': ['ディープインパクト', 'エピファネイア', 'キズナ'],
+                'wet_affinity': ['ルーラーシップ', 'キズナ'],
+                'cross_bonus': [('ディープインパクト', 'ストームキャット'), ('エピファネイア', 'キングカメハメハ')],
+                'notes': '阪神芝1600m（桜花賞コース等）。外回りはヨーイドンの末脚勝負になりやすい。ディープ・エピファネイア産駒が強い。',
+            },
+            2000: {
+                'top_sires': ['ディープインパクト', 'エピファネイア', 'キズナ', 'ハーツクライ',
+                              'サートゥルナーリア', 'ゴールドシップ', 'スワーヴリチャード'],
+                'sire_lines': ['SS系', 'ロベルト系', 'NT系'],
+                'speed_sires': ['エピファネイア', 'サートゥルナーリア'],
+                'stamina_sires': ['ディープインパクト', 'キズナ', 'ハーツクライ', 'ゴールドシップ'],
+                'wet_affinity': ['ハーツクライ', 'ゴールドシップ', 'キズナ'],
+                'cross_bonus': [
+                    ('ディープインパクト', 'ノーザンダンサー'),
+                    ('エピファネイア', 'キングカメハメハ'),
+                    ('ハーツクライ', 'サンデーサイレンス'),
+                ],
+                'notes': '阪神芝2000m（大阪杯コース）。内回りでコーナリング＋パワーが必要。先行〜差しまで幅広く対応できる血統が有利。ディープ・エピファネイア・ハーツクライ産駒が実績豊富。',
+            },
+            2400: {
+                'top_sires': ['ディープインパクト', 'オルフェーヴル', 'キズナ', 'ゴールドシップ', 'ハービンジャー'],
+                'sire_lines': ['SS系', 'ND系'],
+                'speed_sires': ['エピファネイア'],
+                'stamina_sires': ['ディープインパクト', 'オルフェーヴル', 'キズナ', 'ゴールドシップ'],
+                'wet_affinity': ['ゴールドシップ', 'ハービンジャー', 'キズナ'],
+                'cross_bonus': [('ディープインパクト', 'ノーザンダンサー'), ('サンデーサイレンス', 'グレイソブリン')],
+                'notes': '阪神芝2400m（宝塚記念コース）。パワー・スタミナの総合力が問われる。ゴールドシップ産駒が特に得意。',
+            },
+        },
+        'dirt': {
+            1400: {
+                'top_sires': ['ヘニーヒューズ', 'キングカメハメハ', 'ゴールドアリュール', 'パイロ'],
+                'sire_lines': ['MR系', 'デピュティミニスター系', 'キングマンボ系'],
+                'speed_sires': ['ヘニーヒューズ', 'パイロ'],
+                'stamina_sires': ['ゴールドアリュール', 'キングカメハメハ'],
+                'wet_affinity': ['ゴールドアリュール'],
+                'cross_bonus': [('ヘニーヒューズ', 'サンデーサイレンス')],
+                'notes': '阪神ダート1400m。先行力＋パワーが重要。ヘニーヒューズ産駒が安定。',
+            },
+            1800: {
+                'top_sires': ['ゴールドアリュール', 'キングカメハメハ', 'ヘニーヒューズ', 'シニスターミニスター', 'クロフネ'],
+                'sire_lines': ['MR系', 'デピュティミニスター系', 'NT系'],
+                'speed_sires': ['ヘニーヒューズ'],
+                'stamina_sires': ['ゴールドアリュール', 'シニスターミニスター', 'クロフネ'],
+                'wet_affinity': ['ゴールドアリュール', 'クロフネ'],
+                'cross_bonus': [('ゴールドアリュール', 'サンデーサイレンス'), ('クロフネ', 'ノーザンダンサー')],
+                'notes': '阪神ダート1800m（チャンピオンズC前哨戦）。スタミナ・パワーが必要。ゴールドアリュール・クロフネ産駒が実績豊富。',
+            },
+        },
+    },
+
+    # =====================================================================
+    # 中京競馬場
+    # =====================================================================
+    '中京': {
+        'turf': {
+            1200: {
+                'top_sires': ['ロードカナロア', 'ダイワメジャー', 'ディープインパクト', 'キングカメハメハ',
+                              'ビッグアーサー', 'モーリス'],
+                'sire_lines': ['SS系', 'キングマンボ系', 'MR系'],
+                'speed_sires': ['ロードカナロア', 'ダイワメジャー', 'ビッグアーサー', 'モーリス'],
+                'stamina_sires': ['キングカメハメハ', 'ディープインパクト'],
+                'wet_affinity': ['キングカメハメハ', 'ディープインパクト'],
+                'cross_bonus': [('ロードカナロア', 'サンデーサイレンス'), ('サンデーサイレンス', 'ロードカナロア')],
+                'notes': '中京芝1200m（高松宮記念コース）。急坂あり。スピード＋パワーが求められる。ロードカナロア産駒がトップ。外枠は差し有利傾向。',
+            },
+            1600: {
+                'top_sires': ['ディープインパクト', 'エピファネイア', 'モーリス', 'ダイワメジャー', 'キズナ'],
+                'sire_lines': ['SS系', 'ロベルト系'],
+                'speed_sires': ['ダイワメジャー', 'モーリス'],
+                'stamina_sires': ['ディープインパクト', 'エピファネイア', 'キズナ'],
+                'wet_affinity': ['キズナ', 'ルーラーシップ'],
+                'cross_bonus': [('ディープインパクト', 'ストームキャット')],
+                'notes': '中京芝1600m。直線が長く差し馬も活躍。ディープ・エピファネイア産駒が安定。',
+            },
+            2000: {
+                'top_sires': ['ディープインパクト', 'エピファネイア', 'キズナ', 'ハーツクライ',
+                              'スワーヴリチャード', 'モーリス'],
+                'sire_lines': ['SS系', 'ロベルト系', 'NT系'],
+                'speed_sires': ['エピファネイア', 'モーリス', 'スワーヴリチャード'],
+                'stamina_sires': ['ディープインパクト', 'キズナ', 'ハーツクライ'],
+                'wet_affinity': ['ハーツクライ', 'キズナ'],
+                'cross_bonus': [('ディープインパクト', 'キングカメハメハ'), ('エピファネイア', 'ノーザンダンサー')],
+                'notes': '中京芝2000m（金鯱賞・大阪杯前哨戦）。直線長く差し有利。スタミナ・末脚のバランスが重要。',
+            },
+        },
+        'dirt': {
+            1800: {
+                'top_sires': ['ゴールドアリュール', 'ヘニーヒューズ', 'キングカメハメハ', 'パイロ', 'シニスターミニスター'],
+                'sire_lines': ['MR系', 'デピュティミニスター系'],
+                'speed_sires': ['ヘニーヒューズ', 'パイロ'],
+                'stamina_sires': ['ゴールドアリュール', 'シニスターミニスター'],
+                'wet_affinity': ['ゴールドアリュール'],
+                'cross_bonus': [('ゴールドアリュール', 'サンデーサイレンス')],
+                'notes': '中京ダート1800m（チャンピオンズC）。パワー・スタミナが問われる。ゴールドアリュール系が断然強い。',
+            },
+        },
+    },
+
+    # =====================================================================
+    # 京都競馬場
+    # =====================================================================
+    '京都': {
+        'turf': {
+            1600: {
+                'top_sires': ['ディープインパクト', 'エピファネイア', 'モーリス', 'ハービンジャー', 'キズナ'],
+                'sire_lines': ['SS系', 'ロベルト系', 'ND系'],
+                'speed_sires': ['モーリス', 'ダイワメジャー'],
+                'stamina_sires': ['ディープインパクト', 'エピファネイア', 'キズナ', 'ハービンジャー'],
+                'wet_affinity': ['ハービンジャー', 'キズナ'],
+                'cross_bonus': [('ディープインパクト', 'ストームキャット')],
+                'notes': '京都芝1600m（マイルCS）。外回りは直線長く差し有利。ディープ産駒が圧倒的。',
+            },
+            2200: {
+                'top_sires': ['ディープインパクト', 'オルフェーヴル', 'ゴールドシップ', 'キズナ', 'ハービンジャー'],
+                'sire_lines': ['SS系', 'ND系'],
+                'speed_sires': ['エピファネイア'],
+                'stamina_sires': ['ディープインパクト', 'オルフェーヴル', 'ゴールドシップ', 'キズナ'],
+                'wet_affinity': ['ゴールドシップ', 'ハービンジャー'],
+                'cross_bonus': [('ディープインパクト', 'ノーザンダンサー')],
+                'notes': '京都芝2200m（エリザベス女王杯）。外回り・スタミナが重要。末脚勝負になりやすい。',
+            },
+            3200: {
+                'top_sires': ['ディープインパクト', 'オルフェーヴル', 'ゴールドシップ', 'キズナ', 'ハーツクライ'],
+                'sire_lines': ['SS系', 'ND系'],
+                'speed_sires': [],
+                'stamina_sires': ['ディープインパクト', 'オルフェーヴル', 'ゴールドシップ', 'キズナ', 'ハーツクライ'],
+                'wet_affinity': ['ゴールドシップ', 'キズナ'],
+                'cross_bonus': [('ディープインパクト', 'ノーザンダンサー'), ('サンデーサイレンス', 'ブライアンズタイム')],
+                'notes': '京都芝3200m（天皇賞春）。究極のスタミナ・底力が問われる。ディープ・オルフェーヴル産駒が特に強い。',
+            },
+        },
+        'dirt': {
+            1900: {
+                'top_sires': ['ゴールドアリュール', 'ヘニーヒューズ', 'キングカメハメハ', 'パイロ'],
+                'sire_lines': ['MR系', 'デピュティミニスター系'],
+                'speed_sires': ['ヘニーヒューズ', 'パイロ'],
+                'stamina_sires': ['ゴールドアリュール', 'キングカメハメハ'],
+                'wet_affinity': ['ゴールドアリュール'],
+                'cross_bonus': [('ゴールドアリュール', 'サンデーサイレンス')],
+                'notes': '京都ダート1900m。パワー型が優位。',
+            },
+        },
+    },
+
+    # =====================================================================
+    # 新潟競馬場
+    # =====================================================================
+    '新潟': {
+        'turf': {
+            1000: {
+                'top_sires': ['ロードカナロア', 'ダイワメジャー', 'ビッグアーサー', 'サクラバクシンオー'],
+                'sire_lines': ['MR系', 'SS系'],
+                'speed_sires': ['ロードカナロア', 'ダイワメジャー', 'ビッグアーサー', 'サクラバクシンオー'],
+                'stamina_sires': [],
+                'wet_affinity': ['ロードカナロア'],
+                'cross_bonus': [],
+                'notes': '新潟芝1000m（直線競馬）。純粋なスピードのみが問われる。外枠有利。スタートセンス重要。',
+            },
+            1600: {
+                'top_sires': ['ディープインパクト', 'モーリス', 'キズナ', 'エピファネイア', 'ハービンジャー'],
+                'sire_lines': ['SS系', 'ND系'],
+                'speed_sires': ['モーリス', 'ダイワメジャー'],
+                'stamina_sires': ['ディープインパクト', 'キズナ', 'ハービンジャー'],
+                'wet_affinity': ['ハービンジャー', 'キズナ'],
+                'cross_bonus': [('ディープインパクト', 'ストームキャット')],
+                'notes': '新潟芝1600m（外回り）。直線長く差し有利の典型的な末脚コース。ディープ・キズナ産駒が強い。',
+            },
+            2000: {
+                'top_sires': ['ディープインパクト', 'キズナ', 'ハービンジャー', 'エピファネイア', 'オルフェーヴル'],
+                'sire_lines': ['SS系', 'ND系'],
+                'speed_sires': ['エピファネイア'],
+                'stamina_sires': ['ディープインパクト', 'キズナ', 'ハービンジャー', 'オルフェーヴル'],
+                'wet_affinity': ['ハービンジャー', 'キズナ'],
+                'cross_bonus': [('ディープインパクト', 'ノーザンダンサー')],
+                'notes': '新潟芝2000m。差し・追い込み有利の傾向。',
+            },
+        },
+        'dirt': {
+            1200: {
+                'top_sires': ['ヘニーヒューズ', 'ロードカナロア', 'パイロ', 'キングカメハメハ'],
+                'sire_lines': ['MR系', 'キングマンボ系'],
+                'speed_sires': ['ヘニーヒューズ', 'ロードカナロア', 'パイロ'],
+                'stamina_sires': ['キングカメハメハ'],
+                'wet_affinity': [],
+                'cross_bonus': [],
+                'notes': '新潟ダート1200m。スピード型が有利。',
+            },
+        },
+    },
+
+    # =====================================================================
+    # 福島競馬場
+    # =====================================================================
+    '福島': {
+        'turf': {
+            1200: {
+                'top_sires': ['ロードカナロア', 'ダイワメジャー', 'ディープインパクト', 'キングカメハメハ'],
+                'sire_lines': ['SS系', 'キングマンボ系'],
+                'speed_sires': ['ロードカナロア', 'ダイワメジャー'],
+                'stamina_sires': ['ディープインパクト', 'キングカメハメハ'],
+                'wet_affinity': ['キングカメハメハ'],
+                'cross_bonus': [],
+                'notes': '福島芝1200m。小回りで先行有利。スピード血統が強い。',
+            },
+            2000: {
+                'top_sires': ['ディープインパクト', 'エピファネイア', 'キズナ', 'ハーツクライ'],
+                'sire_lines': ['SS系', 'ロベルト系'],
+                'speed_sires': ['エピファネイア'],
+                'stamina_sires': ['ディープインパクト', 'キズナ', 'ハーツクライ'],
+                'wet_affinity': ['ハーツクライ'],
+                'cross_bonus': [],
+                'notes': '福島芝2000m。小回りでコーナリング能力重要。先行有利。',
+            },
+        },
+        'dirt': {
+            1150: {
+                'top_sires': ['ヘニーヒューズ', 'パイロ', 'キングカメハメハ'],
+                'sire_lines': ['MR系', 'キングマンボ系'],
+                'speed_sires': ['ヘニーヒューズ', 'パイロ'],
+                'stamina_sires': ['キングカメハメハ'],
+                'wet_affinity': [],
+                'cross_bonus': [],
+                'notes': '福島ダート1150m。スピード血統有利。',
+            },
+        },
+    },
+
+    # =====================================================================
+    # 小倉競馬場
+    # =====================================================================
+    '小倉': {
+        'turf': {
+            1200: {
+                'top_sires': ['ロードカナロア', 'ダイワメジャー', 'キングカメハメハ', 'ビッグアーサー'],
+                'sire_lines': ['SS系', 'キングマンボ系', 'MR系'],
+                'speed_sires': ['ロードカナロア', 'ダイワメジャー', 'ビッグアーサー'],
+                'stamina_sires': ['キングカメハメハ'],
+                'wet_affinity': ['キングカメハメハ'],
+                'cross_bonus': [('ロードカナロア', 'サンデーサイレンス')],
+                'notes': '小倉芝1200m。直線短い先行有利コース。スピード・加速力が問われる。',
+            },
+            2000: {
+                'top_sires': ['ディープインパクト', 'エピファネイア', 'キズナ', 'ハーツクライ'],
+                'sire_lines': ['SS系', 'ロベルト系'],
+                'speed_sires': ['エピファネイア'],
+                'stamina_sires': ['ディープインパクト', 'キズナ', 'ハーツクライ'],
+                'wet_affinity': ['ハーツクライ'],
+                'cross_bonus': [],
+                'notes': '小倉芝2000m（小倉記念）。コーナリング能力重要。',
+            },
+        },
+        'dirt': {
+            1000: {
+                'top_sires': ['ヘニーヒューズ', 'ロードカナロア', 'パイロ'],
+                'sire_lines': ['MR系'],
+                'speed_sires': ['ヘニーヒューズ', 'ロードカナロア', 'パイロ'],
+                'stamina_sires': [],
+                'wet_affinity': [],
+                'cross_bonus': [],
+                'notes': '小倉ダート1000m。純粋スピード勝負。',
+            },
+        },
+    },
+
+    # =====================================================================
+    # 札幌競馬場
+    # =====================================================================
+    '札幌': {
+        'turf': {
+            1200: {
+                'top_sires': ['ロードカナロア', 'ダイワメジャー', 'ハービンジャー', 'ディープインパクト'],
+                'sire_lines': ['SS系', 'ND系', 'キングマンボ系'],
+                'speed_sires': ['ロードカナロア', 'ダイワメジャー'],
+                'stamina_sires': ['ハービンジャー', 'ディープインパクト'],
+                'wet_affinity': ['ハービンジャー', 'ディープインパクト'],
+                'cross_bonus': [],
+                'notes': '札幌芝1200m。洋芝でパワーが必要。ハービンジャー産駒が洋芝向き。',
+            },
+            2000: {
+                'top_sires': ['ディープインパクト', 'ハービンジャー', 'キズナ', 'エピファネイア', 'オルフェーヴル'],
+                'sire_lines': ['SS系', 'ND系'],
+                'speed_sires': ['エピファネイア'],
+                'stamina_sires': ['ディープインパクト', 'ハービンジャー', 'キズナ', 'オルフェーヴル'],
+                'wet_affinity': ['ハービンジャー', 'キズナ', 'オルフェーヴル'],
+                'cross_bonus': [('ハービンジャー', 'サンデーサイレンス')],
+                'notes': '札幌芝2000m（札幌記念）。洋芝でパワー・スタミナ重要。ハービンジャー産駒が特に得意。',
+            },
+        },
+        'dirt': {
+            1700: {
+                'top_sires': ['ゴールドアリュール', 'ヘニーヒューズ', 'キングカメハメハ'],
+                'sire_lines': ['MR系', 'デピュティミニスター系'],
+                'speed_sires': ['ヘニーヒューズ'],
+                'stamina_sires': ['ゴールドアリュール'],
+                'wet_affinity': ['ゴールドアリュール'],
+                'cross_bonus': [],
+                'notes': '札幌ダート1700m。パワー型有利。',
+            },
+        },
+    },
+
+    # =====================================================================
+    # 函館競馬場
+    # =====================================================================
+    '函館': {
+        'turf': {
+            1200: {
+                'top_sires': ['ロードカナロア', 'ダイワメジャー', 'ハービンジャー', 'キングカメハメハ'],
+                'sire_lines': ['SS系', 'ND系', 'キングマンボ系'],
+                'speed_sires': ['ロードカナロア', 'ダイワメジャー'],
+                'stamina_sires': ['ハービンジャー', 'キングカメハメハ'],
+                'wet_affinity': ['ハービンジャー', 'キングカメハメハ'],
+                'cross_bonus': [],
+                'notes': '函館芝1200m。洋芝・小回りでパワーとスピード両立が必要。ハービンジャー産駒が洋芝巧者。',
+            },
+            2000: {
+                'top_sires': ['ディープインパクト', 'ハービンジャー', 'キズナ', 'エピファネイア'],
+                'sire_lines': ['SS系', 'ND系'],
+                'speed_sires': ['エピファネイア'],
+                'stamina_sires': ['ディープインパクト', 'ハービンジャー', 'キズナ'],
+                'wet_affinity': ['ハービンジャー', 'キズナ'],
+                'cross_bonus': [('ハービンジャー', 'サンデーサイレンス')],
+                'notes': '函館芝2000m。洋芝でパワー・スタミナ重要。ハービンジャー産駒が強い。',
+            },
+        },
+        'dirt': {
+            1700: {
+                'top_sires': ['ゴールドアリュール', 'ヘニーヒューズ', 'キングカメハメハ'],
+                'sire_lines': ['MR系'],
+                'speed_sires': ['ヘニーヒューズ'],
+                'stamina_sires': ['ゴールドアリュール'],
+                'wet_affinity': ['ゴールドアリュール'],
+                'cross_bonus': [],
+                'notes': '函館ダート1700m。パワー型が有利。',
+            },
+        },
+    },
+}
+
+
+def _lookup_course_pedigree(venue: str, surface: str, distance: int) -> dict:
+    """競馬場・芝ダート・距離から血統適性データを返す。最近傍距離マッチング付き。"""
+    venue_data = JRA_COURSE_PEDIGREE_DATA.get(venue, {})
+    surface_data = venue_data.get(surface, {})
+    if not surface_data:
+        return {}
+    # 完全一致
+    if distance in surface_data:
+        return surface_data[distance]
+    # 最近傍マッチ（±200m以内）
+    dists = sorted(surface_data.keys())
+    best_dist = min(dists, key=lambda d: abs(d - distance))
+    if abs(best_dist - distance) <= 200:
+        return surface_data[best_dist]
+    return {}
+
+
+def compute_course_pedigree_fit(
+    df: pd.DataFrame,
+    meta: Dict[str, str],
+    params: Optional[dict] = None,
+) -> pd.DataFrame:
+    """各馬の父・母父が当該コースの血統適性データにマッチするかを評価し
+    CoursePedigreeFit (0〜100) と CoursePedigreeBonus (加点用) を付与する。(v1.36)
+
+    入力カラム（任意）:
+        sire      : 父名（例: 'ディープインパクト'）
+        dam_sire  : 母父名（例: 'キングカメハメハ'）
+        sire_line : 系統名（例: 'SS系'）
+
+    出力カラム:
+        CoursePedigreeFit   : 0〜100 の血統コース適性スコア
+        CoursePedigreeBonus : AnchorScore へ加算するボーナス（-5 〜 +5）
+    """
+    wp = (params or {})
+    ped_params = wp.get('course_pedigree_params', {})
+    if not ped_params.get('enabled', True):
+        if 'CoursePedigreeFit' not in df.columns:
+            df['CoursePedigreeFit'] = 50.0
+        if 'CoursePedigreeBonus' not in df.columns:
+            df['CoursePedigreeBonus'] = 0.0
+        return df
+
+    dist, surface = _meta_distance_surface(meta)
+    venue = str(meta.get('venue', '') or '')
+    is_wet = _is_wet_track(meta)
+
+    pedigree_data = _lookup_course_pedigree(venue, surface, int(dist) if np.isfinite(dist) else 2000)
+
+    if not pedigree_data:
+        df['CoursePedigreeFit'] = 50.0
+        df['CoursePedigreeBonus'] = 0.0
+        return df
+
+    top_sires    = set(pedigree_data.get('top_sires', []))
+    speed_sires  = set(pedigree_data.get('speed_sires', []))
+    stamina_sires = set(pedigree_data.get('stamina_sires', []))
+    sire_lines   = set(pedigree_data.get('sire_lines', []))
+    wet_sires    = set(pedigree_data.get('wet_affinity', []))
+    cross_bonus_pairs = pedigree_data.get('cross_bonus', [])
+
+    top_scale     = float(ped_params.get('top_sire_score',    15.0))
+    line_scale    = float(ped_params.get('sire_line_score',    8.0))
+    dam_scale     = float(ped_params.get('dam_sire_score',    10.0))
+    wet_scale     = float(ped_params.get('wet_affinity_score', 5.0))
+    cross_scale   = float(ped_params.get('cross_bonus_score',  5.0))
+    bonus_cap     = float(ped_params.get('bonus_cap',          5.0))
+
+    n = len(df)
+    _idx = df.index
+
+    def _get_col(col: str) -> list:
+        if col in df.columns:
+            return [str(v).strip() for v in df[col].fillna('').values]
+        return [''] * n
+
+    sires     = _get_col('sire')
+    dam_sires = _get_col('dam_sire')
+    sire_line_vals = _get_col('sire_line')
+
+    fit_scores   = np.full(n, 50.0, dtype=np.float64)
+    bonus_scores = np.zeros(n, dtype=np.float64)
+
+    for i in range(n):
+        s   = sires[i]
+        ds  = dam_sires[i]
+        sl  = sire_line_vals[i]
+        score = 0.0
+
+        # 父が top_sires に入っている
+        if s and s in top_sires:
+            score += top_scale
+        # 母父が top_sires / speed_sires / stamina_sires
+        if ds and ds in top_sires:
+            score += dam_scale
+        elif ds and (ds in speed_sires or ds in stamina_sires):
+            score += dam_scale * 0.6
+
+        # 系統マッチ
+        if sl and sl in sire_lines:
+            score += line_scale
+
+        # 道悪適性
+        if is_wet:
+            if s and s in wet_sires:
+                score += wet_scale
+            if ds and ds in wet_sires:
+                score += wet_scale * 0.5
+
+        # クロスボーナス（父×母父の組み合わせ）
+        for p1, p2 in cross_bonus_pairs:
+            if (s == p1 and ds == p2) or (s == p2 and ds == p1):
+                score += cross_scale
+                break
+
+        # スコアを 0〜100 に変換（最大 top_scale + dam_scale + cross + wet + line ≈ 43）
+        fit = np.clip(50.0 + score * 1.5, 0.0, 100.0)
+        fit_scores[i] = fit
+        bonus_scores[i] = np.clip((fit - 50.0) / 10.0 * bonus_cap, -bonus_cap, bonus_cap)
+
+    df['CoursePedigreeFit']   = _make_series(fit_scores, _idx)
+    df['CoursePedigreeBonus'] = _make_series(bonus_scores, _idx)
+    return df
+
+
+# =============================================================================
 # JRA 全重賞データ辞書（JRA_GRADED_RACES_DATA）
 # =============================================================================
 # キー構造:
@@ -20516,6 +21163,29 @@ def _csv_compute_base_features(
     # コース特性由来の追加特徴量
     df = add_course_profile_features(df, meta, params)
 
+    # ── 血統コース適性スコア (v1.36) ─────────────────────────────
+    # 父(sire)・母父(dam_sire)・系統(sire_line)カラムが存在する場合に
+    # CoursePedigreeFit / CoursePedigreeBonus を計算して付与する。
+    try:
+        df = compute_course_pedigree_fit(df, meta, params)
+        # CoursePedigreeBonus を AnchorScore 前のベーススコアに反映
+        _ped_params = (params.get('course_pedigree_params', {}) or {})
+        _ped_scale = float(_ped_params.get('anchor_apply_scale', 0.06))
+        if _ped_scale > 0.0 and 'CoursePedigreeFit' in df.columns:
+            _cpf = pd.to_numeric(df['CoursePedigreeFit'], errors='coerce').fillna(50.0).values
+            # Ability に軽くブレンド（50を基準に偏差×scale）
+            if 'Ability' in df.columns:
+                _ability = pd.to_numeric(df['Ability'], errors='coerce').fillna(50.0).values
+                df['Ability'] = _make_series(
+                    np.clip(_ability + (_cpf - 50.0) * _ped_scale, 0.0, 100.0),
+                    df.index
+                )
+    except Exception:
+        if 'CoursePedigreeFit' not in df.columns:
+            df['CoursePedigreeFit'] = 50.0
+        if 'CoursePedigreeBonus' not in df.columns:
+            df['CoursePedigreeBonus'] = 0.0
+
     return df, rating_min, rating_max, speed_min, speed_max
 
     # -------------------------
@@ -22541,6 +23211,15 @@ def compute_scores_v1_1(entries: pd.DataFrame, meta: Dict[str, str], params: Opt
 
     # ── SAS / AnchorScore ───────────────────────────────────────
     df = _csv_compute_sas(df, meta, params)
+
+    # ── 血統コース適性ボーナス → AnchorScore 反映 (v1.36) ──────
+    try:
+        if 'CoursePedigreeBonus' in df.columns and 'AnchorScore' in df.columns:
+            _cpb = pd.to_numeric(df['CoursePedigreeBonus'], errors='coerce').fillna(0.0).values
+            _anchor = pd.to_numeric(df['AnchorScore'], errors='coerce').fillna(50.0).values
+            df['AnchorScore'] = _make_series(np.clip(_anchor + _cpb, 0.0, 100.0), df.index)
+    except Exception:
+        pass
 
     # ── WINDEX指数統合 (v1.35) ──────────────────────────────────
     # windex_score/kiso/blood/hatten/time/jockey 列が存在する場合に
