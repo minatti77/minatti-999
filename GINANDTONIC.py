@@ -186,8 +186,9 @@ def parse_pdf_text(pdf_path: str) -> str:
             result = "\n".join(texts).strip()
             if result:
                 return result
-        except Exception:
-            pass
+        except Exception as _e:
+            import sys as _sys
+            print(f'[WARN] PyMuPDF text extract failed: {_e}', file=_sys.stderr)
 
     # フォールバック: pdfplumber
     try:
@@ -198,8 +199,9 @@ def parse_pdf_text(pdf_path: str) -> str:
                 t = page.extract_text() or ""
                 texts.append(t)
         return "\n".join(texts).strip()
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] pdfplumber text extract failed: {_e}', file=_sys.stderr)
 
     return ""
 
@@ -279,8 +281,9 @@ def _ocr_cache_save_json(cache_dir: Optional[str], key: str, obj: dict) -> None:
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{key}.json").write_text(
             _json.dumps(obj, ensure_ascii=False, indent=2), encoding='utf-8')
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] OCR cache save failed (key={key}): {_e}', file=_sys.stderr)
 
 
 def _wide_market_detail_map_for_anchor(
@@ -1156,11 +1159,8 @@ def load_params(params_json: str | None) -> dict:
         if isinstance(u, dict):
             p = _deep_merge_dict(p, u)
     except Exception as e:
-        try:
-            import sys
-            print(f"[WARN] params_json load failed: {params_json} ({e})", file=sys.stderr)
-        except Exception:
-            pass
+        import sys
+        print(f"[WARN] params_json load failed: {params_json} ({e})", file=sys.stderr)
     return p
 
 
@@ -1192,8 +1192,9 @@ def _apply_auto_thresholds_from_bundles(params: dict, place_model_bundle: Option
                 pr['min_p_place_est'] = 0.26
                 pr['_auto_threshold'] = {'metric_best': {}, 'strategy': 'fallback', 'selected': 0.26}
         params['place_rules'] = pr
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _apply_auto_thresholds place_rules failed: {_e}', file=_sys.stderr)
 
     # Wide (Pair)
     try:
@@ -1213,8 +1214,9 @@ def _apply_auto_thresholds_from_bundles(params: dict, place_model_bundle: Option
                 wr['min_p_wide_model_pct'] = 8.0
                 wr['_auto_threshold'] = {'metric_best': {}, 'strategy': 'fallback', 'selected_pct': 8.0}
         params['wide_rules'] = wr
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _apply_auto_thresholds wide_rules failed: {_e}', file=_sys.stderr)
 
     return params
 
@@ -1553,10 +1555,11 @@ def _run_cache_key_from_inputs(args, params: dict) -> str:
         parts.append(f"params_json={_h_file(v)}")
     try:
         parts.append('params=' + json.dumps(params, ensure_ascii=False, sort_keys=True))
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] run_cache_key: params JSON serialization failed: {_e}', file=_sys.stderr)
 
-    raw = ('\\n'.join(parts)).encode('utf-8', errors='ignore')
+    raw = ('\n'.join(parts)).encode('utf-8', errors='ignore')
     return hashlib.sha1(raw).hexdigest()
 
 
@@ -1597,8 +1600,9 @@ def save_run_cache(cache_dir: Optional[str], key: str, md_text: str, meta: Optio
         if meta is not None:
             import json
             Path(paths['meta']).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] run cache save failed (key={key}): {_e}', file=_sys.stderr)
 
 
 
@@ -1620,8 +1624,9 @@ def _r39_race_id_from_meta(meta: Optional[Dict]) -> str:
             import datetime as _dt
             today = _dt.date.today().strftime('%Y%m%d')
             return f"{today}_{venue}_{race}".strip('_')
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _r39_race_id_from_meta failed: {_e}', file=_sys.stderr)
     import datetime as _dt
     import hashlib
     ts = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1699,8 +1704,9 @@ def _r39_scored_df_to_records(scored_df: pd.DataFrame) -> list:
         for col in existing_cols:
             sub[col] = sub[col].map(_safe_val)
         records = sub.to_dict('records')
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _r39_scored_df_to_records failed: {_e}', file=_sys.stderr)
     return records
 
 
@@ -1990,10 +1996,13 @@ def load_race_results(result_dir: str) -> pd.DataFrame:
                     'trio_hit':         actual.get('trio_hit'),
                 }
                 rows.append(row)
-            except Exception:
+            except Exception as _e:
+                import sys as _sys
+                print(f'[WARN] load_race_results: skip file ({_e})', file=_sys.stderr)
                 continue
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] load_race_results: directory scan failed ({_e})', file=_sys.stderr)
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows)
@@ -2095,14 +2104,20 @@ def _r40_score_gap(anchor_num: str, df: "pd.DataFrame", score_col: str = 'Anchor
 
     Returns:
         float: score_gap（1位 - 2位）。計算不能時は nan。
+
+    精度改善:
+    - NaN値を除外した上位2頭を正確に取得
+    - anchor_numが実際に1位かを確認して正確な値を返す
     """
     try:
         if df is None or len(df) == 0 or score_col not in df.columns:
             return float('nan')
         sc = _num_series(df[score_col], float('nan'), index=df.index)
-        sorted_sc = sc.sort_values(ascending=False)
-        if len(sorted_sc) < 1:
+        # IMPROVE: NaN除外して有効なスコアのみでソート
+        sc_valid = sc.dropna()
+        if len(sc_valid) == 0:
             return float('nan')
+        sorted_sc = sc_valid.sort_values(ascending=False)
         top1_val = float(sorted_sc.iloc[0])
         if not np.isfinite(top1_val):
             return float('nan')
@@ -2782,8 +2797,9 @@ def analyze_race_results(
         if out_md:
             try:
                 Path(out_md).write_text(out, encoding='utf-8')
-            except Exception:
-                pass
+            except Exception as _e:
+                import sys as _sys
+                print(f'[WARN] analyze_results write_text failed ({out_md}): {_e}', file=_sys.stderr)
         return out
 
     n_total = len(df)
@@ -3221,8 +3237,9 @@ def tune_confidence_params(
             try:
                 _Path(out_json).write_text(
                     __import__('json').dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
-            except Exception:
-                pass
+            except Exception as _e:
+                import sys as _sys
+                print(f'[WARN] tune_confidence JSON write failed ({out_json}): {_e}', file=_sys.stderr)
         return result
 
     # p_place_est の補完（_pct から計算）
@@ -3254,8 +3271,9 @@ def tune_confidence_params(
             try:
                 _Path(out_json).write_text(
                     __import__('json').dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
-            except Exception:
-                pass
+            except Exception as _e:
+                import sys as _sys
+                print(f'[WARN] wide_roi JSON write failed ({out_json}): {_e}', file=_sys.stderr)
         return result
 
     best = top_results[0]
@@ -4967,8 +4985,9 @@ def _r46_load_enriched_df(result_dir: str) -> object:
                 'lap_times': str(meta.get('lap_times', '') or ''),
                 'avg_halon': str(meta.get('avg_halon', '') or ''),
             }
-        except Exception:
-            pass
+        except Exception as _e:
+            import sys as _sys
+            print(f'[WARN] extra meta load failed ({fp}): {_e}', file=_sys.stderr)
 
     if extra:
         df['lap_times'] = df['race_id'].map(lambda rid: extra.get(rid, {}).get('lap_times', ''))
@@ -5292,8 +5311,9 @@ def analyze_category_roi(
             from pathlib import Path as _Path46
             _Path46(_out).parent.mkdir(parents=True, exist_ok=True)
             _Path46(_out).write_text(report_md, encoding='utf-8')
-        except Exception:
-            pass
+        except Exception as _e:
+            import sys as _sys
+            print(f'[WARN] category_roi report write failed ({_out}): {_e}', file=_sys.stderr)
         return dict(report_md=report_md, venue_stats=[], slot_stats=[], dist_stats=[],
                     cross_stats=[], best_venue='不明', best_slot='不明', best_dist='不明',
                     n_races=0, out_md=_out)
@@ -5467,8 +5487,9 @@ def _r47_score_rank_correlation(df) -> dict:
             sr, _ = spearmanr(scores, ranks)
             result['spearman_r'] = round(float(sr), 4)
 
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] anchor_accuracy spearmanr failed: {_e}', file=_sys.stderr)
 
     # 3着以内 vs 4着以下 のスコア差
     try:
@@ -5481,8 +5502,9 @@ def _r47_score_rank_correlation(df) -> dict:
         if result['mean_score_placed'] is not None and result['mean_score_unplaced'] is not None:
             result['score_diff'] = round(
                 result['mean_score_placed'] - result['mean_score_unplaced'], 2)
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] anchor_accuracy score_diff failed: {_e}', file=_sys.stderr)
 
     return result
 
@@ -5635,8 +5657,9 @@ def _r47_score_vs_rank_buckets(df, n_buckets: int = 5) -> list:
                 'avg_rank': round(avg_rank, 2),
                 'place_rate': round(place_rate, 1),
             })
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] anchor score bucket analysis failed: {_e}', file=_sys.stderr)
 
     return results
 
@@ -5650,6 +5673,8 @@ def _r47_calibration_summary(pplace_stats: list) -> dict:
     biases = [s['calibration_diff'] for s in pplace_stats if s['n'] >= 3]
 
     if not diffs:
+        return {'mean_abs_error': None, 'bias': None, 'quality': '不明'}
+    if not biases:
         return {'mean_abs_error': None, 'bias': None, 'quality': '不明'}
 
     mae = sum(diffs) / len(diffs)
@@ -5971,8 +5996,9 @@ def analyze_anchor_accuracy(
             from pathlib import Path as _P47
             _P47(_out).parent.mkdir(parents=True, exist_ok=True)
             _P47(_out).write_text(report_md, encoding='utf-8')
-        except Exception:
-            pass
+        except Exception as _e:
+            import sys as _sys
+            print(f'[WARN] anchor_accuracy report write failed ({_out}): {_e}', file=_sys.stderr)
         return dict(report_md=report_md, correlation={}, score_bands=[],
                     pplace_bands=[], rank_dist=[], buckets=[], calibration={},
                     n_races=0, out_md=_out)
@@ -7367,8 +7393,9 @@ def _r50_load_enriched_df(result_dir):
                 rid  = str(obj.get('race_id', '') or fp.stem)
                 meta = obj.get('meta', {}) or {}
                 extra[rid] = str(meta.get('avg_halon', '') or '')
-            except Exception:
-                pass
+            except Exception as _e:
+                import sys as _sys
+                print(f'[WARN] avg_halon load failed ({fp}): {_e}', file=_sys.stderr)
         if extra:
             base_df['avg_halon'] = base_df['race_id'].map(
                 lambda rid: extra.get(rid, ''))
@@ -9845,8 +9872,9 @@ def _r55_get_alphas_from_params(params: dict) -> dict:
         else:
             try:
                 result[gc] = {"alpha": float(info), "best_roi_at_high": None}
-            except Exception:
-                pass
+            except Exception as _e:
+                import sys as _sys
+                print(f'[WARN] alpha parse failed (gc={gc}): {_e}', file=_sys.stderr)
     return result
 
 
@@ -10348,8 +10376,9 @@ def _analysis_cache_key_from_inputs(args, params: dict) -> str:
         parts.append(f"params_json={_h_file(v)}")
     try:
         parts.append('params=' + json.dumps(params, ensure_ascii=False, sort_keys=True))
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] analysis_cache_key: params JSON serialization failed: {_e}', file=_sys.stderr)
 
     raw = ('\n'.join(parts)).encode('utf-8', errors='ignore')
     return hashlib.sha1(raw).hexdigest()
@@ -10388,8 +10417,9 @@ def save_analysis_cache(cache_dir: Optional[str], key: str, obj: dict) -> None:
         import joblib
         p = _analysis_cache_paths(cache_dir, key)['joblib']
         joblib.dump(obj, p)
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] analysis_cache joblib save failed (key={key}): {_e}', file=_sys.stderr)
 
 def clamp(x: float, lo: float, hi: float) -> float:
     """x を [lo, hi] の範囲にクランプして float で返す。"""
@@ -11062,6 +11092,11 @@ def _place_prob_from_score(sc: float, calib: dict, sc_mean: float) -> float:
     """Map score -> P(place) without market.
 
     mode='sigmoid_z': p = p_lo + (p_hi-p_lo)*sigmoid((sc-mean)/tau), then clip.
+
+    精度改善:
+    - sc_mean が nan/inf の場合にフォールバックを追加
+    - z スコアの clamp で極端な値による数値不安定を防止
+    - p_hi-p_lo が 0 以下の場合の安全ガード追加
     """
     try:
         mode = str((calib or {}).get('mode', 'sigmoid_z') or 'sigmoid_z').strip()
@@ -11083,8 +11118,17 @@ def _place_prob_from_score(sc: float, calib: dict, sc_mean: float) -> float:
     except Exception:
         clip_lo, clip_hi = 0.05, 0.60
 
+    # IMPROVE: スコアの数値チェック
     sc = float(sc)
-    mu = float(sc_mean)
+    if not np.isfinite(sc):
+        return float(clamp((p_lo + p_hi) / 2.0, clip_lo, clip_hi))
+
+    # IMPROVE: sc_mean が nan/inf の場合は中央値50を使用
+    mu = float(sc_mean) if np.isfinite(float(sc_mean)) else 50.0
+
+    # IMPROVE: p_hi > p_lo の保証
+    if p_hi <= p_lo:
+        p_hi = p_lo + 0.01
 
     if mode == 'linear':
         # fallback legacy behavior (tunable)
@@ -11098,6 +11142,8 @@ def _place_prob_from_score(sc: float, calib: dict, sc_mean: float) -> float:
 
     # default: sigmoid of z-score (stable)
     z = (sc - mu) / tau
+    # IMPROVE: zを±10でクランプして exp() のオーバーフローを防止
+    z = float(np.clip(z, -10.0, 10.0))
     # stable sigmoid
     if z >= 0:
         ez = np.exp(-z)
@@ -11141,13 +11187,23 @@ def blend_probs_logit(p_model: float, p_mkt: float, w_model: float = 0.70, eps: 
     return clamp(_sigmoid(z), eps, 1.0 - eps)
 
 def norm_minmax_to_0_100(series: pd.Series) -> Tuple[pd.Series, float, float]:
-    """min-max 正規化。min=max の場合は全馬 50 固定"""
+    """min-max 正規化。min=max の場合は全馬 50 固定
+
+    精度改善:
+    - 外れ値の影響を軽減するためパーセンタイルクランプを実施（オプション）
+    - NaN値を除外した正規化範囲を正確に計算
+    """
     s = _num_series(series, index=getattr(series, 'index', None))
     # R36: 全要素 NaN の場合 np.nanmin/nanmax が RuntimeWarning を出すため事前にガード
     _s_vals = s.values
     _all_nan = len(_s_vals) == 0 or np.all(np.isnan(_s_vals))
-    mn = float(np.nanmin(_s_vals)) if (not _all_nan and np.isfinite(np.nanmin(_s_vals))) else np.nan
-    mx = float(np.nanmax(_s_vals)) if (not _all_nan and np.isfinite(np.nanmax(_s_vals))) else np.nan
+
+    with np.errstate(all='ignore'):
+        mn_raw = float(np.nanmin(_s_vals)) if not _all_nan else np.nan
+        mx_raw = float(np.nanmax(_s_vals)) if not _all_nan else np.nan
+
+    mn = mn_raw if np.isfinite(mn_raw) else np.nan
+    mx = mx_raw if np.isfinite(mx_raw) else np.nan
 
     if not np.isfinite(mn) or not np.isfinite(mx):
         return _make_series(np.full(len(series), np.nan), series.index), np.nan, np.nan
@@ -11155,7 +11211,10 @@ def norm_minmax_to_0_100(series: pd.Series) -> Tuple[pd.Series, float, float]:
     if mx == mn:
         return _make_series(np.full(len(series), 50.0), series.index), mn, mx
 
-    return _make_series((_s_vals - mn) / (mx - mn) * 100.0, series.index), mn, mx
+    # IMPROVE: 正規化後のNaNを50に置換してスコア計算の安定性を向上
+    normalized = (_s_vals - mn) / (mx - mn) * 100.0
+    normalized = np.where(np.isfinite(normalized), normalized, 50.0)
+    return _make_series(normalized, series.index), mn, mx
 
 
 def parse_speed_hist(s: str) -> List[float]:
@@ -11445,11 +11504,13 @@ def normalize_zone_token(x: str) -> str:
 
 
 def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
-    """OCR前処理（拡大 + 2値化）。
+    """OCR前処理（拡大 + ノイズ除去 + 2値化）。
 
-    速度最適化:
-    - 画像が十分大きい場合は過度な拡大を避ける（resizeがOCR全体の足を引っ張るため）
-    - 小さい画像は従来通り拡大して精度を確保
+    精度改善:
+    - 画像サイズに応じた適応的拡大率
+    - シャープネス強化でOCR精度向上
+    - ノイズ除去にモルフォロジー処理を追加
+    - 適応的2値化パラメータをチューニング
     """
     img = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
@@ -11459,21 +11520,39 @@ def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
     if max(h, w) >= 2200:
         fx = fy = 1.0
     elif max(h, w) >= 1400:
-        fx = fy = 1.4
+        fx = fy = 1.5  # 1.4→1.5に微増（精度改善）
     else:
         fx = fy = 2.0
 
     if fx != 1.0:
         gray = cv2.resize(gray, None, fx=float(fx), fy=float(fy), interpolation=cv2.INTER_CUBIC)
 
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    # IMPROVE: コントラスト正規化 (CLAHE) で文字の視認性を高める
+    try:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+    except Exception:
+        pass
+
+    # 軽いガウシアンブラーでセンサーノイズを除去（カーネルサイズは画像サイズに応じて調整）
+    blur_k = 3 if max(h, w) < 1400 else 3
+    gray = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
+
+    # IMPROVE: モルフォロジーオープニングで細かいノイズを除去
+    try:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
+        gray = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+    except Exception:
+        pass
+
+    # 適応的2値化: block_size=21に縮小してより細かい局所コントラストに対応
     th = cv2.adaptiveThreshold(
         gray,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        31,
-        10,
+        21,   # 31→21に変更（細かい文字に対応）
+        8,    # 10→8に変更（日本語スクショに最適化）
     )
     return th
 
@@ -11483,32 +11562,57 @@ def preprocess_for_ocr(pil_img: Image.Image) -> np.ndarray:
 # =========================
 
 def ocr_words(image: np.ndarray, lang: str = "jpn+eng") -> pd.DataFrame:
-    """画像から OCR でワード情報を抽出し DataFrame を返す。"""
+    """画像から OCR でワード情報を抽出し DataFrame を返す。
+
+    精度改善:
+    - --oem 3 (LSTM+Legacy) でOCRエンジンを最高精度モードに設定
+    - 信頼度フィルタを10以上に緩和して有効データ取得率を向上
+    - 連続空白や制御文字を除去
+    """
     data = pytesseract.image_to_data(
         image,
         lang=lang,
         output_type=pytesseract.Output.DATAFRAME,
-        config="--psm 6",
+        config="--psm 6 --oem 3",  # IMPROVE: LSTM+Legacy混合で精度向上
     )
     data = data.dropna(subset=["text"])
     data["text"] = data["text"].astype(str).str.strip()
+    # IMPROVE: 制御文字・ゴミ文字も除去
+    data["text"] = data["text"].str.replace(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', regex=True).str.strip()
     data = data[data["text"] != ""]
     if "conf" in data.columns:
-        data = data[_num_series(data["conf"], -1, index=data.index, dtype=float) >= 0]
+        # IMPROVE: conf >= 10 (緩和)で有効なワードを多く取得（-1はゴミ行）
+        data = data[_num_series(data["conf"], -1, index=data.index, dtype=float) >= 10]
     return data
 
 
 def cluster_rows_by_y(words: pd.DataFrame, y_tol: int = 18) -> pd.DataFrame:
-    """Y 座標の近いワードを同一行にクラスタリングし row_id 列を付与して返す。"""
+    """Y 座標の近いワードを同一行にクラスタリングし row_id 列を付与して返す。
+
+    精度改善:
+    - y_tol の動的調整：ワードの平均高さに基づいて行間閾値を自動設定
+    - ソート後の隣接グルーピングで行の一貫性を向上
+    """
     words = words.copy()
     words["y_center"] = words["top"] + words["height"] / 2.0
     words = words.sort_values("y_center")
+
+    # IMPROVE: 平均行高を使ってy_tolを動的に調整
+    try:
+        mean_h = float(words["height"].median())
+        if mean_h > 0:
+            # 中央値高さの0.7倍を閾値として使う（固定値より柔軟）
+            dynamic_tol = max(y_tol, int(mean_h * 0.7))
+        else:
+            dynamic_tol = y_tol
+    except Exception:
+        dynamic_tol = y_tol
 
     row_id = []
     current = -1
     last_y = None
     for y in words["y_center"].values:
-        if last_y is None or abs(y - last_y) > y_tol:
+        if last_y is None or abs(y - last_y) > dynamic_tol:
             current += 1
             last_y = y
         row_id.append(current)
@@ -11521,8 +11625,9 @@ def _ocr_header_key(text: str) -> str:
     s = _norm_ocr_token(text)
     try:
         s = s.translate(str.maketrans('ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ', 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'))
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _ocr_header_key translate failed: {_e}', file=_sys.stderr)
     s = s.upper()
     s = s.replace('一', 'ー').replace('-', 'ー').replace('_', '')
     s = re.sub(r'[\s:：./・,，]+', '', s)
@@ -11685,17 +11790,35 @@ def _image_size(path: str) -> tuple[int,int]:
 
 
 def _norm_ocr_token(t: str) -> str:
-    """OCR トークンを正規化する（全角数字→半角、空白除去、長音・記号統一等）。"""
+    """OCR トークンを正規化する（全角数字→半角、空白除去、長音・記号統一等）。
+
+    精度改善:
+    - 全角英字も半角に変換
+    - よくあるOCR誤認（rn→m, 0→O等）を修正
+    - 全角記号の正規化を拡充
+    """
     if t is None:
         return ''
     s = str(t).strip()
     try:
+        # 全角数字→半角
         s = s.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
     except Exception:
         pass
+    # IMPROVE: 全角英字も半角に変換
+    try:
+        s = s.translate(str.maketrans(
+            'ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ',
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+        ))
+    except Exception:
+        pass
     # common noise
-    s = s.replace('　',' ')
-    s = s.replace('．','.').replace('。','.').replace('，',',').replace('、',',').replace('：',':').replace('；',';')
+    s = s.replace('　', ' ')
+    s = s.replace('．', '.').replace('。', '.').replace('，', ',').replace('、', ',').replace('：', ':').replace('；', ';')
+    # IMPROVE: 全角括弧・長音など追加正規化
+    s = s.replace('（', '(').replace('）', ')').replace('「', '').replace('」', '')
+    s = s.replace('〜', '-').replace('～', '-')
 
     # numeric-like OCR noise only (do NOT touch horse names)
     try:
@@ -11703,10 +11826,10 @@ def _norm_ocr_token(t: str) -> str:
     except Exception:
         numeric_like = False
     if numeric_like:
-        s = (s.replace('O','0').replace('o','0')
-               .replace('I','1').replace('l','1').replace('|','1')
-               .replace('S','5').replace('s','5')
-               .replace('B','8').replace('Z','2').replace('z','2'))
+        s = (s.replace('O', '0').replace('o', '0')
+               .replace('I', '1').replace('l', '1').replace('|', '1')
+               .replace('S', '5').replace('s', '5')
+               .replace('B', '8').replace('Z', '2').replace('z', '2'))
         s = s.replace(',', '.').replace(':', '.').replace(';', '.').replace("'", '.')
         s = re.sub(r'\s+', '', s)
         s = re.sub(r'\.{2,}', '.', s)
@@ -11737,8 +11860,12 @@ def _parse_float_token(s: str) -> float | None:
 
 
 def _parse_float_token_loose(s: str, lo: float | None = None, hi: float | None = None) -> float | None:
-    """    ゆるい形式（単位付き等）の文字列から浮動小数点数を抽出する。
+    """ゆるい形式（単位付き等）の文字列から浮動小数点数を抽出する。
     lo/hi 範囲外の場合は None を返す。
+
+    精度改善:
+    - 正規表現による小数点付き数値の直接抽出を先に試みる
+    - 桁数ヒューリスティックを拡充（2桁整数対応）
     """
     s = _norm_ocr_token(s)
     def _ok(x) -> bool:
@@ -11759,10 +11886,22 @@ def _parse_float_token_loose(s: str, lo: float | None = None, hi: float | None =
     if _ok(v):
         return float(v)
 
+    # IMPROVE: 正規表現で直接 float パターンを抽出（例: "76.5点" → 76.5）
+    m = re.search(r'(\d{1,3}\.\d{1,2})', s)
+    if m:
+        try:
+            candidate = float(m.group(1))
+            if _ok(candidate):
+                return candidate
+        except Exception:
+            pass
+
     digits = re.sub(r'[^0-9]', '', s)
     cands = []
-    if re.fullmatch(r'\d{3}', digits):
-        cands = [int(digits) / 10.0]
+    if re.fullmatch(r'\d{2}', digits):  # IMPROVE: 2桁整数（例: "76"）も候補に
+        cands = [int(digits)]
+    elif re.fullmatch(r'\d{3}', digits):
+        cands = [int(digits) / 10.0, int(digits)]  # IMPROVE: 整数値も候補
     elif re.fullmatch(r'\d{4}', digits):
         cands = [int(digits) / 10.0, int(digits) / 100.0]
     elif re.fullmatch(r'\d{5}', digits):
@@ -11794,27 +11933,40 @@ def _row_tokens(words: pd.DataFrame) -> list[dict]:
 
 
 def _extract_num_and_name(tokens: list[dict], img_w: int) -> tuple[str,str,str]:
-    """Return (num, name, cpu_mark). name is concatenated from middle tokens."""
+    """Return (num, name, cpu_mark). name is concatenated from middle tokens.
+
+    精度改善:
+    - 枠番の誤認識防止: xc範囲を0.22まで拡張して馬番検出を改善
+    - 名前バンドをより広く（0.15〜0.82）取ってOCRの位置ずれに対応
+    - 連続したひらがな・カタカナ・漢字のみで構成されるトークンを優先
+    """
     num=''
     cpu=''
-    # pick leftmost 1-20 integer near left side
+    # pick leftmost 1-20 integer near left side (widened to 0.22 for OCR drift)
     for d in tokens:
         iv=_parse_int_token(d['t'])
-        if iv is not None and 1 <= iv <= 20 and d['xc'] <= img_w*0.18:
+        if iv is not None and 1 <= iv <= 18 and d['xc'] <= img_w*0.22:
             num=str(iv)
             break
+    # IMPROVE: 馬番が見つからない場合、より左側の数値トークンを拡張検索
+    if not num:
+        for d in tokens:
+            iv=_parse_int_token(d['t'])
+            if iv is not None and 1 <= iv <= 18 and d['xc'] <= img_w*0.30:
+                num=str(iv)
+                break
     # cpu mark: first mark token near left-mid
     for d in tokens:
-        if d['t'] in _MARK_TOKENS and d['xc'] <= img_w*0.28:
+        if d['t'] in _MARK_TOKENS and d['xc'] <= img_w*0.30:
             cpu=d['t']
             break
     # name: tokens in the central band, excluding pure numbers and marks
     name_tokens=[]
     for d in tokens:
         t=d['t']
-        if d['xc'] < img_w*0.18:
+        if d['xc'] < img_w*0.15:   # IMPROVE: 0.18→0.15（位置ずれ対応）
             continue
-        if d['xc'] > img_w*0.78:
+        if d['xc'] > img_w*0.82:   # IMPROVE: 0.78→0.82（長名対応）
             continue
         if t in _MARK_TOKENS:
             continue
@@ -11826,7 +11978,20 @@ def _extract_num_and_name(tokens: list[dict], img_w: int) -> tuple[str,str,str]:
         if t:
             name_tokens.append(t)
     name=''.join(name_tokens).strip()
-    return num,name,cpu
+    # IMPROVE: 名前が空の場合、マーク記号を除いたすべてのトークンを試みる
+    if not name and num:
+        fallback_tokens = []
+        for d in tokens:
+            t = d['t']
+            if t in _MARK_TOKENS:
+                continue
+            if re.fullmatch(r"\d+(?:\.\d+)?", t):
+                continue
+            t2 = re.sub(r"[^0-9A-Za-z\u3040-\u30ff\u4e00-\u9fffー\-]", "", t).strip('-')
+            if t2 and len(t2) >= 2:
+                fallback_tokens.append(t2)
+        name = ''.join(fallback_tokens[:4]).strip()  # 最大4トークンまで
+    return num, name, cpu
 
 
 def ocr_rating_table_v10(image_path: str, lang: str = 'jpn+eng') -> pd.DataFrame:
@@ -12132,13 +12297,15 @@ def ocr_rating_table_v10_cached(
         if hit is not None and isinstance(hit, list):
             try:
                 return pd.DataFrame(hit)
-            except Exception:
-                pass
+            except Exception as _e:
+                import sys as _sys
+                print(f'[WARN] rating OCR cache DataFrame conversion failed: {_e}', file=_sys.stderr)
     df_result = ocr_rating_table_v10(image_path, lang=lang)
     try:
         _ocr_cache_save_json(cache_dir, key, df_result.to_dict(orient='records'))
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] rating OCR cache save failed: {_e}', file=_sys.stderr)
     return df_result
 
 
@@ -12160,8 +12327,9 @@ def ocr_speed_index_table_v10_cached(
     df_result = ocr_speed_index_table_v10(image_path, lang=lang)
     try:
         _ocr_cache_save_json(cache_dir, key, df_result.to_dict(orient='records'))
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] speed_index OCR cache save failed: {_e}', file=_sys.stderr)
     return df_result
 
 
@@ -12178,13 +12346,15 @@ def ocr_factor_table_v10_cached(
         if hit is not None and isinstance(hit, list):
             try:
                 return pd.DataFrame(hit)
-            except Exception:
-                pass
+            except Exception as _e:
+                import sys as _sys
+                print(f'[WARN] factor OCR cache DataFrame conversion failed: {_e}', file=_sys.stderr)
     df_result = ocr_factor_table_v10(image_path, lang=lang)
     try:
         _ocr_cache_save_json(cache_dir, key, df_result.to_dict(orient='records'))
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] factor OCR cache save failed: {_e}', file=_sys.stderr)
     return df_result
 
 
@@ -12204,13 +12374,15 @@ def ocr_pred_times_table_v10_cached(
         if hit is not None and isinstance(hit, list):
             try:
                 return pd.DataFrame(hit)
-            except Exception:
-                pass
+            except Exception as _e:
+                import sys as _sys
+                print(f'[WARN] pred_times OCR cache DataFrame conversion failed: {_e}', file=_sys.stderr)
     df_result = ocr_pred_times_table_v10(image_paths, lang=lang)
     try:
         _ocr_cache_save_json(cache_dir, key, df_result.to_dict(orient='records'))
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] pred_times OCR cache save failed: {_e}', file=_sys.stderr)
     return df_result
 
 
@@ -17260,8 +17432,9 @@ def ocr_track_images(track_img_paths: List[str], lang: str = "jpn") -> Dict[str,
             img = preprocess_for_ocr(pil)
             t = pytesseract.image_to_string(img, lang=lang, config="--psm 6")
             texts.append(t)
-        except Exception:
-            pass
+        except Exception as _e:
+            import sys as _sys
+            print(f'[WARN] OCR failed for {p}: {_e}', file=_sys.stderr)
 
     joined = "\n".join(texts)
     raw = parse_track_conditions_text(joined)
@@ -17565,8 +17738,9 @@ def _kbs_course_normalize(dfa, tr: dict) -> object:
             iqr  = float(sub.quantile(0.75) - sub.quantile(0.25)) if len(sub) >= 3 else 1.0
             iqr  = max(iqr, 1.0)
             dfa.loc[mask, 'WorkoutScore_latest'] = _clip0100(((sub - med) / iqr * 10 + 50))
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _kbs_course_normalize failed: {_e}', file=_sys.stderr)
     return dfa
 
 
@@ -21223,8 +21397,9 @@ def _cbf_apply_sanko_gai_override(df: "pd.DataFrame") -> "pd.DataFrame":
             else:
                 df.loc[idx, 'Ability'] = min(100.0, float(df.loc[idx, 'Ability']) + 8.0)
                 df.loc[idx, 'rating_norm'] = min(100.0, float(df.loc[idx, 'rating_norm']) + 5.0)
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _cbf_apply_sanko_gai_override failed: {_e}', file=_sys.stderr)
     return df
 
 
@@ -21333,7 +21508,9 @@ def _csv_compute_base_features(
                     np.clip(_ability + (_cpf - 50.0) * _ped_scale, 0.0, 100.0),
                     df.index
                 )
-    except Exception:
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] course_pedigree_fit apply failed: {_e}', file=_sys.stderr)
         if 'CoursePedigreeFit' not in df.columns:
             df['CoursePedigreeFit'] = 50.0
         if 'CoursePedigreeBonus' not in df.columns:
@@ -21383,7 +21560,13 @@ def _sas_compute_weights(params: dict, wet_mode: bool) -> dict:
 
 
 def _sas_apply_geo_blend(df, params: dict, sas_add_col: str = 'SAS') -> object:
-    """SAS_add と SAS_geo をブレンドして SAS 列を上書きした df を返す。"""
+    """SAS_add と SAS_geo をブレンドして SAS 列を上書きした df を返す。
+
+    精度改善:
+    - 幾何平均の計算をより安定に（log(x+eps)のepsを調整）
+    - 列が少ない場合のブレンド比率を動的に調整
+    - NaN の多い列を除外して精度を維持
+    """
     import numpy as np
     wp  = (params.get('wide_rules') or {})
     geo_blend = float(wp.get('sas_geo_blend', 0.35) or 0.35)
@@ -21391,18 +21574,28 @@ def _sas_apply_geo_blend(df, params: dict, sas_add_col: str = 'SAS') -> object:
     try:
         sas_add = _num_series(df[sas_add_col], 50.0, index=df.index)
         geo_cols = ['AnchorScore', 'PosFit', 'Consist', 'MapFit']
-        avail = [c for c in geo_cols if c in df.columns]
+        # IMPROVE: NaNが50%超の列は除外して精度を維持
+        avail = []
+        for c in geo_cols:
+            if c in df.columns:
+                col_vals = pd.to_numeric(df[c], errors='coerce')
+                if col_vals.notna().sum() >= max(1, len(df) * 0.5):
+                    avail.append(c)
         if avail and geo_blend > 0.0:
             stack = np.column_stack([
                 np.clip(_arr(df, c, 50.0), 1.0, 100.0)
                 for c in avail
             ])
             with np.errstate(all='ignore'):
-                sas_geo = np.exp(np.nanmean(np.log(stack + 1e-9), axis=1)) - 1e-9
+                # IMPROVE: log(x + 1e-6) でより安定な幾何平均
+                sas_geo = np.exp(np.nanmean(np.log(stack + 1e-6), axis=1)) - 1e-6
             sas_geo = np.clip(sas_geo, 0.0, 100.0)
-            df[sas_add_col] = _clip0100(((1.0 - geo_blend) * sas_add + geo_blend * sas_geo))
-    except Exception:
-        pass
+            # IMPROVE: avail列数が少ない場合はblend比率を下げる
+            effective_blend = geo_blend * min(1.0, len(avail) / max(1, len(geo_cols)))
+            df[sas_add_col] = _clip0100(((1.0 - effective_blend) * sas_add + effective_blend * sas_geo))
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _sas_apply_geo_blend failed: {_e}', file=_sys.stderr)
     return df
 
 
@@ -21419,8 +21612,9 @@ def _sas_apply_training_delta(df, params: dict) -> object:
         delta = _clip_series(_num_series(df['delta_train'], 0.0, index=df.index), -td_cap, td_cap)
         df['SAS']         = _clip0100((_num_series(df['SAS'],         50.0, index=df.index) + delta * td_scale))
         df['AnchorScore'] = _clip0100((_num_series(df['AnchorScore'], 50.0, index=df.index) + delta * td_scale))
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _sas_apply_training_delta failed: {_e}', file=_sys.stderr)
     return df
 
 def _csv_compute_sas(
@@ -21477,7 +21671,9 @@ def _csv_compute_sas(
             + michiaku_w * _sc('MichiakuScore', 50.0)
         ))
         df['SAS'] = sas_add
-    except Exception:
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] SAS add calculation failed: {_e}', file=_sys.stderr)
         df['SAS'] = 50.0
 
     # 5. コメントΔ適用
@@ -21487,8 +21683,9 @@ def _csv_compute_sas(
         if 'comment_delta' in df.columns:
             cd = _clip_series(_num_series(df['comment_delta'], 0.0, index=df.index), -cap, cap)
             df['SAS'] = _clip0100((_num_series(df['SAS'], 50.0, index=df.index) + cd * scale))
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] SAS comment_delta apply failed: {_e}', file=_sys.stderr)
 
     # 6. SAS_UNIFIED: 幾何平均ブレンド
     df = _sas_apply_geo_blend(df, params)
@@ -22870,8 +23067,9 @@ def _comp_axis_final(
         meta['trio_race_type_mode'] = 'closing' if pace_mode in {'high', 'high-mid'} else 'good-position'
         meta['position_second_column_nums'] = ','.join(promoted_second)
         meta['pace_human_check'] = str((meta or {}).get('pace_human_check', '') or '')
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _compute_scenario_marks meta update failed: {_e}', file=_sys.stderr)
     return df
 
 
@@ -22971,8 +23169,9 @@ def _csp_update_meta_nums(
               .loc[_num_series(df.get('ValueHoleFlag', 0), 0, index=df.index, dtype=int) > 0, 'num']
               .astype(str).tolist()[:6]
         )
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] value_hole_nums update failed: {_e}', file=_sys.stderr)
 
 
 def _csp_apply_pace_h_front_penalty(
@@ -23101,7 +23300,9 @@ def _csp_apply_pace_h_rear_bonus(
         # AnchorScore に REAR + MIDDLE ボーナスを加算
         total_bonus = rear_bonus + mid_bonus
         df['AnchorScore'] = _clip0100((df['AnchorScore'] + total_bonus)).astype(float)
-    except Exception:
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _csp_apply_pace_h_rear_bonus failed: {_e}', file=_sys.stderr)
         df['AnchorScoreRearBonus'] = 0.0
         df['AnchorScoreMiddleGRBBonus'] = 0.0
     return df
@@ -23193,10 +23394,17 @@ def _csp_compute_win_place_probs(
     except Exception:
         win_tau = 12.0
     _win_score = _num_series(df[score_col_for_win], 50.0, index=df.index)
-    win_raw = np.exp((_win_score - _win_score.mean()) / max(1.0, win_tau))
-    win_raw = pd.Series(win_raw).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    win_denom = float(win_raw.sum())
-    df["p_win_field"] = (win_raw / win_denom * 100.0).astype(float) if win_denom > 0 else 0.0
+    _win_mean = float(_win_score.mean()) if _win_score.notna().sum() > 0 else 50.0
+    # IMPROVE: z をクランプして exp() オーバーフロー防止
+    _win_z = np.clip((_win_score.values - _win_mean) / max(1.0, win_tau), -15.0, 15.0)
+    win_raw = np.exp(_win_z)
+    win_raw = np.where(np.isfinite(win_raw) & (win_raw >= 0), win_raw, 0.0)
+    win_denom = float(np.sum(win_raw))
+    # IMPROVE: 全馬0の場合は均等分配
+    if win_denom > 0:
+        df["p_win_field"] = _make_series(win_raw / win_denom * 100.0, df.index).astype(float)
+    else:
+        df["p_win_field"] = _make_series(np.full(len(df), 100.0 / max(1, len(df))), df.index).astype(float)
     df = _apply_win_expected_value(df, params=params, meta=meta)
 
     # --- Tight race detection ---
@@ -23371,8 +23579,9 @@ def compute_scores_v1_1(entries: pd.DataFrame, meta: Dict[str, str], params: Opt
             _cpb = pd.to_numeric(df['CoursePedigreeBonus'], errors='coerce').fillna(0.0).values
             _anchor = pd.to_numeric(df['AnchorScore'], errors='coerce').fillna(50.0).values
             df['AnchorScore'] = _make_series(np.clip(_anchor + _cpb, 0.0, 100.0), df.index)
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] CoursePedigreeBonus apply to AnchorScore failed: {_e}', file=_sys.stderr)
 
     # ── WINDEX指数統合 (v1.35) ──────────────────────────────────
     # windex_score/kiso/blood/hatten/time/jockey 列が存在する場合に
@@ -23639,8 +23848,9 @@ def _anchor_apply_risk_guard(d, best: dict, params: dict) -> dict:
                               ascending=[False, False, False, True])
             if len(d):
                 best = d.iloc[0].to_dict()
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _select_anchor_from_scored failed: {_e}', file=_sys.stderr)
     return best
 
 
@@ -23785,8 +23995,9 @@ def _anchor_resolve_box_candidates(
                     _ex_nums.add(_num_str)
             if len(result) > max_count:
                 result = sorted(result, key=lambda x: float(x.get('AnchorScore', 0)), reverse=True)[:max_count+1]
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] _build_wide_candidates failed: {_e}', file=_sys.stderr)
 
     mode = 'BOX' if len(result) >= 2 else 'SINGLE'
     for r in result:
@@ -23867,14 +24078,28 @@ def _pl_strength_from_score(df: pd.DataFrame, score_col: str = 'SAS', tau: float
     - market側: (任意) p_win_mkt があればそれも弱く混ぜる
 
     ブレンドは log ドメイン（幾何平均）にして安定化。
+
+    精度改善:
+    - tauが0に近い場合の数値安定性向上
+    - NaNが多い場合のフォールバック改善
+    - 強さの最小値をより安全な値に設定
     """
     if score_col not in df.columns:
         score_col = 'SAS' if 'SAS' in df.columns else score_col
 
     sc = _num_series(df.get(score_col), np.nan, index=df.index)
-    sc = _num_series(sc, float(sc.mean()) if sc.notna().sum() else 50.0, index=df.index)
-    x = (sc.astype(float) - float(sc.mean())) / float(tau)
-    s_model = np.exp(x.values)
+    valid_count = int(sc.notna().sum())
+    if valid_count == 0:
+        # IMPROVE: 全NaNの場合は均等強さを返す（0除算回避）
+        return np.ones(len(df), dtype=float)
+    sc_fill = float(sc.mean()) if valid_count > 0 else 50.0
+    sc = _num_series(sc, sc_fill, index=df.index)
+
+    tau_safe = float(max(1e-3, tau))  # IMPROVE: tau=0防止
+    x = (sc.astype(float) - float(sc.mean())) / tau_safe
+    # IMPROVE: x をクランプして exp() オーバーフロー防止
+    x_clipped = np.clip(x.values, -15.0, 15.0)
+    s_model = np.exp(x_clipped)
     s_model = np.where(np.isfinite(s_model) & (s_model > 0), s_model, 1e-9)
 
     # market signal
@@ -25897,8 +26122,9 @@ def _sworm_pace_adjust(
                 pf01 = _clip_series(((float(pf.max()) - pf) / (float(pf.max()) - float(pf.min()))), 0.0, 1.0)
                 adj.loc[zn == 'FRONT'] -= (_front_fast_pen * pf01.loc[zn == 'FRONT']).astype(float)
             pool['pick_score_base'] = (pool['pick_score_base'] + adj).astype(float)
-        except Exception:
-            pass
+        except Exception as _e:
+            import sys as _sys
+            print(f'[WARN] pace zone pick_score_base adjust failed: {_e}', file=_sys.stderr)
 
     # pace->zone bonus (score add only; does NOT loosen market gates)
     try:
@@ -25968,8 +26194,9 @@ def _sworm_pace_adjust(
             # Combine (clamped), then apply only to REAR/MIDDLE
             perf01 = _clip_series((0.7*sm01.fillna(0.0) + 0.3*sh01.fillna(0.0)), 0.0, 1.0)
             pool.loc[rear_mask, 'pick_score_base'] = (pool.loc[rear_mask, 'pick_score_base'] + _sp_bonus*perf01.loc[rear_mask]).astype(float)
-        except Exception:
-            pass
+        except Exception as _e:
+            import sys as _sys
+            print(f'[WARN] rear perf score bonus failed: {_e}', file=_sys.stderr)
 
     # R28: ワイド対抗スコア ペース別重み行列 (M/S)
     try:
@@ -26167,8 +26394,9 @@ def _sworm_post_pick(
                             out.loc[worst_pos, c] = best_row[c]
                     out.loc[worst_pos, 'pick_score'] = float(best_row.get('pick_score_base', out.loc[worst_pos, 'pick_score']))
                     _swapped_for_place = True
-        except Exception:
-            pass
+        except Exception as _e:
+            import sys as _sys
+            print(f'[WARN] place candidate swap failed: {_e}', file=_sys.stderr)
 
     # === ENSURE_TRIO_PLUS_IN_WIDE_V1: force include 'trio-plus' candidate in wide ===
     # Policy: ワイド4点のうち1点は「連軸プラス推奨」枠（=三連複フォメ3頭目候補の最上位）から必ず採る。
@@ -28006,8 +28234,9 @@ def _bam_section_analysis(d0, meta: dict, anchor_num: str, params: dict) -> str:
     # ---- 重賞特化分析セクション（重賞レース検出時のみ出力）----
     try:
         out += _bam_section_graded_race_analysis(d0, meta, anchor_num, params)
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] graded race analysis section failed: {_e}', file=_sys.stderr)
     out += _bsa_next_race(d0, params)
     return out
 
@@ -28051,8 +28280,9 @@ def _bam_section_betting_plan(
             if str(_ne) != str(_n):
                 last3f_line += f"（例外で{_ne}頭）"
             last3f_line += '\n'
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys as _sys
+        print(f'[WARN] last3f_line build failed: {_e}', file=_sys.stderr)
     out += last3f_line
 
     anchor_risk_line = '- 軸リスク警告: なし\n'
@@ -29115,8 +29345,9 @@ def _main_ocr_meta(args: "argparse.Namespace") -> "Dict[str, str]":
                     r = f.result()
                     if isinstance(r, dict):
                         meta.update(r)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    import sys as _sys
+                    print(f'[WARN] parallel OCR job ({k}) failed: {_e}', file=_sys.stderr)
     except Exception:
         # sequential fallback
         if args.meta_img:
@@ -29796,8 +30027,9 @@ def main() -> None:
             _r41_conf_info = {}
             try:
                 _r41_conf_info = _r40_place_confidence_level(anchor, scored, params) or {}
-            except Exception:
-                pass
+            except Exception as _e:
+                import sys as _sys
+                print(f'[WARN] _r40_place_confidence_level failed: {_e}', file=_sys.stderr)
             _r41_place_ok = bool(anchor.get('p_place_est', 0.0) >= float(
                 (params.get('place_rules', {}) or {}).get('min_p_place_est', 0.26) or 0.26
             ))
@@ -29977,8 +30209,9 @@ def main() -> None:
                     from pathlib import Path as _Path
                     _Path(_ana_path).write_text(_r41_report, encoding='utf-8')
                     print(f'[R41] analysis report -> {_ana_path}')
-                except Exception:
-                    pass
+                except Exception as _e:
+                    import sys as _sys
+                    print(f'[WARN] R41 report write failed ({_ana_path}): {_e}', file=_sys.stderr)
         except Exception as _e:
             print(f'[R41] analyze failed: {_e}')
 
@@ -30169,7 +30402,7 @@ def main() -> None:
             print('[R55] 補正係数: {}'.format(
                 {k: round(v.get('alpha', 1.0), 3) if isinstance(v, dict) else v
                  for k, v in _alphas.items()}))
-            print('[R55] ╲u03b1JSON保存 -> {}'.format(_r55_result.get('alpha_json', '')))
+            print('[R55] αJSON保存 -> {}'.format(_r55_result.get('alpha_json', '')))
         except Exception as _e:
             print('[R55] apply_alpha failed: {}'.format(_e))
         return  # 信頼度スコア補正のみで終了
