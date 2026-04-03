@@ -78,6 +78,12 @@ except Exception:  # allow non-OCR runs
     cv2 = None
     pytesseract = None
 
+# PDF support (optional – requires PyMuPDF)
+try:
+    import fitz as _fitz  # PyMuPDF
+except Exception:
+    _fitz = None
+
 
 # =========================
 # 0) Utils
@@ -98,6 +104,153 @@ def _ocr_cache_key(prefix: str, img_path: str, lang: str) -> str:
     import hashlib
     raw = f"{prefix}:{img_path}:{lang}".encode('utf-8', errors='ignore')
     return hashlib.sha1(raw).hexdigest()
+
+
+# =========================
+# PDF → 画像変換ユーティリティ (PyMuPDF使用)
+# =========================
+
+def pdf_to_images(
+    pdf_path: str,
+    out_dir: Optional[str] = None,
+    dpi: int = 200,
+    fmt: str = "png",
+) -> List[str]:
+    """PDF の各ページを画像ファイルに変換してパスリストを返す。
+
+    Parameters
+    ----------
+    pdf_path : str
+        入力PDFのパス。
+    out_dir : str, optional
+        画像出力ディレクトリ。None の場合は PDF と同じディレクトリに保存。
+    dpi : int
+        レンダリング解像度（デフォルト 200 DPI）。
+    fmt : str
+        出力画像フォーマット（"png" または "jpg"）。
+
+    Returns
+    -------
+    List[str]
+        生成した画像ファイルのパスリスト（ページ順）。
+    """
+    if _fitz is None:
+        raise ImportError(
+            "PDF support requires PyMuPDF. Install with: pip install pymupdf"
+        )
+    import os
+    from pathlib import Path as _P
+
+    pdf_path = str(pdf_path)
+    if not os.path.isfile(pdf_path):
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    base_name = _P(pdf_path).stem
+    if out_dir is None:
+        out_dir = str(_P(pdf_path).parent)
+    _P(out_dir).mkdir(parents=True, exist_ok=True)
+
+    # dpi → zoom 係数 (72 dpi が基準)
+    zoom = dpi / 72.0
+    mat = _fitz.Matrix(zoom, zoom)
+
+    out_paths: List[str] = []
+    doc = _fitz.open(pdf_path)
+    try:
+        for i, page in enumerate(doc):
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            out_name = f"{base_name}_page{i+1:03d}.{fmt}"
+            out_path = str(_P(out_dir) / out_name)
+            pix.save(out_path)
+            out_paths.append(out_path)
+    finally:
+        doc.close()
+
+    return out_paths
+
+
+def parse_pdf_text(pdf_path: str) -> str:
+    """PDF からテキストを抽出して返す（全ページ結合）。
+
+    PyMuPDF でテキスト抽出できない場合は pdfplumber でフォールバック。
+    """
+    if _fitz is not None:
+        try:
+            doc = _fitz.open(str(pdf_path))
+            texts = []
+            try:
+                for page in doc:
+                    texts.append(page.get_text("text"))
+            finally:
+                doc.close()
+            result = "\n".join(texts).strip()
+            if result:
+                return result
+        except Exception:
+            pass
+
+    # フォールバック: pdfplumber
+    try:
+        import pdfplumber
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            texts = []
+            for page in pdf.pages:
+                t = page.extract_text() or ""
+                texts.append(t)
+        return "\n".join(texts).strip()
+    except Exception:
+        pass
+
+    return ""
+
+
+def pdf_to_rating_csv(pdf_path: str, out_dir: Optional[str] = None) -> Optional[str]:
+    """PDF からレイティング情報を解析してCSVを保存し、そのパスを返す。
+
+    PDFのテキストから馬番・馬名・Rating・SpeedIndex の行を検出する。
+    解析できなかった場合は None を返す。
+    """
+    import csv
+    import re
+    from pathlib import Path as _P
+
+    text = parse_pdf_text(pdf_path)
+    if not text:
+        return None
+
+    # 行ごとに処理: "番号 馬名 ... 数値" のパターンを探す
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # 馬番（1〜18）で始まる行を候補とする
+        m = re.match(
+            r'^(\d{1,2})\s+([^\d\s][^\t\n]*?)\s+([\d.]+)\s*$', line
+        )
+        if m:
+            num = m.group(1)
+            name = m.group(2).strip()
+            val = m.group(3)
+            try:
+                num_i = int(num)
+                if 1 <= num_i <= 18:
+                    rows.append({'num': num_i, 'name': name, 'rating': float(val)})
+            except ValueError:
+                pass
+
+    if not rows:
+        return None
+
+    if out_dir is None:
+        out_dir = str(_P(pdf_path).parent)
+    _P(out_dir).mkdir(parents=True, exist_ok=True)
+    csv_path = str(_P(out_dir) / (_P(pdf_path).stem + "_rating.csv"))
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['num', 'name', 'rating'])
+        writer.writeheader()
+        writer.writerows(rows)
+    return csv_path
 
 
 def _ocr_cache_load_json(cache_dir: Optional[str], key: str) -> Optional[dict]:
@@ -28655,6 +28808,14 @@ def _main_build_argparser() -> "argparse.ArgumentParser":
     """CLI 引数パーサーを構築して返す。main() から分離。"""
     ap = argparse.ArgumentParser()
 
+    # --- PDF input (v1.34+) ---
+    ap.add_argument('--pdf', type=str, default=None,
+                    help='【PDF】レース資料PDF（各ページを画像に変換してOCR）')
+    ap.add_argument('--pdf_dpi', type=int, default=200,
+                    help='PDF→画像変換時のDPI（デフォルト200）')
+    ap.add_argument('--pdf_out_dir', type=str, default=None,
+                    help='PDF→画像変換の出力先ディレクトリ（未指定時はPDFと同じフォルダ）')
+
     # --- legacy (v9) ---
     ap.add_argument('--entries_img', type=str, default=None, help='出走表スクショ（列名付き / legacy）')
     ap.add_argument('--entries_csv', type=str, default=None, help='出走表CSV（legacy / 任意）')
@@ -29437,10 +29598,78 @@ def _main_score_and_anchor(args, entries: "pd.DataFrame", meta: dict, params: di
     return scored, norm_logs, flags, anchor, anchor_num, wide_market_df
 
 
+def _main_process_pdf(args: "argparse.Namespace") -> None:
+    """--pdf 引数が指定された場合、PDFを画像に変換してargs に反映する。
+
+    PDFの各ページを画像化し、最初の2ページを rating_img / speed_index_img として
+    割り当てる。3ページ目以降は pred_times_imgs に追加する。
+    既に rating_img / speed_index_img が指定されている場合は上書きしない。
+    """
+    pdf_path = getattr(args, 'pdf', None)
+    if not pdf_path:
+        return
+
+    import os
+    from pathlib import Path as _P
+
+    print(f'[PDF] PDF入力: {pdf_path}')
+
+    # 出力ディレクトリ
+    out_dir = getattr(args, 'pdf_out_dir', None) or str(_P(pdf_path).parent / 'pdf_images')
+    dpi = int(getattr(args, 'pdf_dpi', 200) or 200)
+
+    try:
+        img_paths = pdf_to_images(pdf_path, out_dir=out_dir, dpi=dpi)
+        print(f'[PDF] {len(img_paths)} ページを画像に変換: {out_dir}')
+    except Exception as e:
+        print(f'[PDF] 画像変換失敗: {e}')
+        # フォールバック: pdfplumber でテキスト抽出してCSV経由で入力
+        try:
+            text = parse_pdf_text(pdf_path)
+            if text:
+                print(f'[PDF] テキスト抽出成功 ({len(text)} 文字)。CSV経由で処理します。')
+                csv_path = pdf_to_rating_csv(pdf_path, out_dir=out_dir)
+                if csv_path and not getattr(args, 'entries_csv', None):
+                    args.entries_csv = csv_path
+                    print(f'[PDF] entries_csv に設定: {csv_path}')
+        except Exception as e2:
+            print(f'[PDF] テキスト抽出も失敗: {e2}')
+        return
+
+    if not img_paths:
+        print('[PDF] 画像なし。PDF処理をスキップします。')
+        return
+
+    # ページ割り当て
+    # 1ページ目 → rating_img（未設定の場合のみ）
+    if not getattr(args, 'rating_img', None) and len(img_paths) >= 1:
+        args.rating_img = img_paths[0]
+        print(f'[PDF] rating_img = page1: {img_paths[0]}')
+
+    # 2ページ目 → speed_index_img（未設定の場合のみ）
+    if not getattr(args, 'speed_index_img', None) and len(img_paths) >= 2:
+        args.speed_index_img = img_paths[1]
+        print(f'[PDF] speed_index_img = page2: {img_paths[1]}')
+    elif not getattr(args, 'speed_index_img', None) and len(img_paths) == 1:
+        # 1ページのみの場合は同じ画像を使用
+        args.speed_index_img = img_paths[0]
+        print(f'[PDF] speed_index_img = page1 (1ページのみ): {img_paths[0]}')
+
+    # 3ページ目以降 → pred_times_imgs に追加
+    if len(img_paths) >= 3:
+        extra = img_paths[2:]
+        existing = list(getattr(args, 'pred_times_imgs', None) or [])
+        args.pred_times_imgs = existing + extra
+        print(f'[PDF] pred_times_imgs に {len(extra)} ページ追加')
+
+
 def main() -> None:
     """CLI エントリポイント。引数を解析し OCR → スコア計算 → 出力 MD を実行する。"""
     ap = _main_build_argparser()
     args = ap.parse_args()
+
+    # PDF入力処理（--pdf が指定された場合、画像に変換してargs に反映）
+    _main_process_pdf(args)
 
     # PROD_FAST_DEFAULT_CACHE_V1: デフォルトキャッシュDIR設定
     _main_setup_cache_dirs(args)

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-app.py  —  STELLA v1.33 スーパーエージェント Web UI
+app.py  —  STELLA v1.34 スーパーエージェント Web UI
 「競馬予想」と入力するだけで予想が始まるチャット形式インターフェース
+PDF資料からの予想にも対応（PyMuPDF + pdfplumber）
 """
 import os
 import sys
@@ -21,22 +22,29 @@ from werkzeug.utils import secure_filename
 BASE_DIR    = Path(__file__).parent.resolve()
 UPLOAD_DIR  = BASE_DIR / "uploads"
 OUTPUT_DIR  = BASE_DIR / "output"
+STATIC_DIR  = BASE_DIR / "static"
 GINANDTONIC = BASE_DIR / "GINANDTONIC.py"
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
+STATIC_DIR.mkdir(exist_ok=True)  # static フォルダが無い場合も自動作成
 
-ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+ALLOWED_IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+ALLOWED_PDF_EXT = {".pdf"}
+ALLOWED_EXT     = ALLOWED_IMG_EXT | ALLOWED_PDF_EXT
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100MB
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB (PDF対応)
 
 # ── 実行中セッション管理 ─────────────────────────
 _jobs: dict = {}   # job_id -> {"status", "log", "markdown", "error", "start_time"}
 _lock = threading.Lock()
 
 # ── ユーティリティ ────────────────────────────────
-def allowed(filename: str) -> bool:
+def allowed_img(filename: str) -> bool:
+    return Path(filename).suffix.lower() in ALLOWED_IMG_EXT
+
+def allowed_any(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_EXT
 
 def save_upload(f) -> Path:
@@ -47,6 +55,9 @@ def save_upload(f) -> Path:
     f.save(dest)
     return dest
 
+# ─────────────────────────────────────────────────
+#  STELLA 実行（画像モード）
+# ─────────────────────────────────────────────────
 def run_stella(job_id: str, rating_img: str, speed_index_img: str,
                meta_img: str = None, factor_img: str = None,
                ai_time_img: str = None,
@@ -55,7 +66,7 @@ def run_stella(job_id: str, rating_img: str, speed_index_img: str,
                training_imgs: list = None,
                comments_csv: str = None,
                fast: bool = False):
-    """バックグラウンドで GINANDTONIC.py を実行する。"""
+    """バックグラウンドで GINANDTONIC.py を実行する（画像入力モード）。"""
     out_md = str(OUTPUT_DIR / f"{job_id}.md")
 
     cmd = [
@@ -68,18 +79,46 @@ def run_stella(job_id: str, rating_img: str, speed_index_img: str,
     if meta_img:        cmd += ["--meta_img",      meta_img]
     if factor_img:      cmd += ["--factor_img",    factor_img]
     if ai_time_img:     cmd += ["--ai_time_img",   ai_time_img]
-    if pred_times_imgs: cmd += ["--pred_times_imgs"] + pred_times_imgs
-    if track_imgs:      cmd += ["--track_imgs"]    + track_imgs
-    if training_imgs:   cmd += ["--training_keibabook_imgs"] + training_imgs
+    if pred_times_imgs: cmd += ["--pred_times_imgs"] + list(pred_times_imgs)
+    if track_imgs:      cmd += ["--track_imgs"]    + list(track_imgs)
+    if training_imgs:   cmd += ["--training_keibabook_imgs"] + list(training_imgs)
     if comments_csv:    cmd += ["--comments_csv",  comments_csv]
     if fast:            cmd.append("--fast")
 
+    _run_cmd(job_id, cmd)
+
+
+# ─────────────────────────────────────────────────
+#  STELLA 実行（PDF入力モード）
+# ─────────────────────────────────────────────────
+def run_stella_pdf(job_id: str, pdf_path: str,
+                   fast: bool = False, dpi: int = 200):
+    """バックグラウンドで GINANDTONIC.py を PDF 入力モードで実行する。"""
+    out_md  = str(OUTPUT_DIR / f"{job_id}.md")
+    pdf_img_dir = str(UPLOAD_DIR / f"pdf_{job_id}")
+
+    cmd = [
+        sys.executable, str(GINANDTONIC),
+        "--pdf",         pdf_path,
+        "--pdf_dpi",     str(dpi),
+        "--pdf_out_dir", pdf_img_dir,
+        "--out_md",      out_md,
+        "--lang",        "jpn",
+    ]
+    if fast:
+        cmd.append("--fast")
+
+    _run_cmd(job_id, cmd)
+
+
+def _run_cmd(job_id: str, cmd: list) -> None:
+    """コマンドを実行しジョブ状態を管理する共通ヘルパー。"""
     with _lock:
         _jobs[job_id] = {
-            "status": "running",
-            "log": "STELLA 起動中...\n",
-            "markdown": "",
-            "error": "",
+            "status":     "running",
+            "log":        "STELLA 起動中...\n",
+            "markdown":   "",
+            "error":      "",
             "start_time": time.time()
         }
 
@@ -97,7 +136,7 @@ def run_stella(job_id: str, rating_img: str, speed_index_img: str,
                 _jobs[job_id]["log"] += line
         proc.wait(timeout=600)
 
-        md_path = Path(out_md)
+        md_path = Path(str(OUTPUT_DIR / f"{job_id}.md"))
         if md_path.exists():
             md_text = md_path.read_text(encoding="utf-8")
         else:
@@ -111,14 +150,13 @@ def run_stella(job_id: str, rating_img: str, speed_index_img: str,
                 _jobs[job_id]["markdown"] = md_text
                 _jobs[job_id]["elapsed"]  = round(elapsed, 1)
             elif proc.returncode == 0 and not md_text:
-                # 出力ファイルなし → ログから結果を取る
                 log = _jobs[job_id]["log"]
                 _jobs[job_id]["status"]   = "done"
                 _jobs[job_id]["markdown"] = f"## STELLA 実行ログ\n\n```\n{log}\n```"
                 _jobs[job_id]["elapsed"]  = round(elapsed, 1)
             else:
-                _jobs[job_id]["status"]   = "error"
-                _jobs[job_id]["error"]    = (
+                _jobs[job_id]["status"] = "error"
+                _jobs[job_id]["error"]  = (
                     f"終了コード {proc.returncode}\n\n"
                     f"ログ (末尾500文字):\n{_jobs[job_id]['log'][-500:]}"
                 )
@@ -143,6 +181,7 @@ def run_stella(job_id: str, rating_img: str, speed_index_img: str,
 def index():
     return render_template("index.html")
 
+
 @app.route("/chat", methods=["POST"])
 def chat():
     """
@@ -166,15 +205,16 @@ def chat():
         return jsonify({
             "reply": (
                 "🏇 **STELLA 競馬予想モード** へようこそ！\n\n"
-                "以下の画像をアップロードして予想を開始できます：\n\n"
-                "| 画像 | 必須 |\n"
+                "以下の画像または **PDF** をアップロードして予想を開始できます：\n\n"
+                "| 入力 | 必須 |\n"
                 "|---|---|\n"
-                "| 📊 レイティング表 | ✅ 必須 |\n"
-                "| ⚡ スピード指数表 | ✅ 必須 |\n"
+                "| 📊 レイティング表（画像） | ✅ 必須 |\n"
+                "| ⚡ スピード指数表（画像） | ✅ 必須 |\n"
+                "| 📄 レース資料PDF | PDF単体でもOK |\n"
                 "| 📋 レース情報 | 任意 |\n"
                 "| 🔍 ファクター表 | 任意 |\n"
                 "| 🤖 AI展開予測 | 任意 |\n\n"
-                "👇 右側のパネルから画像を選択してください。"
+                "👇 右側のパネルから画像またはPDFを選択してください。"
             ),
             "action": "show_upload"
         })
@@ -183,11 +223,16 @@ def chat():
         return jsonify({
             "reply": (
                 "## 📖 STELLA の使い方\n\n"
+                "### 画像モード（従来）\n"
                 "1. **「競馬予想」** と入力する\n"
-                "2. 右パネルで画像をアップロード（ドラッグ&ドロップ対応）\n"
-                "3. **「予想を開始する」** ボタンをクリック\n"
-                "4. OCR処理後、予想結果が表示されます\n\n"
-                "### 必須画像\n"
+                "2. 右パネルでレイティング表・スピード指数表をアップロード\n"
+                "3. **「予想を開始する」** ボタンをクリック\n\n"
+                "### PDFモード（新機能）\n"
+                "1. **「競馬予想」** と入力する\n"
+                "2. **「📄 PDF資料」** タブを選択\n"
+                "3. PDFファイルをアップロード\n"
+                "4. **「📄 PDFから予想する」** ボタンをクリック\n\n"
+                "### 必須画像（画像モード）\n"
                 "- **レイティング表**（`--rating_img`）\n"
                 "- **スピード指数表**（`--speed_index_img`）\n\n"
                 "### 任意画像（精度向上）\n"
@@ -201,7 +246,8 @@ def chat():
                 "こんにちは！🏇 **STELLA 競馬予想** アシスタントです。\n\n"
                 "**「競馬予想」** と入力すると予想を開始できます。\n\n"
                 "- `競馬予想` → レース予想を開始\n"
-                "- `使い方` / `ヘルプ` → 使い方を表示"
+                "- `使い方` / `ヘルプ` → 使い方を表示\n\n"
+                "📄 **PDF資料からの予想にも対応しました！**"
             )
         })
 
@@ -217,11 +263,11 @@ def predict():
 
     if not rating_file or not rating_file.filename:
         return jsonify({"error": "レイティング表画像（rating_img）が必要です"}), 400
-    if not allowed(rating_file.filename):
+    if not allowed_img(rating_file.filename):
         return jsonify({"error": "対応していないファイル形式です（jpg/png/bmp/webp）"}), 400
     if not speed_file or not speed_file.filename:
         return jsonify({"error": "スピード指数表画像（speed_index_img）が必要です"}), 400
-    if not allowed(speed_file.filename):
+    if not allowed_img(speed_file.filename):
         return jsonify({"error": "対応していないファイル形式です（jpg/png/bmp/webp）"}), 400
 
     # 画像を保存
@@ -230,7 +276,7 @@ def predict():
 
     def opt_save(key):
         f = request.files.get(key)
-        if f and f.filename and allowed(f.filename):
+        if f and f.filename and allowed_img(f.filename):
             return save_upload(f)
         return None
 
@@ -239,11 +285,11 @@ def predict():
     aitime_path = opt_save("ai_time_img")
 
     pred_paths  = [save_upload(f) for f in request.files.getlist("pred_times_imgs")
-                   if f.filename and allowed(f.filename)]
+                   if f.filename and allowed_img(f.filename)]
     track_paths = [save_upload(f) for f in request.files.getlist("track_imgs")
-                   if f.filename and allowed(f.filename)]
+                   if f.filename and allowed_img(f.filename)]
     train_paths = [save_upload(f) for f in request.files.getlist("training_imgs")
-                   if f.filename and allowed(f.filename)]
+                   if f.filename and allowed_img(f.filename)]
 
     fast = request.form.get("fast", "false").lower() == "true"
 
@@ -261,6 +307,40 @@ def predict():
             track_imgs=[str(p) for p in track_paths] or None,
             training_imgs=[str(p) for p in train_paths] or None,
             fast=fast,
+        ),
+        daemon=True,
+    )
+    t.start()
+
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/predict_pdf", methods=["POST"])
+def predict_pdf():
+    """
+    PDF ファイルを受け取って予想ジョブを開始する（PDFモード）。
+    job_id を返す（進捗は /status/<job_id> でポーリング）。
+    """
+    pdf_file = request.files.get("pdf")
+    if not pdf_file or not pdf_file.filename:
+        return jsonify({"error": "PDFファイル（pdf）が必要です"}), 400
+
+    ext = Path(secure_filename(pdf_file.filename)).suffix.lower()
+    if ext != ".pdf":
+        return jsonify({"error": "PDFファイルのみ対応しています"}), 400
+
+    pdf_path = save_upload(pdf_file)
+    fast = request.form.get("fast", "false").lower() == "true"
+    dpi  = int(request.form.get("dpi", "200") or "200")
+
+    job_id = uuid.uuid4().hex
+    t = threading.Thread(
+        target=run_stella_pdf,
+        kwargs=dict(
+            job_id=job_id,
+            pdf_path=str(pdf_path),
+            fast=fast,
+            dpi=dpi,
         ),
         daemon=True,
     )
@@ -291,11 +371,30 @@ def uploaded_file(filename):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "ginandtonic": str(GINANDTONIC.exists())})
+    # PDF ライブラリの有無もチェック
+    try:
+        import fitz
+        pdf_ok = True
+    except ImportError:
+        pdf_ok = False
+    try:
+        import pdfplumber
+        pdfplumber_ok = True
+    except ImportError:
+        pdfplumber_ok = False
+
+    return jsonify({
+        "status":       "ok",
+        "ginandtonic":  str(GINANDTONIC.exists()),
+        "pdf_support":  pdf_ok,
+        "pdfplumber":   pdfplumber_ok,
+    })
 
 
 # ── 起動 ──────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     print(f"[STELLA] サーバー起動: http://0.0.0.0:{port}", flush=True)
+    print(f"[STELLA] アップロードDir: {UPLOAD_DIR}", flush=True)
+    print(f"[STELLA] 出力Dir: {OUTPUT_DIR}", flush=True)
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
