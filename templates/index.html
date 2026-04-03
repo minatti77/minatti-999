@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🏇 STELLA 競馬予想 スーパーエージェント</title>
+<title>🏇 STELLA 競馬予想 スーパーエージェント v1.34</title>
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
 <style>
 /* ─── リセット ─── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -339,15 +340,16 @@ main {
   background: #0a0d14;
   border-radius: 6px; height: 7px; overflow: hidden; margin-bottom: 10px;
 }
-#progress-bar {
+#progress-bar, #pdf-progress-bar {
   height: 100%;
   background: linear-gradient(90deg, #f6c90e, #22c55e);
   width: 0%;
   transition: width .5s ease;
   border-radius: 6px;
 }
-#progress-bar.error   { background: #ef4444; }
-#progress-bar.success { background: #22c55e; }
+#progress-bar.error,   #pdf-progress-bar.error   { background: #ef4444; }
+#progress-bar.success, #pdf-progress-bar.success { background: #22c55e; }
+#pdf-progress-bar { background: linear-gradient(90deg, #3b82f6, #22c55e); }
 
 #progress-log {
   font-size: 11.5px;
@@ -474,6 +476,9 @@ main {
       <button class="tab-btn active" data-tab="upload" onclick="switchTab('upload')">
         📸 画像アップロード
       </button>
+      <button class="tab-btn" data-tab="pdf" onclick="switchTab('pdf')">
+        📄 PDF資料
+      </button>
       <button class="tab-btn" data-tab="result" id="tab-result-btn" onclick="switchTab('result')" style="display:none;">
         🏆 予想結果
       </button>
@@ -571,6 +576,64 @@ main {
       </div>
     </div>
 
+    <!-- PDFタブ -->
+    <div class="tab-content" id="tab-pdf">
+      <div class="tab-inner">
+        <div class="section-title">📄 PDF資料から予想する</div>
+
+        <div class="upload-hint">
+          <strong>競馬資料のPDFをアップロード</strong>するだけで予想を開始できます。<br>
+          PDFの各ページを自動で画像に変換してOCR処理します。<br>
+          📄 対応形式：<strong>.pdf</strong> ｜ 最大200MB
+        </div>
+
+        <div class="up-card" id="card-pdf"
+             style="max-width:420px; min-height:140px; margin-bottom:16px;"
+             ondragover="dragOverPdf(event)" ondragleave="dragLeavePdf()" ondrop="dropPdf(event)">
+          <div class="ci">📄</div>
+          <div class="cl" id="pdf-card-label">PDFをドラッグ&amp;ドロップ</div>
+          <div class="cs">またはクリックして選択</div>
+          <div class="cbg cbg-req" style="margin-top:6px;">PDF</div>
+          <input type="file" id="file-pdf" accept=".pdf,application/pdf" onchange="onPdfChange()">
+        </div>
+
+        <div id="pdf-meta" style="display:none; font-size:12px; color:#6b7fa0; margin-bottom:14px;">
+          📎 <span id="pdf-filename"></span>
+        </div>
+
+        <div style="display:flex; gap:12px; align-items:center; margin-bottom:14px; flex-wrap:wrap;">
+          <label class="opt-row" style="margin:0;">
+            <input type="checkbox" id="pdf-fast-mode">
+            ⚡ 高速モード
+          </label>
+          <label style="display:flex; align-items:center; gap:6px; font-size:12.5px; color:#6b7fa0;">
+            DPI:
+            <select id="pdf-dpi" style="background:#141c2e; border:1px solid #1e2a3d; color:#dde3ee; border-radius:6px; padding:3px 8px; font-size:12px;">
+              <option value="150">150 (高速)</option>
+              <option value="200" selected>200 (標準)</option>
+              <option value="300">300 (高精度)</option>
+            </select>
+          </label>
+        </div>
+
+        <button id="pdf-run-btn" onclick="runPdfPredict()" disabled
+                style="width:100%; padding:13px; background:linear-gradient(135deg,#3b82f6,#1d4ed8); border:none; border-radius:11px; font-size:15px; font-weight:800; color:#fff; cursor:pointer; letter-spacing:0.05em; margin-bottom:14px; box-shadow:0 4px 20px #3b82f622; transition:opacity .2s, transform .1s;">
+          📄 PDFから予想する
+        </button>
+
+        <div id="pdf-progress-wrap" style="display:none;">
+          <div class="prog-header">
+            <span class="prog-label" id="pdf-prog-label">PDF処理中...</span>
+            <span class="prog-time" id="pdf-prog-time">0s</span>
+          </div>
+          <div class="prog-bar-bg">
+            <div id="pdf-progress-bar"></div>
+          </div>
+          <div id="pdf-progress-log">待機中...</div>
+        </div>
+      </div>
+    </div>
+
     <!-- 結果タブ -->
     <div class="tab-content" id="tab-result">
       <div class="tab-inner">
@@ -590,10 +653,18 @@ main {
         <div class="section-title">📖 STELLA の使い方</div>
 
         <div class="guide-card">
-          <h3>🚀 基本の使い方（3ステップ）</h3>
+          <h3>🚀 基本の使い方（画像モード）</h3>
           <div class="step-row"><span class="step-num">1</span>左のチャットに <strong>「競馬予想」</strong> と入力</div>
           <div class="step-row"><span class="step-num">2</span>「📸 画像アップロード」タブで画像をアップロード</div>
           <div class="step-row"><span class="step-num">3</span>「🏇 予想を開始する」ボタンをクリック</div>
+        </div>
+
+        <div class="guide-card" style="border-color:#3b82f644;">
+          <h3 style="color:#3b82f6;">📄 PDFモード（新機能）</h3>
+          <div class="step-row"><span class="step-num" style="background:#3b82f6;">1</span>「📄 PDF資料」タブを選択</div>
+          <div class="step-row"><span class="step-num" style="background:#3b82f6;">2</span>PDFファイルをドラッグ&ドロップまたは選択</div>
+          <div class="step-row"><span class="step-num" style="background:#3b82f6;">3</span>「📄 PDFから予想する」をクリック</div>
+          <p style="font-size:12px; color:#6b7fa0; margin-top:8px;">ℹ️ PDFを自動でページ画像に変換してOCR処理します。Google Drive等のPDF資料をそのまま使用できます。</p>
         </div>
 
         <div class="guide-card">
@@ -615,6 +686,8 @@ main {
             <li>ドラッグ&ドロップでアップロード可能</li>
             <li>OCR処理のため <strong>数十秒〜数分</strong> かかります</li>
             <li>⚡ 高速モードは処理時間を短縮できます</li>
+            <li>📄 <strong>PDF資料</strong>（Google Drive等）はそのままアップロード可能</li>
+            <li>PDF DPI: 200（標準）/ 300（高精度・遅い）/ 150（高速）</li>
           </ul>
         </div>
 
@@ -939,6 +1012,151 @@ function newRace() {
   document.getElementById("progress-wrap").classList.remove("show");
   document.getElementById("progress-bar").style.width = "0%";
   document.getElementById("progress-bar").className = "";
+}
+
+// ─────────────────────────────────────────
+//  PDF アップロード機能
+// ─────────────────────────────────────────
+let pdfFile = null;
+let pdfPollTimer = null;
+let pdfPollCount = 0;
+let pdfElapsed = 0;
+let pdfElapsedTimer = null;
+
+function onPdfChange() {
+  const inp = document.getElementById("file-pdf");
+  if (inp.files && inp.files[0]) {
+    setPdfFile(inp.files[0]);
+  }
+}
+
+function setPdfFile(f) {
+  if (!f) return;
+  pdfFile = f;
+  const card = document.getElementById("card-pdf");
+  card.classList.add("has-file");
+  document.getElementById("pdf-card-label").textContent =
+    f.name.length > 28 ? f.name.slice(0, 26) + "…" : f.name;
+  const meta = document.getElementById("pdf-meta");
+  meta.style.display = "";
+  document.getElementById("pdf-filename").textContent =
+    f.name + "  (" + (f.size / 1024 / 1024).toFixed(1) + " MB)";
+  document.getElementById("pdf-run-btn").disabled = false;
+}
+
+function dragOverPdf(e) {
+  e.preventDefault();
+  document.getElementById("card-pdf").classList.add("drag-over");
+}
+function dragLeavePdf() {
+  document.getElementById("card-pdf").classList.remove("drag-over");
+}
+function dropPdf(e) {
+  e.preventDefault();
+  dragLeavePdf();
+  const f = e.dataTransfer.files[0];
+  if (f && (f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf"))) {
+    setPdfFile(f);
+  } else {
+    addMsg("⚠️ PDFファイルのみ対応しています。");
+  }
+}
+
+async function runPdfPredict() {
+  if (!pdfFile) return;
+  const btn  = document.getElementById("pdf-run-btn");
+  const prog = document.getElementById("pdf-progress-wrap");
+  const bar  = document.getElementById("pdf-progress-bar");
+  const lbl  = document.getElementById("pdf-prog-label");
+
+  btn.disabled = true;
+  btn.textContent = "⏳ PDF処理中...";
+  prog.style.display = "block";
+  bar.className = "";
+  bar.style.width = "4%";
+  lbl.textContent = "PDFをアップロード中...";
+  document.getElementById("pdf-progress-log").textContent = "";
+
+  pdfElapsed = 0;
+  clearInterval(pdfElapsedTimer);
+  pdfElapsedTimer = setInterval(() => {
+    pdfElapsed++;
+    document.getElementById("pdf-prog-time").textContent = pdfElapsed + "s";
+  }, 1000);
+
+  const dpi  = document.getElementById("pdf-dpi").value;
+  const fast = document.getElementById("pdf-fast-mode").checked;
+
+  const fd = new FormData();
+  fd.append("pdf",  pdfFile);
+  fd.append("dpi",  dpi);
+  if (fast) fd.append("fast", "true");
+
+  try {
+    const res  = await fetch("/predict_pdf", { method: "POST", body: fd });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    currentJobId = data.job_id;
+    lbl.textContent = "PDFを画像に変換してOCR処理中...";
+    bar.style.width = "8%";
+    addMsg("📄 PDFから予想を開始しました！ページ変換 → OCR処理中です…");
+    pollPdfJob();
+  } catch (e) {
+    clearInterval(pdfElapsedTimer);
+    btn.disabled = false;
+    btn.textContent = "📄 PDFから予想する";
+    prog.style.display = "none";
+    addMsg(`❌ エラー: ${e.message}`);
+  }
+}
+
+function pollPdfJob() {
+  if (pdfPollTimer) clearInterval(pdfPollTimer);
+  pdfPollCount = 0;
+  pdfPollTimer = setInterval(async () => {
+    pdfPollCount++;
+    const pct = Math.min(8 + pdfPollCount * 2, 88);
+    document.getElementById("pdf-progress-bar").style.width = pct + "%";
+
+    try {
+      const res  = await fetch(`/status/${currentJobId}`);
+      if (!res.ok) return;
+      const data = await res.json();
+
+      if (data.log) {
+        const lines = data.log.split("\n").filter(Boolean);
+        document.getElementById("pdf-progress-log").textContent =
+          lines.slice(-6).join("\n");
+      }
+
+      if (data.status === "done") {
+        clearInterval(pdfPollTimer);
+        clearInterval(pdfElapsedTimer);
+        const bar = document.getElementById("pdf-progress-bar");
+        bar.style.width = "100%";
+        bar.classList.add("success");
+        document.getElementById("pdf-prog-label").textContent =
+          `✅ 完了（${data.elapsed ?? pdfElapsed}秒）`;
+        showResult(data.markdown);
+        const btn = document.getElementById("pdf-run-btn");
+        btn.disabled = false;
+        btn.textContent = "📄 PDFから予想する";
+      } else if (data.status === "error") {
+        clearInterval(pdfPollTimer);
+        clearInterval(pdfElapsedTimer);
+        const bar = document.getElementById("pdf-progress-bar");
+        bar.style.width = "100%";
+        bar.classList.add("error");
+        document.getElementById("pdf-prog-label").textContent = "❌ エラー";
+        addMsg(`❌ PDF予想に失敗しました:\n\`\`\`\n${(data.error || "").slice(0, 600)}\n\`\`\``);
+        const btn = document.getElementById("pdf-run-btn");
+        btn.disabled = false;
+        btn.textContent = "📄 PDFから予想する";
+      }
+    } catch (e) {
+      // ネットワークエラーは無視
+    }
+  }, 2500);
 }
 </script>
 </body>
