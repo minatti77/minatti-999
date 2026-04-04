@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-app.py  —  STELLA v1.34 スーパーエージェント Web UI
-「競馬予想」と入力するだけで予想が始まるチャット形式インターフェース
-PDF資料からの予想にも対応（PyMuPDF + pdfplumber）
+app.py — STELLA v1.34 競馬予想 Web アプリ
+GIN AND TONIC STELLA を使った競馬予想 Web インターフェース
 """
+
 import os
 import sys
 import uuid
@@ -11,10 +12,11 @@ import subprocess
 import threading
 import time
 import json
+import re
 from pathlib import Path
 from flask import (
     Flask, request, jsonify, render_template,
-    send_from_directory, Response, stream_with_context
+    send_from_directory, Response
 )
 from werkzeug.utils import secure_filename
 
@@ -27,20 +29,22 @@ GINANDTONIC = BASE_DIR / "GINANDTONIC.py"
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
-STATIC_DIR.mkdir(exist_ok=True)  # static フォルダが無い場合も自動作成
+STATIC_DIR.mkdir(exist_ok=True)
 
 ALLOWED_IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 ALLOWED_PDF_EXT = {".pdf"}
 ALLOWED_EXT     = ALLOWED_IMG_EXT | ALLOWED_PDF_EXT
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB (PDF対応)
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB
 
 # ── 実行中セッション管理 ─────────────────────────
-_jobs: dict = {}   # job_id -> {"status", "log", "markdown", "error", "start_time"}
+_jobs: dict = {}
 _lock = threading.Lock()
 
-# ── ユーティリティ ────────────────────────────────
+# ── 結果履歴管理 ──────────────────────────────────
+_history: list = []  # 最新N件の予想結果を保存
+
 def allowed_img(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_IMG_EXT
 
@@ -55,6 +59,7 @@ def save_upload(f) -> Path:
     f.save(dest)
     return dest
 
+
 # ─────────────────────────────────────────────────
 #  STELLA 実行（画像モード）
 # ─────────────────────────────────────────────────
@@ -65,6 +70,7 @@ def run_stella(job_id: str, rating_img: str, speed_index_img: str,
                track_imgs: list = None,
                training_imgs: list = None,
                comments_csv: str = None,
+               race_id: str = None,
                fast: bool = False):
     """バックグラウンドで GINANDTONIC.py を実行する（画像入力モード）。"""
     out_md = str(OUTPUT_DIR / f"{job_id}.md")
@@ -83,9 +89,10 @@ def run_stella(job_id: str, rating_img: str, speed_index_img: str,
     if track_imgs:      cmd += ["--track_imgs"]    + list(track_imgs)
     if training_imgs:   cmd += ["--training_keibabook_imgs"] + list(training_imgs)
     if comments_csv:    cmd += ["--comments_csv",  comments_csv]
+    if race_id:         cmd += ["--race_id",       race_id]
     if fast:            cmd.append("--fast")
 
-    _run_cmd(job_id, cmd)
+    _run_cmd(job_id, cmd, mode="image")
 
 
 # ─────────────────────────────────────────────────
@@ -108,10 +115,10 @@ def run_stella_pdf(job_id: str, pdf_path: str,
     if fast:
         cmd.append("--fast")
 
-    _run_cmd(job_id, cmd)
+    _run_cmd(job_id, cmd, mode="pdf")
 
 
-def _run_cmd(job_id: str, cmd: list) -> None:
+def _run_cmd(job_id: str, cmd: list, mode: str = "image") -> None:
     """コマンドを実行しジョブ状態を管理する共通ヘルパー。"""
     with _lock:
         _jobs[job_id] = {
@@ -119,7 +126,8 @@ def _run_cmd(job_id: str, cmd: list) -> None:
             "log":        "STELLA 起動中...\n",
             "markdown":   "",
             "error":      "",
-            "start_time": time.time()
+            "start_time": time.time(),
+            "mode":       mode,
         }
 
     try:
@@ -149,6 +157,8 @@ def _run_cmd(job_id: str, cmd: list) -> None:
                 _jobs[job_id]["status"]   = "done"
                 _jobs[job_id]["markdown"] = md_text
                 _jobs[job_id]["elapsed"]  = round(elapsed, 1)
+                # 履歴に追加
+                _add_history(job_id, md_text)
             elif proc.returncode == 0 and not md_text:
                 log = _jobs[job_id]["log"]
                 _jobs[job_id]["status"]   = "done"
@@ -175,6 +185,27 @@ def _run_cmd(job_id: str, cmd: list) -> None:
             _jobs[job_id]["error"]  = str(e)
 
 
+def _add_history(job_id: str, md_text: str) -> None:
+    """予想結果を履歴に追加する。"""
+    global _history
+    # タイトル抽出（最初のH1またはH2）
+    title = "予想結果"
+    for line in md_text.splitlines():
+        m = re.match(r'^#{1,2}\s+(.+)', line)
+        if m:
+            title = m.group(1)[:40]
+            break
+
+    entry = {
+        "job_id":    job_id,
+        "title":     title,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M"),
+        "preview":   md_text[:200],
+    }
+    _history.insert(0, entry)
+    _history = _history[:20]  # 最新20件のみ保持
+
+
 # ── ルーティング ──────────────────────────────────
 
 @app.route("/")
@@ -184,11 +215,6 @@ def index():
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    """
-    テキストメッセージを受け取る。
-    「競馬予想」を含むとき → 予想モードへ誘導するレスポンスを返す。
-    それ以外 → 汎用ガイドを返す。
-    """
     data = request.get_json(force=True)
     msg  = str(data.get("message", "")).strip()
 
@@ -223,21 +249,27 @@ def chat():
         return jsonify({
             "reply": (
                 "## 📖 STELLA の使い方\n\n"
-                "### 画像モード（従来）\n"
-                "1. **「競馬予想」** と入力する\n"
+                "### 画像モード\n"
+                "1. **「競馬予想」** と入力\n"
                 "2. 右パネルでレイティング表・スピード指数表をアップロード\n"
                 "3. **「予想を開始する」** ボタンをクリック\n\n"
-                "### PDFモード（新機能）\n"
-                "1. **「競馬予想」** と入力する\n"
+                "### PDFモード\n"
+                "1. **「競馬予想」** と入力\n"
                 "2. **「📄 PDF資料」** タブを選択\n"
                 "3. PDFファイルをアップロード\n"
-                "4. **「📄 PDFから予想する」** ボタンをクリック\n\n"
-                "### 必須画像（画像モード）\n"
+                "4. **「📄 PDFから予想する」** をクリック\n\n"
+                "### 必須画像\n"
                 "- **レイティング表**（`--rating_img`）\n"
                 "- **スピード指数表**（`--speed_index_img`）\n\n"
                 "### 任意画像（精度向上）\n"
-                "- レース情報・ファクター表・AI展開予測・馬場状態"
+                "- レース情報・ファクター表・AI展開予測・馬場状態・調教"
             )
+        })
+
+    elif any(k in msg for k in ["履歴", "過去", "history"]):
+        return jsonify({
+            "reply": "📂 過去の予想履歴を表示します。",
+            "action": "show_history"
         })
 
     else:
@@ -246,18 +278,15 @@ def chat():
                 "こんにちは！🏇 **STELLA 競馬予想** アシスタントです。\n\n"
                 "**「競馬予想」** と入力すると予想を開始できます。\n\n"
                 "- `競馬予想` → レース予想を開始\n"
-                "- `使い方` / `ヘルプ` → 使い方を表示\n\n"
-                "📄 **PDF資料からの予想にも対応しました！**"
+                "- `使い方` / `ヘルプ` → 使い方を表示\n"
+                "- `履歴` → 過去の予想を確認\n\n"
+                "📄 **PDF資料からの予想にも対応しています！**"
             )
         })
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    """
-    画像ファイルを受け取って予想ジョブを開始する。
-    job_id を返す（進捗は /status/<job_id> でポーリング）。
-    """
     rating_file = request.files.get("rating_img")
     speed_file  = request.files.get("speed_index_img")
 
@@ -270,7 +299,6 @@ def predict():
     if not allowed_img(speed_file.filename):
         return jsonify({"error": "対応していないファイル形式です（jpg/png/bmp/webp）"}), 400
 
-    # 画像を保存
     rating_path = save_upload(rating_file)
     speed_path  = save_upload(speed_file)
 
@@ -291,7 +319,8 @@ def predict():
     train_paths = [save_upload(f) for f in request.files.getlist("training_imgs")
                    if f.filename and allowed_img(f.filename)]
 
-    fast = request.form.get("fast", "false").lower() == "true"
+    fast    = request.form.get("fast", "false").lower() == "true"
+    race_id = request.form.get("race_id", "").strip() or None
 
     job_id = uuid.uuid4().hex
     t = threading.Thread(
@@ -307,6 +336,7 @@ def predict():
             track_imgs=[str(p) for p in track_paths] or None,
             training_imgs=[str(p) for p in train_paths] or None,
             fast=fast,
+            race_id=race_id,
         ),
         daemon=True,
     )
@@ -317,10 +347,6 @@ def predict():
 
 @app.route("/predict_pdf", methods=["POST"])
 def predict_pdf():
-    """
-    PDF ファイルを受け取って予想ジョブを開始する（PDFモード）。
-    job_id を返す（進捗は /status/<job_id> でポーリング）。
-    """
     pdf_file = request.files.get("pdf")
     if not pdf_file or not pdf_file.filename:
         return jsonify({"error": "PDFファイル（pdf）が必要です"}), 400
@@ -351,17 +377,37 @@ def predict_pdf():
 
 @app.route("/status/<job_id>")
 def status(job_id):
-    """ジョブの進捗・結果を返す。"""
     with _lock:
         job = _jobs.get(job_id)
     if not job:
         return jsonify({"status": "not_found"}), 404
 
-    # 実行時間も返す
     result = dict(job)
     if job["status"] == "running":
         result["elapsed"] = round(time.time() - job.get("start_time", time.time()), 1)
     return jsonify(result)
+
+
+@app.route("/history")
+def history():
+    """予想履歴一覧を返す。"""
+    return jsonify({"history": _history})
+
+
+@app.route("/result/<job_id>")
+def get_result(job_id):
+    """特定ジョブのMarkdown結果を返す。"""
+    md_path = OUTPUT_DIR / f"{job_id}.md"
+    if md_path.exists():
+        return jsonify({
+            "success": True,
+            "markdown": md_path.read_text(encoding="utf-8")
+        })
+    with _lock:
+        job = _jobs.get(job_id)
+    if job and job.get("markdown"):
+        return jsonify({"success": True, "markdown": job["markdown"]})
+    return jsonify({"success": False, "error": "結果が見つかりません"}), 404
 
 
 @app.route("/uploads/<path:filename>")
@@ -371,7 +417,6 @@ def uploaded_file(filename):
 
 @app.route("/health")
 def health():
-    # PDF ライブラリの有無もチェック
     try:
         import fitz
         pdf_ok = True
@@ -382,12 +427,23 @@ def health():
         pdfplumber_ok = True
     except ImportError:
         pdfplumber_ok = False
+    try:
+        import pytesseract
+        tess_ok = True
+        tess_version = pytesseract.get_tesseract_version().vstring if hasattr(pytesseract.get_tesseract_version(), 'vstring') else str(pytesseract.get_tesseract_version())
+    except Exception:
+        tess_ok = False
+        tess_version = "N/A"
 
     return jsonify({
-        "status":       "ok",
-        "ginandtonic":  str(GINANDTONIC.exists()),
-        "pdf_support":  pdf_ok,
-        "pdfplumber":   pdfplumber_ok,
+        "status":         "ok",
+        "ginandtonic":    str(GINANDTONIC.exists()),
+        "pdf_support":    pdf_ok,
+        "pdfplumber":     pdfplumber_ok,
+        "tesseract":      tess_ok,
+        "tesseract_ver":  tess_version,
+        "active_jobs":    len([j for j in _jobs.values() if j["status"] == "running"]),
+        "total_history":  len(_history),
     })
 
 
@@ -397,4 +453,5 @@ if __name__ == "__main__":
     print(f"[STELLA] サーバー起動: http://0.0.0.0:{port}", flush=True)
     print(f"[STELLA] アップロードDir: {UPLOAD_DIR}", flush=True)
     print(f"[STELLA] 出力Dir: {OUTPUT_DIR}", flush=True)
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    print(f"[STELLA] GINANDTONIC.py: {GINANDTONIC.exists()}", flush=True)
+    app.run(host="0.0.0.0", port=7860, debug=False, threaded=True)
