@@ -2,1567 +2,1276 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>GIN AND TONIC STELLA | AI競馬予想エンジン</title>
 <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Noto+Sans+JP:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
 /* ═══════════════════════════════════════════════════════════
-   GIN AND TONIC STELLA v2.0 — netkeita.com品質 Premium UI
+   GIN AND TONIC STELLA v2.0 — netkeita.com品質UI
+   Professional Horse Racing AI Prediction Engine
    ═══════════════════════════════════════════════════════════ */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-:root {
-  --bg:          #0f1117;
-  --bg-card:     #1a1d28;
-  --bg-card2:    #1e2233;
-  --bg-hover:    #252a3a;
-  --bg-input:    #13151e;
-  --border:      #2a2f42;
-  --border-soft: #1e2235;
-  --gold:        #f0b90b;
-  --gold-dim:    #f0b90b55;
-  --gold-glow:   #f0b90b22;
-  --green:       #00d68f;
-  --green-dim:   #00d68f33;
-  --red:         #f44336;
-  --red-dim:     #f4433622;
-  --blue:        #4d9fff;
-  --blue-dim:    #4d9fff22;
-  --purple:      #a78bfa;
-  --orange:      #ff9800;
-  --cyan:        #22d3ee;
-  --text:        #e4e8f1;
-  --text-sub:    #8892a8;
-  --text-muted:  #4b5366;
-  --radius:      10px;
-  --radius-sm:   6px;
-  --radius-lg:   16px;
-  --shadow:      0 4px 24px rgba(0,0,0,0.35);
-  --transition:  all 0.2s ease;
-  --font:        'Hiragino Kaku Gothic ProN','Noto Sans JP','Segoe UI',sans-serif;
+:root{
+  --bg:#060b14;--bg2:#0b1120;--bg3:#101828;--bg4:#182036;
+  --surface:#0d1424;--surface2:#141e30;--surface3:#1c2a42;
+  --border:rgba(255,255,255,.06);--border2:rgba(255,255,255,.10);--border3:rgba(255,255,255,.15);
+  --gold:#f5a623;--gold2:#fbbf24;--gold3:#fcd34d;--gold-dim:rgba(245,166,35,.12);--gold-border:rgba(245,166,35,.30);
+  --blue:#3b82f6;--blue2:#60a5fa;--blue-dim:rgba(59,130,246,.10);--blue-border:rgba(59,130,246,.25);
+  --green:#10b981;--green2:#34d399;--green-dim:rgba(16,185,129,.10);--green-border:rgba(16,185,129,.25);
+  --red:#ef4444;--red2:#f87171;--red-dim:rgba(239,68,68,.08);--red-border:rgba(239,68,68,.20);
+  --purple:#a78bfa;--purple-dim:rgba(167,139,250,.10);
+  --cyan:#06b6d4;--orange:#f97316;
+  --text:#f1f5f9;--text2:#94a3b8;--text3:#64748b;--text4:#475569;
+  --font:'Inter','Noto Sans JP','Hiragino Kaku Gothic ProN','Yu Gothic',sans-serif;
+  --mono:'JetBrains Mono','Fira Code',monospace;
+  --r:6px;--r2:10px;--r3:14px;--r4:20px;
+  --shadow:0 2px 16px rgba(0,0,0,.40);
+  --shadow2:0 8px 32px rgba(0,0,0,.50);
+  --shadow3:0 12px 48px rgba(0,0,0,.60);
+  --transition:all .2s cubic-bezier(.4,0,.2,1);
 }
 
-html, body {
-  height: 100%;
-  font-family: var(--font);
-  background: var(--bg);
-  color: var(--text);
-  line-height: 1.6;
-  overflow-x: hidden;
+html{font-size:14px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+a{color:var(--blue2);text-decoration:none}
+button{cursor:pointer;font-family:var(--font);border:none;background:none}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.2)}
+
+/* ═══ HEADER ═══ */
+.header{
+  position:sticky;top:0;z-index:100;
+  height:52px;display:flex;align-items:center;gap:12px;padding:0 16px;
+  background:rgba(6,11,20,.85);
+  border-bottom:1px solid var(--border);
+  backdrop-filter:blur(20px) saturate(180%);
+  -webkit-backdrop-filter:blur(20px) saturate(180%);
+}
+.logo{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.logo-icon{
+  width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,var(--gold),#e67e22);font-size:16px;
+  box-shadow:0 2px 8px rgba(245,166,35,.3);
+}
+.logo-text{font-size:14px;font-weight:800;color:var(--text);letter-spacing:.04em}
+.logo-ver{
+  font-size:9px;font-weight:700;color:var(--gold);
+  background:var(--gold-dim);border:1px solid var(--gold-border);
+  padding:1px 6px;border-radius:4px;margin-left:2px;
+}
+.header-spacer{flex:1}
+.nav-tabs{display:flex;gap:2px;align-items:center}
+.nav-tab{
+  padding:6px 14px;border-radius:8px;font-size:12px;font-weight:600;
+  color:var(--text3);transition:var(--transition);white-space:nowrap;
+}
+.nav-tab:hover{color:var(--text2);background:rgba(255,255,255,.04)}
+.nav-tab.active{color:var(--gold);background:var(--gold-dim)}
+.health-dot{
+  width:6px;height:6px;border-radius:50%;background:var(--green);
+  display:inline-block;margin-right:3px;
+  animation:pulse-dot 2s ease infinite;
+}
+@keyframes pulse-dot{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
+
+/* ═══ MAIN ═══ */
+.main-wrap{max-width:1200px;margin:0 auto;padding:0 16px}
+
+/* ═══ RACE SELECTOR BAR (netkeita style) ═══ */
+.race-bar{
+  background:var(--surface);
+  border-bottom:1px solid var(--border);
+  padding:10px 0;
+  position:sticky;top:52px;z-index:90;
+  backdrop-filter:blur(12px);
+}
+.race-bar-inner{max-width:1200px;margin:0 auto;padding:0 16px}
+.date-venue-row{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap}
+.date-picker{
+  background:var(--bg3);border:1px solid var(--border2);color:var(--text);
+  padding:5px 10px;border-radius:var(--r);font-size:12px;font-weight:600;
+  font-family:var(--font);
+}
+.date-picker::-webkit-calendar-picker-indicator{filter:invert(1);opacity:.5}
+.venue-btn{
+  padding:5px 14px;border-radius:6px;font-size:12px;font-weight:700;
+  color:var(--text3);background:var(--bg3);border:1px solid var(--border2);
+  transition:var(--transition);
+}
+.venue-btn:hover{color:var(--text);border-color:var(--border3)}
+.venue-btn.active{
+  color:#fff;border-color:transparent;
+  background:linear-gradient(135deg,#16a34a,#15803d);
+  box-shadow:0 2px 8px rgba(22,163,74,.3);
+}
+.race-nums{display:flex;gap:3px;overflow-x:auto;padding:2px 0;-webkit-overflow-scrolling:touch}
+.race-nums::-webkit-scrollbar{height:0}
+.race-num-btn{
+  min-width:36px;height:30px;border-radius:6px;font-size:12px;font-weight:700;
+  color:var(--text3);background:var(--bg3);border:1px solid var(--border);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  transition:var(--transition);
+}
+.race-num-btn:hover{color:var(--text);border-color:var(--border3)}
+.race-num-btn.active{
+  color:#fff;border-color:transparent;
+  background:linear-gradient(135deg,#16a34a,#15803d);
+}
+.race-meta{
+  display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap;
+}
+.race-meta-name{font-size:15px;font-weight:800;color:var(--text)}
+.race-meta-tag{
+  padding:2px 8px;border-radius:4px;font-size:10px;font-weight:800;
+  letter-spacing:.03em;
+}
+.grade-GI{background:linear-gradient(135deg,#f59e0b,#d97706);color:#000}
+.grade-GII{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff}
+.grade-GIII{background:linear-gradient(135deg,#8b5cf6,#7c3aed);color:#fff}
+.grade-OP{background:var(--blue-dim);color:var(--blue2);border:1px solid var(--blue-border)}
+.grade-default{background:var(--surface2);color:var(--text3);border:1px solid var(--border)}
+.race-meta-dist{font-size:12px;color:var(--text2);font-weight:600}
+
+/* ═══ RANK INDEX MATRIX (core netkeita feature) ═══ */
+.matrix-section{padding:16px 0}
+.matrix-header{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:12px;gap:8px;flex-wrap:wrap;
+}
+.matrix-title{font-size:13px;font-weight:700;color:var(--text2);display:flex;align-items:center;gap:6px}
+.matrix-title-bar{width:3px;height:14px;border-radius:2px;background:var(--gold);flex-shrink:0}
+.matrix-legend{display:flex;gap:4px;align-items:center}
+.legend-item{
+  display:flex;align-items:center;gap:3px;font-size:10px;color:var(--text3);
+}
+.legend-badge{width:18px;height:16px;border-radius:3px;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:800}
+
+.matrix-wrap{
+  overflow-x:auto;border-radius:var(--r2);
+  border:1px solid var(--border);
+  background:var(--surface);
+  box-shadow:var(--shadow);
+  -webkit-overflow-scrolling:touch;
+}
+.matrix-table{
+  width:100%;border-collapse:collapse;
+  font-size:12.5px;min-width:680px;
+  table-layout:fixed;
+}
+.matrix-table colgroup col:nth-child(1){width:38px}
+.matrix-table colgroup col:nth-child(2){width:34px}
+.matrix-table colgroup col:nth-child(3){width:auto;min-width:100px}
+
+.matrix-table thead th{
+  padding:9px 6px;text-align:center;font-size:10px;font-weight:700;
+  color:var(--text3);background:var(--bg3);
+  border-bottom:2px solid var(--border2);
+  letter-spacing:.06em;white-space:nowrap;
+  position:sticky;top:0;z-index:2;
+  text-transform:uppercase;
+}
+.matrix-table thead th:nth-child(1),
+.matrix-table thead th:nth-child(2){text-align:center}
+.matrix-table thead th:nth-child(3){text-align:left;padding-left:10px}
+.matrix-table thead th:nth-child(4){border-left:2px solid var(--border2)}
+
+.matrix-table tbody td{
+  padding:8px 6px;text-align:center;
+  border-bottom:1px solid var(--border);
+  transition:background .12s;
+  white-space:nowrap;
+}
+.matrix-table tbody tr:last-child td{border-bottom:none}
+.matrix-table tbody tr:hover td{background:rgba(255,255,255,.03)}
+
+.matrix-table tbody td:nth-child(1){text-align:center}
+.matrix-table tbody td:nth-child(2){font-weight:800;color:var(--text2);text-align:center}
+.matrix-table tbody td:nth-child(3){text-align:left;padding-left:10px;font-weight:600}
+.matrix-table tbody td:nth-child(4){border-left:2px solid var(--border)}
+
+/* Row highlights */
+.matrix-table tbody tr.row-anchor td{background:var(--gold-dim)}
+.matrix-table tbody tr.row-anchor td:nth-child(3){color:var(--gold2)}
+.matrix-table tbody tr.row-wide td{background:var(--blue-dim)}
+.matrix-table tbody tr.row-wide td:nth-child(3){color:var(--blue2)}
+
+/* Horse name extra info */
+.horse-cell{display:flex;align-items:center;gap:6px}
+.horse-mark{font-size:14px;flex-shrink:0}
+.horse-name{font-weight:600;font-size:12.5px}
+.horse-jockey{font-size:10px;color:var(--text3);font-weight:400}
+
+/* ═══ RANK BADGES ═══ */
+.rb{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:26px;height:22px;border-radius:4px;font-size:11px;font-weight:800;
+  letter-spacing:-.02em;
+}
+.rb-S{background:linear-gradient(135deg,#f5a623,#fbbf24);color:#000;box-shadow:0 1px 4px rgba(245,166,35,.3)}
+.rb-A{background:rgba(59,130,246,.20);color:#60a5fa;border:1px solid rgba(59,130,246,.25)}
+.rb-B{background:rgba(16,185,129,.15);color:#34d399;border:1px solid rgba(16,185,129,.20)}
+.rb-C{background:rgba(148,163,184,.10);color:var(--text2);border:1px solid rgba(148,163,184,.15)}
+.rb-D{background:rgba(239,68,68,.10);color:#f87171;border:1px solid rgba(239,68,68,.15)}
+.rb-none{background:transparent;color:var(--text4);font-size:10px;font-weight:400}
+
+/* ═══ WAKU COLORS ═══ */
+.wk{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:24px;height:24px;border-radius:50%;font-size:11px;font-weight:800;color:#fff;
+  flex-shrink:0;
+}
+.wk-1{background:#e5e7eb;color:#1f2937;border:1.5px solid #9ca3af}
+.wk-2{background:#1f2937;border:1.5px solid #4b5563}
+.wk-3{background:#dc2626}
+.wk-4{background:#2563eb}
+.wk-5{background:#eab308;color:#1f2937}
+.wk-6{background:#16a34a}
+.wk-7{background:#ea580c}
+.wk-8{background:#db2777}
+
+/* ═══ ANCHOR HERO CARD ═══ */
+.anchor-hero{
+  margin:16px 0;border-radius:var(--r3);overflow:hidden;
+  background:linear-gradient(135deg,rgba(245,166,35,.08),rgba(245,166,35,.02));
+  border:1px solid var(--gold-border);
+  position:relative;
+}
+.anchor-hero::before{
+  content:'';position:absolute;inset:0;
+  background:radial-gradient(ellipse at 20% 50%,rgba(245,166,35,.06),transparent 60%);
+  pointer-events:none;
+}
+.anchor-inner{display:flex;align-items:center;gap:20px;padding:20px 24px;position:relative;z-index:1}
+.anchor-big-num{
+  width:52px;height:52px;border-radius:50%;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+  font-size:22px;font-weight:900;
+  background:linear-gradient(135deg,var(--gold),#e67e22);color:#000;
+  box-shadow:0 4px 16px rgba(245,166,35,.35);
+}
+.anchor-details{flex:1;min-width:0}
+.anchor-details h3{font-size:18px;font-weight:800;margin-bottom:2px;display:flex;align-items:center;gap:8px}
+.anchor-details h3 .mark{
+  font-size:10px;font-weight:800;color:#000;
+  background:linear-gradient(135deg,var(--gold),var(--gold2));
+  padding:1px 6px;border-radius:3px;
+}
+.anchor-details .meta-line{font-size:12px;color:var(--text2)}
+.anchor-stats-row{display:flex;gap:16px;margin-left:auto;flex-shrink:0}
+.anchor-stat{text-align:center}
+.anchor-stat-val{font-size:20px;font-weight:800;color:var(--gold)}
+.anchor-stat-lbl{font-size:9px;color:var(--text3);margin-top:1px;font-weight:600}
+
+/* ═══ PREDICTION SUMMARY CARDS ═══ */
+.pred-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0}
+.pred-card{
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--r2);
+  padding:14px 16px;transition:var(--transition);
+}
+.pred-card:hover{border-color:var(--border2);transform:translateY(-1px)}
+.pred-card-lbl{font-size:10px;font-weight:600;color:var(--text3);margin-bottom:6px;letter-spacing:.04em}
+.pred-card-val{font-size:22px;font-weight:800;margin-bottom:2px;line-height:1.2}
+.pred-card-sub{font-size:11px;color:var(--text2)}
+
+.conf-HIGH{color:var(--gold)}
+.conf-MEDIUM{color:var(--blue2)}
+.conf-LOW{color:var(--text3)}
+
+/* ═══ BET SECTION ═══ */
+.bet-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}
+.bet-box{
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--r2);
+  padding:16px;
+}
+.bet-box-title{
+  font-size:12px;font-weight:700;margin-bottom:10px;
+  display:flex;align-items:center;gap:6px;
+}
+.bet-tag{
+  font-size:9px;font-weight:700;padding:2px 7px;border-radius:4px;
+  background:var(--blue-dim);color:var(--blue2);border:1px solid var(--blue-border);
+}
+.bet-nums-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.bet-circle{
+  width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-size:14px;font-weight:800;
+  background:var(--blue-dim);color:var(--blue2);border:1.5px solid var(--blue-border);
+}
+.bet-circle.anc{background:var(--gold-dim);color:var(--gold);border-color:var(--gold-border)}
+.bet-arrow{color:var(--text4);font-size:14px}
+.trio-box{
+  font-family:var(--mono);font-size:12px;color:var(--text);
+  background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
+  padding:10px 14px;line-height:1.8;
 }
 
-/* ─── SCROLLBAR ─── */
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #3a4058; }
+/* ═══ UPLOAD PANEL ═══ */
+.upload-section{padding:20px 0}
+.upload-panel{
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--r3);
+  padding:24px;max-width:780px;margin:0 auto;
+}
+.tab-row{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid var(--border);padding-bottom:10px}
+.tab-btn{
+  padding:7px 18px;border-radius:8px 8px 0 0;font-size:12px;font-weight:700;
+  color:var(--text3);transition:var(--transition);
+}
+.tab-btn.active{color:var(--gold);background:var(--gold-dim)}
+.tab-btn:hover{color:var(--text2)}
+.tab-pane{display:none}.tab-pane.active{display:block}
 
-/* ═══ TOP HEADER ═══ */
-.top-header {
-  background: linear-gradient(135deg, #111420 0%, #0d1019 100%);
-  border-bottom: 1px solid var(--border);
-  padding: 0 24px;
-  height: 56px;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  position: sticky;
-  top: 0;
-  z-index: 100;
+.slot-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.upload-slot{
+  border:1.5px dashed var(--border2);border-radius:var(--r2);padding:16px 12px;
+  text-align:center;cursor:pointer;transition:var(--transition);position:relative;
 }
-.logo {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  text-decoration: none;
+.upload-slot:hover{border-color:var(--gold);background:var(--gold-dim)}
+.upload-slot.filled{border-color:var(--green);border-style:solid;background:var(--green-dim)}
+.upload-slot .s-icon{font-size:24px;margin-bottom:4px}
+.upload-slot .s-label{font-size:11px;font-weight:600;color:var(--text2)}
+.upload-slot .s-tag{
+  position:absolute;top:6px;right:6px;font-size:8px;font-weight:800;
+  padding:1px 5px;border-radius:3px;letter-spacing:.02em;
 }
-.logo-icon {
-  font-size: 28px;
-  filter: drop-shadow(0 0 8px var(--gold-dim));
-}
-.logo-text {
-  font-size: 15px;
-  font-weight: 900;
-  letter-spacing: 0.12em;
-  background: linear-gradient(135deg, #f0b90b, #ffd54f, #f0b90b);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-.logo-sub {
-  font-size: 10px;
-  color: var(--text-muted);
-  margin-left: 4px;
-}
-.header-right {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.status-badge {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 4px 12px;
-  border-radius: 20px;
-  font-size: 11px;
-  font-weight: 700;
-}
-.badge-live {
-  background: var(--green-dim);
-  color: var(--green);
-  border: 1px solid rgba(0,214,143,0.3);
-}
-.badge-live::before {
-  content: '';
-  width: 6px;
-  height: 6px;
-  background: var(--green);
-  border-radius: 50%;
-  animation: blink 2s infinite;
-}
-@keyframes blink {
-  0%,100% { opacity: 1; }
-  50% { opacity: 0.3; }
-}
-.badge-ai {
-  background: var(--blue-dim);
-  color: var(--blue);
-  border: 1px solid rgba(77,159,255,0.3);
-}
+.s-tag-req{background:var(--red-dim);color:var(--red2);border:1px solid var(--red-border)}
+.s-tag-opt{background:var(--surface2);color:var(--text4)}
+.upload-slot input[type=file]{display:none}
+.upload-slot .s-fname{font-size:10px;color:var(--green2);margin-top:4px;word-break:break-all}
 
-/* ═══ NAVIGATION TABS ═══ */
-.nav-tabs {
-  display: flex;
-  background: var(--bg-card);
-  border-bottom: 1px solid var(--border);
-  padding: 0 24px;
-  gap: 2px;
-  overflow-x: auto;
+.opt-row{margin-top:10px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.opt-row label{font-size:11px;color:var(--text3);display:flex;align-items:center;gap:4px}
+.opt-row input[type=text]{
+  background:var(--bg3);border:1px solid var(--border);color:var(--text);
+  padding:5px 8px;border-radius:var(--r);font-size:11px;width:180px;font-family:var(--font);
 }
-.nav-tab {
-  padding: 12px 20px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-sub);
-  cursor: pointer;
-  border-bottom: 2px solid transparent;
-  white-space: nowrap;
-  transition: var(--transition);
-  user-select: none;
-}
-.nav-tab:hover { color: var(--text); background: var(--bg-hover); }
-.nav-tab.active {
-  color: var(--gold);
-  border-bottom-color: var(--gold);
-}
-
-/* ═══ MAIN LAYOUT ═══ */
-.main-container {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 20px 16px;
-}
-
-/* ═══ SECTION CARD ═══ */
-.section-card {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  margin-bottom: 20px;
-  overflow: hidden;
-}
-.section-header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--border-soft);
-  font-size: 15px;
-  font-weight: 700;
-}
-.section-header .icon {
-  font-size: 20px;
-}
-.section-body {
-  padding: 20px;
-}
-
-/* ═══ HERO BANNER ═══ */
-.hero {
-  background: linear-gradient(135deg, #111827 0%, #0f1524 50%, #131b2e 100%);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 40px 32px;
-  margin-bottom: 24px;
-  text-align: center;
-  position: relative;
-  overflow: hidden;
-}
-.hero::before {
-  content: '';
-  position: absolute;
-  top: -50%;
-  left: -50%;
-  width: 200%;
-  height: 200%;
-  background: radial-gradient(circle at 30% 40%, var(--gold-glow) 0%, transparent 50%);
-  pointer-events: none;
-}
-.hero-title {
-  font-size: 28px;
-  font-weight: 900;
-  margin-bottom: 8px;
-  position: relative;
-}
-.hero-title .accent {
-  background: linear-gradient(135deg, var(--gold), #ffd54f);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-.hero-sub {
-  font-size: 14px;
-  color: var(--text-sub);
-  position: relative;
-}
-.hero-features {
-  display: flex;
-  justify-content: center;
-  gap: 24px;
-  margin-top: 24px;
-  flex-wrap: wrap;
-  position: relative;
-}
-.feature-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--text-sub);
-}
-.feature-icon {
-  width: 32px;
-  height: 32px;
-  border-radius: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 16px;
-}
-.fi-gold   { background: var(--gold-glow); }
-.fi-green  { background: var(--green-dim); }
-.fi-blue   { background: var(--blue-dim); }
-.fi-purple { background: rgba(167,139,250,0.15); }
-
-/* ═══ UPLOAD AREA ═══ */
-.upload-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-}
-@media (max-width: 640px) {
-  .upload-grid { grid-template-columns: 1fr; }
-}
-.upload-slot {
-  border: 2px dashed var(--border);
-  border-radius: var(--radius);
-  padding: 20px;
-  text-align: center;
-  cursor: pointer;
-  transition: var(--transition);
-  position: relative;
-}
-.upload-slot:hover {
-  border-color: var(--gold-dim);
-  background: var(--gold-glow);
-}
-.upload-slot.required {
-  border-color: rgba(240,185,11,0.4);
-}
-.upload-slot.filled {
-  border-color: var(--green);
-  border-style: solid;
-  background: var(--green-dim);
-}
-.upload-slot input[type="file"] {
-  position: absolute;
-  inset: 0;
-  opacity: 0;
-  cursor: pointer;
-}
-.upload-icon { font-size: 28px; margin-bottom: 6px; }
-.upload-label {
-  font-size: 13px;
-  font-weight: 700;
-  margin-bottom: 2px;
-}
-.upload-desc {
-  font-size: 11px;
-  color: var(--text-muted);
-}
-.upload-filename {
-  font-size: 11px;
-  color: var(--green);
-  margin-top: 4px;
-  word-break: break-all;
-}
-.tag-required {
-  display: inline-block;
-  background: var(--red-dim);
-  color: var(--red);
-  font-size: 9px;
-  font-weight: 700;
-  padding: 1px 6px;
-  border-radius: 4px;
-  margin-left: 4px;
-}
-.tag-optional {
-  display: inline-block;
-  background: var(--blue-dim);
-  color: var(--blue);
-  font-size: 9px;
-  font-weight: 700;
-  padding: 1px 6px;
-  border-radius: 4px;
-  margin-left: 4px;
-}
-
-/* ─── Extra Uploads Toggle ─── */
-.extra-toggle {
-  text-align: center;
-  padding: 12px;
-  font-size: 13px;
-  color: var(--blue);
-  cursor: pointer;
-  border-top: 1px solid var(--border-soft);
-}
-.extra-toggle:hover { background: var(--bg-hover); }
-.extra-uploads { display: none; padding: 16px 20px; }
-.extra-uploads.show { display: block; }
+.opt-row input[type=checkbox]{accent-color:var(--gold)}
 
 /* ═══ BUTTONS ═══ */
-.btn {
-  padding: 12px 28px;
-  border: none;
-  border-radius: var(--radius);
-  font-size: 14px;
-  font-weight: 700;
-  cursor: pointer;
-  transition: var(--transition);
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
+.btn-primary{
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  padding:10px 24px;border-radius:var(--r2);font-size:13px;font-weight:700;
+  background:linear-gradient(135deg,var(--gold),#d97706);color:#000;
+  box-shadow:0 2px 12px rgba(245,166,35,.25);
+  transition:var(--transition);
 }
-.btn-primary {
-  background: linear-gradient(135deg, var(--gold), #e5a800);
-  color: #0f1117;
-  box-shadow: 0 4px 16px var(--gold-dim);
+.btn-primary:hover{transform:translateY(-1px);box-shadow:0 4px 20px rgba(245,166,35,.35)}
+.btn-primary:disabled{opacity:.35;cursor:not-allowed;transform:none}
+.btn-outline{
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  padding:7px 14px;border-radius:var(--r);font-size:12px;font-weight:600;
+  background:transparent;border:1px solid var(--border2);color:var(--text2);
+  transition:var(--transition);
 }
-.btn-primary:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 6px 24px rgba(240,185,11,0.4);
-}
-.btn-primary:disabled {
-  opacity: 0.5;
-  transform: none;
-  cursor: not-allowed;
-}
-.btn-secondary {
-  background: var(--bg-card2);
-  color: var(--text);
-  border: 1px solid var(--border);
-}
-.btn-secondary:hover { background: var(--bg-hover); }
-.btn-sm { padding: 8px 16px; font-size: 12px; }
+.btn-outline:hover{border-color:var(--text3);color:var(--text)}
 
-.btn-group {
-  display: flex;
-  gap: 12px;
-  justify-content: center;
-  margin-top: 16px;
-  flex-wrap: wrap;
+/* ═══ LOADING OVERLAY ═══ */
+.loading-overlay{
+  display:none;position:fixed;inset:0;z-index:200;
+  background:rgba(6,11,20,.92);backdrop-filter:blur(8px);
+  flex-direction:column;align-items:center;justify-content:center;gap:16px;
+}
+.loading-overlay.show{display:flex}
+.ld-spinner{
+  width:40px;height:40px;border:3px solid var(--border2);border-top-color:var(--gold);
+  border-radius:50%;animation:spin .8s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+.ld-text{font-size:14px;font-weight:600;color:var(--text2)}
+.ld-bar{width:280px;height:3px;background:var(--border);border-radius:2px;overflow:hidden}
+.ld-fill{height:100%;background:linear-gradient(90deg,var(--gold),var(--gold2));border-radius:2px;transition:width .3s}
+.ld-log{
+  max-width:560px;width:90%;max-height:160px;overflow-y:auto;
+  font-family:var(--mono);font-size:10px;color:var(--text3);
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
+  padding:10px;white-space:pre-wrap;word-break:break-all;
 }
 
-/* ═══ PROGRESS ═══ */
-.progress-container {
-  display: none;
-  text-align: center;
-  padding: 32px 20px;
+/* ═══ MD RENDER ═══ */
+.md-section{margin:16px 0}
+.md-render{
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--r2);
+  padding:20px;font-size:13px;line-height:1.75;
 }
-.progress-container.active { display: block; }
-.progress-bar-wrap {
-  width: 100%;
-  height: 4px;
-  background: var(--border);
-  border-radius: 2px;
-  margin: 16px 0;
-  overflow: hidden;
-}
-.progress-bar {
-  height: 100%;
-  background: linear-gradient(90deg, var(--gold), #ffd54f, var(--gold));
-  background-size: 200% 100%;
-  animation: shimmer 2s infinite;
-  border-radius: 2px;
-  width: 0%;
-  transition: width 0.5s;
-}
-@keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
-}
-.progress-text {
-  font-size: 13px;
-  color: var(--text-sub);
-}
-.progress-time {
-  font-size: 24px;
-  font-weight: 900;
-  color: var(--gold);
-  margin-top: 8px;
-}
-.progress-log {
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 12px;
-  max-height: 150px;
-  overflow-y: auto;
-  text-align: left;
-  font-family: 'Fira Code', 'Consolas', monospace;
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-top: 12px;
-  white-space: pre-wrap;
-}
+.md-render h1,.md-render h2,.md-render h3{color:var(--text);margin:18px 0 8px;font-weight:700}
+.md-render h1{font-size:18px;border-bottom:1px solid var(--border);padding-bottom:6px}
+.md-render h2{font-size:16px}
+.md-render h3{font-size:14px;color:var(--gold)}
+.md-render table{width:100%;border-collapse:collapse;margin:10px 0;font-size:12px}
+.md-render th{background:var(--bg3);padding:7px;text-align:left;font-weight:600;border:1px solid var(--border2)}
+.md-render td{padding:6px 7px;border:1px solid var(--border)}
+.md-render tr:nth-child(even) td{background:var(--bg2)}
+.md-render code{font-family:var(--mono);background:var(--bg3);padding:1px 4px;border-radius:3px;font-size:11px}
+.md-render pre{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:12px;overflow-x:auto;margin:10px 0}
+.md-render pre code{background:transparent;padding:0}
+.md-render blockquote{border-left:3px solid var(--gold);padding-left:12px;color:var(--text2);margin:10px 0}
+.md-render strong{color:var(--gold)}
+.md-render ul,.md-render ol{padding-left:18px;margin:6px 0}
+.md-render li{margin:2px 0}
 
-/* ═══ RANK MATRIX TABLE (netkeita.com style) ═══ */
-.rank-matrix-wrap {
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
+/* ═══ HISTORY ═══ */
+.history-section{padding:20px 0}
+.hist-item{
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
+  padding:12px 16px;margin-bottom:6px;cursor:pointer;transition:var(--transition);
+  display:flex;align-items:center;gap:12px;
 }
-.rank-matrix {
-  width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-  font-size: 13px;
+.hist-item:hover{border-color:var(--gold-border);background:var(--surface2)}
+.hist-badge{
+  width:36px;height:36px;border-radius:8px;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+  font-size:14px;font-weight:800;background:var(--gold-dim);color:var(--gold);
 }
-.rank-matrix thead th {
-  background: #161a28;
-  color: var(--text-sub);
-  font-size: 11px;
-  font-weight: 600;
-  padding: 10px 8px;
-  text-align: center;
-  border-bottom: 2px solid var(--border);
-  white-space: nowrap;
-  position: sticky;
-  top: 0;
-  z-index: 2;
-}
-.rank-matrix tbody tr {
-  transition: var(--transition);
-}
-.rank-matrix tbody tr:hover {
-  background: var(--bg-hover);
-}
-.rank-matrix tbody tr.anchor-row {
-  background: rgba(240,185,11,0.08);
-}
-.rank-matrix tbody tr.anchor-row:hover {
-  background: rgba(240,185,11,0.14);
-}
-.rank-matrix td {
-  padding: 10px 8px;
-  text-align: center;
-  border-bottom: 1px solid var(--border-soft);
-  white-space: nowrap;
-}
-.rank-matrix td:first-child,
-.rank-matrix td:nth-child(2),
-.rank-matrix td:nth-child(3) {
-  text-align: left;
-}
-.rank-matrix .horse-num {
-  font-weight: 900;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 12px;
-  color: #fff;
-}
-.rank-matrix .horse-name {
-  font-weight: 600;
-  font-size: 13px;
-  max-width: 120px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+.hist-info{flex:1;min-width:0}
+.hist-info h4{font-size:12.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hist-info .meta{font-size:10.5px;color:var(--text3);margin-top:2px}
 
-/* ─── Rank Badges ─── */
-.rank-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 24px;
-  border-radius: 5px;
-  font-size: 12px;
-  font-weight: 800;
-  letter-spacing: -0.02em;
+/* ═══ HERO (landing) ═══ */
+.hero-section{padding:48px 0 32px;text-align:center}
+.hero-chip{
+  display:inline-flex;align-items:center;gap:5px;padding:4px 12px;border-radius:20px;
+  background:var(--gold-dim);border:1px solid var(--gold-border);
+  color:var(--gold);font-size:10px;font-weight:700;margin-bottom:14px;
 }
-.rank-S { background: linear-gradient(135deg, #f0b90b, #ffd54f); color: #1a1200; }
-.rank-A { background: linear-gradient(135deg, #4d9fff, #6db3ff); color: #001a3a; }
-.rank-B { background: rgba(142,159,184,0.2); color: #8e9fb8; border: 1px solid rgba(142,159,184,0.3); }
-.rank-C { background: rgba(75,83,102,0.2); color: #6b7385; border: 1px solid rgba(75,83,102,0.3); }
-.rank-D { background: rgba(60,65,80,0.15); color: #555b6e; }
-.rank-- { background: transparent; color: var(--text-muted); font-size: 10px; }
+.hero-section h1{font-size:28px;font-weight:900;line-height:1.35;margin-bottom:10px}
+.hero-section h1 em{font-style:normal;background:linear-gradient(135deg,#f5a623,#fbbf24);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hero-section p{color:var(--text2);font-size:13px;max-width:500px;margin:0 auto 24px;line-height:1.7}
+.feature-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:24px 0}
+.feature-card{
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--r2);
+  padding:16px;text-align:left;transition:var(--transition);
+}
+.feature-card:hover{border-color:var(--border2);transform:translateY(-2px)}
+.feature-card .f-icon{font-size:22px;margin-bottom:8px}
+.feature-card .f-title{font-size:13px;font-weight:700;margin-bottom:4px}
+.feature-card .f-desc{font-size:11px;color:var(--text2);line-height:1.5}
 
-/* ─── Waku Colors ─── */
-.waku-1 { background: #f5f5f5; color: #333; }
-.waku-2 { background: #333; color: #fff; }
-.waku-3 { background: #e53935; }
-.waku-4 { background: #1e88e5; }
-.waku-5 { background: #fdd835; color: #333; }
-.waku-6 { background: #43a047; }
-.waku-7 { background: #ff8f00; }
-.waku-8 { background: #e91e63; }
-
-/* ═══ ANCHOR CARD ═══ */
-.anchor-card {
-  background: linear-gradient(135deg, rgba(240,185,11,0.08), rgba(240,185,11,0.03));
-  border: 1px solid rgba(240,185,11,0.25);
-  border-radius: var(--radius-lg);
-  padding: 24px;
-  margin-bottom: 20px;
+/* ═══ TOAST ═══ */
+.toast{
+  position:fixed;top:62px;right:16px;z-index:300;
+  background:var(--surface2);border:1px solid var(--border2);border-radius:var(--r);
+  padding:10px 16px;font-size:12px;box-shadow:var(--shadow2);
+  transform:translateX(120%);transition:transform .3s;max-width:320px;
 }
-.anchor-top {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  margin-bottom: 16px;
-}
-.anchor-mark {
-  font-size: 36px;
-  font-weight: 900;
-  color: var(--gold);
-  line-height: 1;
-}
-.anchor-info h3 {
-  font-size: 20px;
-  font-weight: 800;
-}
-.anchor-info .num {
-  color: var(--gold);
-  margin-right: 6px;
-}
-.anchor-stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 12px;
-}
-.stat-item {
-  background: var(--bg-card);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-  padding: 12px;
-  text-align: center;
-}
-.stat-label {
-  font-size: 10px;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-.stat-value {
-  font-size: 22px;
-  font-weight: 900;
-  margin-top: 4px;
-}
-.stat-value.high { color: var(--green); }
-.stat-value.medium { color: var(--gold); }
-.stat-value.low { color: var(--red); }
-
-/* ═══ CONFIDENCE BADGE ═══ */
-.confidence {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 10px;
-  border-radius: 20px;
-  font-size: 11px;
-  font-weight: 700;
-}
-.confidence-HIGH {
-  background: var(--green-dim);
-  color: var(--green);
-  border: 1px solid rgba(0,214,143,0.3);
-}
-.confidence-MEDIUM {
-  background: rgba(240,185,11,0.15);
-  color: var(--gold);
-  border: 1px solid rgba(240,185,11,0.3);
-}
-.confidence-LOW {
-  background: var(--red-dim);
-  color: var(--red);
-  border: 1px solid rgba(244,67,54,0.3);
-}
-
-/* ═══ BET PLAN ═══ */
-.bet-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 16px;
-}
-.bet-card {
-  background: var(--bg-card2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 16px;
-}
-.bet-card h4 {
-  font-size: 13px;
-  color: var(--text-sub);
-  margin-bottom: 10px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.bet-nums {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-.bet-num {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  background: var(--bg-input);
-  border: 2px solid var(--gold-dim);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 800;
-  font-size: 13px;
-  color: var(--gold);
-}
-.bet-num.anchor-num {
-  background: var(--gold);
-  color: #1a1200;
-  border-color: var(--gold);
-}
-
-/* ═══ MARKDOWN RESULT ═══ */
-.md-result {
-  padding: 24px;
-  line-height: 1.75;
-  font-size: 14px;
-}
-.md-result h1, .md-result h2, .md-result h3 {
-  color: var(--gold);
-  margin: 20px 0 10px;
-  font-weight: 800;
-}
-.md-result h1 { font-size: 22px; }
-.md-result h2 { font-size: 18px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
-.md-result h3 { font-size: 15px; color: var(--blue); }
-.md-result table {
-  width: 100%;
-  border-collapse: collapse;
-  margin: 12px 0;
-  font-size: 12px;
-}
-.md-result th, .md-result td {
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  text-align: center;
-}
-.md-result th {
-  background: #161a28;
-  color: var(--text-sub);
-  font-weight: 600;
-}
-.md-result tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
-.md-result code {
-  background: var(--bg-input);
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 12px;
-  color: var(--orange);
-}
-.md-result pre {
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 16px;
-  overflow-x: auto;
-  font-size: 12px;
-}
-.md-result blockquote {
-  border-left: 3px solid var(--gold);
-  padding-left: 16px;
-  margin: 12px 0;
-  color: var(--text-sub);
-}
-
-/* ═══ HISTORY LIST ═══ */
-.history-list { list-style: none; }
-.history-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border-soft);
-  cursor: pointer;
-  transition: var(--transition);
-}
-.history-item:hover { background: var(--bg-hover); }
-.history-venue {
-  width: 44px;
-  height: 44px;
-  border-radius: 10px;
-  background: var(--bg-card2);
-  border: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 16px;
-  font-weight: 800;
-  color: var(--gold);
-  flex-shrink: 0;
-}
-.history-info { flex: 1; min-width: 0; }
-.history-title {
-  font-size: 13px;
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.history-meta {
-  font-size: 11px;
-  color: var(--text-muted);
-}
-.history-confidence { flex-shrink: 0; }
-
-/* ═══ TABS INSIDE RESULTS ═══ */
-.result-tabs {
-  display: flex;
-  gap: 2px;
-  padding: 0 20px;
-  border-bottom: 1px solid var(--border-soft);
-  background: #14171f;
-}
-.result-tab {
-  padding: 10px 16px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-muted);
-  cursor: pointer;
-  border-bottom: 2px solid transparent;
-  transition: var(--transition);
-}
-.result-tab:hover { color: var(--text-sub); }
-.result-tab.active { color: var(--gold); border-bottom-color: var(--gold); }
-.result-panel { display: none; }
-.result-panel.active { display: block; }
+.toast.show{transform:translateX(0)}
+.toast.error{border-color:var(--red-border);color:var(--red2)}
+.toast.success{border-color:var(--green-border);color:var(--green2)}
 
 /* ═══ EMPTY STATE ═══ */
-.empty-state {
-  text-align: center;
-  padding: 48px 20px;
-  color: var(--text-muted);
+.empty{text-align:center;padding:32px 16px;color:var(--text3)}
+.empty .e-icon{font-size:36px;margin-bottom:8px;opacity:.4}
+.empty p{font-size:12px}
+
+/* ═══ FOOTER ═══ */
+.footer{
+  padding:12px 16px;font-size:9px;color:var(--text4);text-align:center;
+  border-top:1px solid var(--border);background:var(--bg2);margin-top:40px;
 }
-.empty-state .icon { font-size: 48px; margin-bottom: 12px; }
-.empty-state p { font-size: 14px; }
+
+/* ═══ SECTION UTILITIES ═══ */
+.sec-title{
+  font-size:12px;font-weight:700;color:var(--text2);margin-bottom:10px;
+  display:flex;align-items:center;gap:6px;letter-spacing:.08em;
+}
+.sec-title-bar{width:3px;height:13px;border-radius:2px;background:var(--gold);flex-shrink:0}
+.section-toggle{
+  display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;
+}
+.hidden{display:none!important}
 
 /* ═══ RESPONSIVE ═══ */
-@media (max-width: 768px) {
-  .top-header { padding: 0 12px; }
-  .logo-text { font-size: 13px; }
-  .main-container { padding: 12px 8px; }
-  .hero { padding: 24px 16px; }
-  .hero-title { font-size: 20px; }
-  .section-body { padding: 12px; }
-  .upload-grid { grid-template-columns: 1fr; }
-  .anchor-stats { grid-template-columns: repeat(2, 1fr); }
+@media(max-width:900px){
+  .pred-cards{grid-template-columns:repeat(2,1fr)}
+  .feature-grid{grid-template-columns:repeat(2,1fr)}
+  .bet-grid{grid-template-columns:1fr}
+  .anchor-stats-row{gap:12px}
+  .anchor-stat-val{font-size:17px}
 }
-
-/* ═══ FADE IN ANIMATION ═══ */
-.fade-in {
-  animation: fadeIn 0.4s ease;
+@media(max-width:640px){
+  .header{padding:0 10px;gap:8px}
+  .logo-text{font-size:12px}
+  .nav-tab{padding:5px 10px;font-size:11px}
+  .main-wrap{padding:0 10px}
+  .race-bar-inner{padding:0 10px}
+  .pred-cards{grid-template-columns:1fr 1fr}
+  .feature-grid{grid-template-columns:1fr 1fr}
+  .slot-grid{grid-template-columns:1fr}
+  .anchor-inner{flex-direction:column;text-align:center;gap:12px;padding:16px}
+  .anchor-stats-row{margin-left:0;justify-content:center}
+  .hero-section h1{font-size:22px}
+  .hero-section{padding:32px 0 20px}
+  .upload-panel{padding:16px}
+  .matrix-table{font-size:11.5px}
+  .rb{width:22px;height:18px;font-size:10px}
+  .wk{width:20px;height:20px;font-size:10px}
 }
-@keyframes fadeIn {
-  from { opacity: 0; transform: translateY(12px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-/* ═══ LOADING SPINNER ═══ */
-.spinner {
-  width: 40px;
-  height: 40px;
-  border: 3px solid var(--border);
-  border-top-color: var(--gold);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-  margin: 0 auto 16px;
-}
-@keyframes spin { to { transform: rotate(360deg); } }
-
-/* hidden */
-.hidden { display: none !important; }
 </style>
 </head>
 <body>
 
 <!-- ═══ HEADER ═══ -->
-<header class="top-header">
-  <a class="logo" href="/" onclick="showPage('home');return false;">
-    <span class="logo-icon">🏇</span>
+<header class="header">
+  <div class="logo">
+    <div class="logo-icon">🏇</div>
     <span class="logo-text">GIN AND TONIC</span>
-    <span class="logo-sub">STELLA v2.0</span>
-  </a>
-  <div class="header-right">
-    <span class="status-badge badge-ai">🤖 AI Engine</span>
-    <span class="status-badge badge-live" id="healthBadge">ONLINE</span>
+    <span class="logo-ver">STELLA v2.0</span>
   </div>
+  <div class="header-spacer"></div>
+  <nav class="nav-tabs">
+    <button class="nav-tab active" data-view="home">ホーム</button>
+    <button class="nav-tab" data-view="race">ランク指数</button>
+    <button class="nav-tab" data-view="predict">予想</button>
+    <button class="nav-tab" data-view="history">履歴</button>
+    <button class="nav-tab" id="healthBadge"><span class="health-dot"></span>稼働中</button>
+  </nav>
 </header>
 
-<!-- ═══ NAVIGATION ═══ -->
-<nav class="nav-tabs" id="mainNav">
-  <div class="nav-tab active" data-page="home" onclick="showPage('home')">🏠 ホーム</div>
-  <div class="nav-tab" data-page="predict" onclick="showPage('predict')">📊 予想する</div>
-  <div class="nav-tab" data-page="results" onclick="showPage('results')">📋 分析結果</div>
-  <div class="nav-tab" data-page="history" onclick="showPage('history')">📂 予想履歴</div>
-</nav>
+<!-- ═══ RACE SELECTOR BAR ═══ -->
+<div class="race-bar" id="raceBar" style="display:none">
+  <div class="race-bar-inner">
+    <div class="date-venue-row">
+      <input type="date" class="date-picker" id="datePicker" value="2026-04-06">
+      <div id="venueButtons"></div>
+    </div>
+    <div class="race-nums" id="raceNums"></div>
+    <div class="race-meta" id="raceMeta"></div>
+  </div>
+</div>
 
 <!-- ═══ MAIN CONTENT ═══ -->
-<div class="main-container" id="mainContent">
+<div class="main-wrap">
 
-  <!-- ─── HOME PAGE ─── -->
-  <div id="page-home" class="page-content fade-in">
-    <div class="hero">
-      <div class="hero-title">
-        <span class="accent">8項目AI指数</span>で全馬を可視化
-      </div>
-      <div class="hero-sub">
-        独自の複合AI分析が生成するランク指数で、出走馬を一目で比較。<br>
-        GIN AND TONIC STELLA — 高精度競馬AI予想エンジン
-      </div>
-      <div class="hero-features">
-        <div class="feature-item">
-          <div class="feature-icon fi-gold">📊</div>
-          <div>
-            <div style="font-weight:700;color:var(--text)">8項目ランク指数</div>
-            <div>S〜Dで一目把握</div>
-          </div>
-        </div>
-        <div class="feature-item">
-          <div class="feature-icon fi-green">🎯</div>
-          <div>
-            <div style="font-weight:700;color:var(--text)">信頼度フィルター</div>
-            <div>HIGH/MEDIUM/LOW判定</div>
-          </div>
-        </div>
-        <div class="feature-item">
-          <div class="feature-icon fi-blue">🤖</div>
-          <div>
-            <div style="font-weight:700;color:var(--text)">複合AI分析</div>
-            <div>4エンジン統合</div>
-          </div>
-        </div>
-        <div class="feature-item">
-          <div class="feature-icon fi-purple">🎫</div>
-          <div>
-            <div style="font-weight:700;color:var(--text)">買い目自動生成</div>
-            <div>複勝・ワイド・三連複</div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ─── SAMPLE RANK MATRIX ─── -->
-    <div class="section-card">
-      <div class="section-header">
-        <span class="icon">📊</span>
-        8項目ランク指数 — サンプル表示
-      </div>
-      <div class="section-body" style="padding:0">
-        <div class="rank-matrix-wrap">
-          <table class="rank-matrix">
-            <thead>
-              <tr>
-                <th style="width:36px">枠</th>
-                <th style="width:36px">番</th>
-                <th>馬名</th>
-                <th>総合</th>
-                <th>能力</th>
-                <th>展開</th>
-                <th>適性</th>
-                <th>安定</th>
-                <th>上り</th>
-                <th>調教</th>
-                <th>EV</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr class="anchor-row">
-                <td><span class="horse-num waku-5">5</span></td>
-                <td><b>7</b></td>
-                <td class="horse-name">ショウナンバルディ</td>
-                <td><span class="rank-badge rank-S">S</span></td>
-                <td><span class="rank-badge rank-A">A</span></td>
-                <td><span class="rank-badge rank-S">S</span></td>
-                <td><span class="rank-badge rank-A">A</span></td>
-                <td><span class="rank-badge rank-S">S</span></td>
-                <td><span class="rank-badge rank-A">A</span></td>
-                <td><span class="rank-badge rank-B">B</span></td>
-                <td><span class="rank-badge rank-S">S</span></td>
-              </tr>
-              <tr>
-                <td><span class="horse-num waku-3">3</span></td>
-                <td><b>4</b></td>
-                <td class="horse-name">タイセイドリーマー</td>
-                <td><span class="rank-badge rank-A">A</span></td>
-                <td><span class="rank-badge rank-S">S</span></td>
-                <td><span class="rank-badge rank-A">A</span></td>
-                <td><span class="rank-badge rank-S">S</span></td>
-                <td><span class="rank-badge rank-A">A</span></td>
-                <td><span class="rank-badge rank-B">B</span></td>
-                <td><span class="rank-badge rank-A">A</span></td>
-                <td><span class="rank-badge rank-A">A</span></td>
-              </tr>
-              <tr>
-                <td><span class="horse-num waku-7">7</span></td>
-                <td><b>12</b></td>
-                <td class="horse-name">メイショウハリオ</td>
-                <td><span class="rank-badge rank-A">A</span></td>
-                <td><span class="rank-badge rank-A">A</span></td>
-                <td><span class="rank-badge rank-B">B</span></td>
-                <td><span class="rank-badge rank-A">A</span></td>
-                <td><span class="rank-badge rank-B">B</span></td>
-                <td><span class="rank-badge rank-S">S</span></td>
-                <td><span class="rank-badge rank-A">A</span></td>
-                <td><span class="rank-badge rank-B">B</span></td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <div style="text-align:center;padding:12px;font-size:12px;color:var(--text-muted)">
-          ↑ サンプル表示。画像をアップロードすると全馬のランク指数が表示されます
-        </div>
-      </div>
-    </div>
-
-    <div class="btn-group">
-      <button class="btn btn-primary" onclick="showPage('predict')">
-        🚀 予想を開始する
-      </button>
+<!-- ═══ HOME VIEW ═══ -->
+<div id="v-home">
+  <div class="hero-section">
+    <div class="hero-chip">⚡ AI POWERED PREDICTION ENGINE</div>
+    <h1>8項目AI分析で<br><em>全馬を一目比較</em></h1>
+    <p>GIN AND TONIC STELLA は独自の複合AIエンジンが生成するランク指数で、総合・能力・展開・適性・安定・上り・調教・期待値の8項目を S〜D で可視化します。</p>
+    <div style="display:flex;gap:8px;justify-content:center">
+      <button class="btn-primary" onclick="switchView('race')">📊 ランク指数を見る</button>
+      <button class="btn-outline" onclick="switchView('predict')">📸 予想を開始</button>
     </div>
   </div>
 
-  <!-- ─── PREDICT PAGE ─── -->
-  <div id="page-predict" class="page-content hidden">
-
-    <!-- Upload Section -->
-    <div class="section-card fade-in">
-      <div class="section-header">
-        <span class="icon">📤</span>
-        画像アップロード
-        <span style="margin-left:auto;font-size:11px;color:var(--text-muted)">画像/PDF対応</span>
-      </div>
-      <div class="section-body">
-        <div class="upload-grid">
-          <div class="upload-slot required" id="slot-rating">
-            <div class="upload-icon">📊</div>
-            <div class="upload-label">レイティング表 <span class="tag-required">必須</span></div>
-            <div class="upload-desc">rating_img — 馬別レイティング</div>
-            <div class="upload-filename" id="fname-rating"></div>
-            <input type="file" accept="image/*" onchange="handleFile(this,'rating','fname-rating','slot-rating')">
-          </div>
-          <div class="upload-slot required" id="slot-speed">
-            <div class="upload-icon">⚡</div>
-            <div class="upload-label">スピード指数表 <span class="tag-required">必須</span></div>
-            <div class="upload-desc">speed_index_img — SP指数</div>
-            <div class="upload-filename" id="fname-speed"></div>
-            <input type="file" accept="image/*" onchange="handleFile(this,'speed','fname-speed','slot-speed')">
-          </div>
-        </div>
-
-        <div class="extra-toggle" id="extraToggle" onclick="toggleExtra()">
-          ＋ 追加画像を表示（精度向上）
-        </div>
-        <div class="extra-uploads" id="extraUploads">
-          <div class="upload-grid">
-            <div class="upload-slot" id="slot-meta">
-              <div class="upload-icon">📋</div>
-              <div class="upload-label">レース情報 <span class="tag-optional">任意</span></div>
-              <div class="upload-filename" id="fname-meta"></div>
-              <input type="file" accept="image/*" onchange="handleFile(this,'meta','fname-meta','slot-meta')">
-            </div>
-            <div class="upload-slot" id="slot-factor">
-              <div class="upload-icon">🔍</div>
-              <div class="upload-label">ファクター表 <span class="tag-optional">任意</span></div>
-              <div class="upload-filename" id="fname-factor"></div>
-              <input type="file" accept="image/*" onchange="handleFile(this,'factor','fname-factor','slot-factor')">
-            </div>
-            <div class="upload-slot" id="slot-aitime">
-              <div class="upload-icon">🤖</div>
-              <div class="upload-label">AI展開予測 <span class="tag-optional">任意</span></div>
-              <div class="upload-filename" id="fname-aitime"></div>
-              <input type="file" accept="image/*" onchange="handleFile(this,'aitime','fname-aitime','slot-aitime')">
-            </div>
-            <div class="upload-slot" id="slot-pdf">
-              <div class="upload-icon">📄</div>
-              <div class="upload-label">PDF資料 <span class="tag-optional">PDF入力</span></div>
-              <div class="upload-filename" id="fname-pdf"></div>
-              <input type="file" accept=".pdf" onchange="handleFile(this,'pdf','fname-pdf','slot-pdf')">
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="btn-group" style="padding:0 20px 20px">
-        <button class="btn btn-primary" id="btnPredict" onclick="startPrediction()" disabled>
-          🚀 AI予想を実行
-        </button>
-        <button class="btn btn-secondary" id="btnPdfPredict" onclick="startPdfPrediction()" style="display:none">
-          📄 PDFから予想
-        </button>
+  <!-- Sample Matrix -->
+  <div class="matrix-section">
+    <div class="matrix-header">
+      <div class="matrix-title"><span class="matrix-title-bar"></span>8項目 ランク指数マトリクス — サンプル</div>
+      <div class="matrix-legend">
+        <div class="legend-item"><span class="legend-badge rb rb-S">S</span>最高</div>
+        <div class="legend-item"><span class="legend-badge rb rb-A">A</span>優秀</div>
+        <div class="legend-item"><span class="legend-badge rb rb-B">B</span>標準</div>
+        <div class="legend-item"><span class="legend-badge rb rb-C">C</span>低め</div>
+        <div class="legend-item"><span class="legend-badge rb rb-D">D</span>警戒</div>
       </div>
     </div>
-
-    <!-- Progress Section -->
-    <div class="section-card">
-      <div class="progress-container" id="progressContainer">
-        <div class="spinner"></div>
-        <div class="progress-text">STELLA AI分析エンジン 処理中...</div>
-        <div class="progress-bar-wrap">
-          <div class="progress-bar" id="progressBar"></div>
-        </div>
-        <div class="progress-time" id="progressTime">0.0s</div>
-        <div class="progress-log" id="progressLog"></div>
-      </div>
+    <div class="matrix-wrap">
+      <table class="matrix-table" id="sampleTable">
+        <colgroup><col><col><col><col><col><col><col><col><col><col><col></colgroup>
+        <thead><tr>
+          <th>枠</th><th>番</th><th>馬名</th>
+          <th>総合</th><th>能力</th><th>展開</th><th>適性</th>
+          <th>安定</th><th>上り</th><th>調教</th><th>EV</th>
+        </tr></thead>
+        <tbody id="sampleBody"></tbody>
+      </table>
     </div>
-
-    <!-- Result Section -->
-    <div id="resultSection" class="hidden">
-
-      <!-- Anchor Card -->
-      <div class="anchor-card fade-in" id="anchorCard" style="display:none">
-        <div class="anchor-top">
-          <div class="anchor-mark">◎</div>
-          <div class="anchor-info">
-            <h3><span class="num" id="anchorNum"></span><span id="anchorName"></span></h3>
-            <span class="confidence" id="anchorConfidence"></span>
-          </div>
-        </div>
-        <div class="anchor-stats" id="anchorStats"></div>
-      </div>
-
-      <!-- Result Tabs -->
-      <div class="section-card fade-in">
-        <div class="result-tabs">
-          <div class="result-tab active" onclick="switchResultTab('matrix')">📊 ランク指数</div>
-          <div class="result-tab" onclick="switchResultTab('bet')">🎫 買い目</div>
-          <div class="result-tab" onclick="switchResultTab('detail')">📝 詳細分析</div>
-        </div>
-
-        <!-- Matrix Tab -->
-        <div class="result-panel active" id="panel-matrix">
-          <div class="rank-matrix-wrap" id="rankMatrixContainer">
-            <div class="empty-state">
-              <div class="icon">📊</div>
-              <p>予想を実行するとランク指数が表示されます</p>
-            </div>
-          </div>
-        </div>
-
-        <!-- Bet Tab -->
-        <div class="result-panel" id="panel-bet">
-          <div class="section-body" id="betPlanContainer">
-            <div class="empty-state">
-              <div class="icon">🎫</div>
-              <p>予想を実行すると買い目が表示されます</p>
-            </div>
-          </div>
-        </div>
-
-        <!-- Detail Tab -->
-        <div class="result-panel" id="panel-detail">
-          <div class="md-result" id="mdResultContainer">
-            <div class="empty-state">
-              <div class="icon">📝</div>
-              <p>予想を実行すると詳細分析が表示されます</p>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
+    <p style="text-align:center;font-size:11px;color:var(--text4);margin-top:8px">↑ デモデータ。「ランク指数」タブで全レースの指数を確認できます</p>
   </div>
 
-  <!-- ─── RESULTS PAGE ─── -->
-  <div id="page-results" class="page-content hidden">
-    <div class="section-card fade-in">
-      <div class="section-header">
-        <span class="icon">📋</span>
-        保存済み予想結果
-      </div>
-      <div class="section-body" id="savedResultsList">
-        <div class="empty-state">
-          <div class="icon">📋</div>
-          <p>保存済みの予想結果はありません</p>
-        </div>
-      </div>
+  <div class="feature-grid">
+    <div class="feature-card">
+      <div class="f-icon">🧠</div>
+      <div class="f-title">STELLAエンジン</div>
+      <div class="f-desc">30,000行+の分析コードがOCR→スコアリング→マーケット推定を全自動実行</div>
+    </div>
+    <div class="feature-card">
+      <div class="f-icon">📊</div>
+      <div class="f-title">8項目ランク指数</div>
+      <div class="f-desc">総合・能力・展開・適性・安定・上り・調教・EVを S〜D の5段階で表示</div>
+    </div>
+    <div class="feature-card">
+      <div class="f-icon">🎯</div>
+      <div class="f-title">買い目自動生成</div>
+      <div class="f-desc">◎軸流しワイド + 三連複フォーメーション + 信頼度3段階判定</div>
+    </div>
+    <div class="feature-card">
+      <div class="f-icon">📄</div>
+      <div class="f-title">PDF/画像対応</div>
+      <div class="f-desc">競馬ブック・スピード指数表・レイティング表を画像/PDFでOCR解析</div>
     </div>
   </div>
-
-  <!-- ─── HISTORY PAGE ─── -->
-  <div id="page-history" class="page-content hidden">
-    <div class="section-card fade-in">
-      <div class="section-header">
-        <span class="icon">📂</span>
-        予想履歴
-      </div>
-      <div class="section-body" style="padding:0" id="historyContainer">
-        <div class="empty-state">
-          <div class="icon">📂</div>
-          <p>予想履歴はまだありません</p>
-        </div>
-      </div>
-    </div>
-  </div>
-
 </div>
+
+<!-- ═══ RACE VIEW (netkeita-style) ═══ -->
+<div id="v-race" class="hidden">
+  <div id="raceLoading" style="text-align:center;padding:40px;color:var(--text3)">
+    <div class="ld-spinner" style="margin:0 auto 12px"></div>
+    <p>レースデータ読み込み中...</p>
+  </div>
+
+  <!-- Anchor Hero -->
+  <div class="anchor-hero hidden" id="anchorHero">
+    <div class="anchor-inner">
+      <div class="anchor-big-num" id="aNum">-</div>
+      <div class="anchor-details">
+        <h3><span id="aName">-</span> <span class="mark" id="aMark">◎本命</span></h3>
+        <div class="meta-line" id="aMeta">-</div>
+      </div>
+      <div class="anchor-stats-row">
+        <div class="anchor-stat"><div class="anchor-stat-val" id="aScore">-</div><div class="anchor-stat-lbl">SCORE</div></div>
+        <div class="anchor-stat"><div class="anchor-stat-val" id="aPPlace">-</div><div class="anchor-stat-lbl">複勝率</div></div>
+        <div class="anchor-stat"><div class="anchor-stat-val conf-HIGH" id="aConf">-</div><div class="anchor-stat-lbl">信頼度</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Prediction Cards -->
+  <div class="pred-cards hidden" id="predCards"></div>
+
+  <!-- Rank Matrix -->
+  <div class="matrix-section" id="raceMatrixSection">
+    <div class="matrix-header">
+      <div class="matrix-title"><span class="matrix-title-bar"></span>8項目 ランク指数マトリクス</div>
+      <div class="matrix-legend">
+        <div class="legend-item"><span class="legend-badge rb rb-S">S</span></div>
+        <div class="legend-item"><span class="legend-badge rb rb-A">A</span></div>
+        <div class="legend-item"><span class="legend-badge rb rb-B">B</span></div>
+        <div class="legend-item"><span class="legend-badge rb rb-C">C</span></div>
+        <div class="legend-item"><span class="legend-badge rb rb-D">D</span></div>
+      </div>
+    </div>
+    <div class="matrix-wrap">
+      <table class="matrix-table">
+        <colgroup><col><col><col><col><col><col><col><col><col><col><col></colgroup>
+        <thead><tr>
+          <th>枠</th><th>番</th><th>馬名</th>
+          <th>総合</th><th>能力</th><th>展開</th><th>適性</th>
+          <th>安定</th><th>上り</th><th>調教</th><th>EV</th>
+        </tr></thead>
+        <tbody id="raceMatrix"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Betting Section -->
+  <div class="bet-grid hidden" id="betSection"></div>
+</div>
+
+<!-- ═══ PREDICT VIEW ═══ -->
+<div id="v-predict" class="hidden">
+  <div class="upload-section">
+    <div class="sec-title"><span class="sec-title-bar"></span>レース予想 — データ入力</div>
+    <div class="upload-panel">
+      <div class="tab-row">
+        <button class="tab-btn active" onclick="switchUpTab('imgPane',this)">📸 画像入力</button>
+        <button class="tab-btn" onclick="switchUpTab('pdfPane',this)">📄 PDF入力</button>
+      </div>
+
+      <div class="tab-pane active" id="imgPane">
+        <div class="slot-grid">
+          <div class="upload-slot" onclick="this.querySelector('input').click()" id="sl_rating">
+            <span class="s-tag s-tag-req">必須</span>
+            <div class="s-icon">📊</div>
+            <div class="s-label">レイティング表</div>
+            <input type="file" accept="image/*" onchange="onFile(this,'rating_img','sl_rating')">
+            <div class="s-fname" id="fn_r"></div>
+          </div>
+          <div class="upload-slot" onclick="this.querySelector('input').click()" id="sl_speed">
+            <span class="s-tag s-tag-req">必須</span>
+            <div class="s-icon">⚡</div>
+            <div class="s-label">スピード指数表</div>
+            <input type="file" accept="image/*" onchange="onFile(this,'speed_index_img','sl_speed')">
+            <div class="s-fname" id="fn_s"></div>
+          </div>
+          <div class="upload-slot" onclick="this.querySelector('input').click()" id="sl_meta">
+            <span class="s-tag s-tag-opt">任意</span>
+            <div class="s-icon">📋</div>
+            <div class="s-label">レース情報</div>
+            <input type="file" accept="image/*" onchange="onFile(this,'meta_img','sl_meta')">
+            <div class="s-fname" id="fn_m"></div>
+          </div>
+          <div class="upload-slot" onclick="this.querySelector('input').click()" id="sl_factor">
+            <span class="s-tag s-tag-opt">任意</span>
+            <div class="s-icon">🔍</div>
+            <div class="s-label">ファクター表</div>
+            <input type="file" accept="image/*" onchange="onFile(this,'factor_img','sl_factor')">
+            <div class="s-fname" id="fn_f"></div>
+          </div>
+          <div class="upload-slot" onclick="this.querySelector('input').click()" id="sl_ai">
+            <span class="s-tag s-tag-opt">任意</span>
+            <div class="s-icon">🤖</div>
+            <div class="s-label">AI展開予測</div>
+            <input type="file" accept="image/*" onchange="onFile(this,'ai_time_img','sl_ai')">
+            <div class="s-fname" id="fn_a"></div>
+          </div>
+          <div class="upload-slot" onclick="this.querySelector('input').click()" id="sl_train">
+            <span class="s-tag s-tag-opt">任意</span>
+            <div class="s-icon">🏋️</div>
+            <div class="s-label">調教データ</div>
+            <input type="file" accept="image/*" multiple onchange="onFile(this,'training_imgs','sl_train')">
+            <div class="s-fname" id="fn_t"></div>
+          </div>
+        </div>
+        <div class="opt-row">
+          <label>ID: <input type="text" id="raceIdIn" placeholder="例: 2026_東京_11R"></label>
+          <label><input type="checkbox" id="fastChk"> 高速モード</label>
+        </div>
+        <div style="text-align:center;margin-top:16px">
+          <button class="btn-primary" id="btnGo" onclick="startPredict()" disabled>🏇 予想を開始する</button>
+        </div>
+      </div>
+
+      <div class="tab-pane" id="pdfPane">
+        <div class="upload-slot" onclick="this.querySelector('input').click()" id="sl_pdf" style="max-width:360px;margin:0 auto">
+          <span class="s-tag s-tag-req">必須</span>
+          <div class="s-icon">📄</div>
+          <div class="s-label">レース資料 PDF</div>
+          <input type="file" accept=".pdf" onchange="onFile(this,'pdf','sl_pdf')">
+          <div class="s-fname" id="fn_p"></div>
+        </div>
+        <div style="text-align:center;margin-top:16px">
+          <button class="btn-primary" id="btnPdf" onclick="startPdfPredict()" disabled>📄 PDFから予想</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ RESULT VIEW ═══ -->
+<div id="v-result" class="hidden">
+  <!-- Same components as race view but populated from job result -->
+  <div class="anchor-hero hidden" id="resAnchorHero">
+    <div class="anchor-inner">
+      <div class="anchor-big-num" id="rANum">-</div>
+      <div class="anchor-details">
+        <h3><span id="rAName">-</span> <span class="mark">◎本命</span></h3>
+        <div class="meta-line" id="rAMeta">-</div>
+      </div>
+      <div class="anchor-stats-row">
+        <div class="anchor-stat"><div class="anchor-stat-val" id="rAScore">-</div><div class="anchor-stat-lbl">SCORE</div></div>
+        <div class="anchor-stat"><div class="anchor-stat-val" id="rAPPlace">-</div><div class="anchor-stat-lbl">複勝率</div></div>
+        <div class="anchor-stat"><div class="anchor-stat-val conf-HIGH" id="rAConf">-</div><div class="anchor-stat-lbl">信頼度</div></div>
+      </div>
+    </div>
+  </div>
+  <div class="pred-cards hidden" id="resPredCards"></div>
+  <div class="matrix-section hidden" id="resMatrixSec">
+    <div class="matrix-header">
+      <div class="matrix-title"><span class="matrix-title-bar"></span>8項目 ランク指数マトリクス</div>
+    </div>
+    <div class="matrix-wrap">
+      <table class="matrix-table">
+        <colgroup><col><col><col><col><col><col><col><col><col><col><col></colgroup>
+        <thead><tr>
+          <th>枠</th><th>番</th><th>馬名</th>
+          <th>総合</th><th>能力</th><th>展開</th><th>適性</th>
+          <th>安定</th><th>上り</th><th>調教</th><th>EV</th>
+        </tr></thead>
+        <tbody id="resMatrix"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="bet-grid hidden" id="resBetSection"></div>
+  <div class="md-section hidden" id="resMdSec">
+    <div class="section-toggle">
+      <div class="sec-title"><span class="sec-title-bar"></span>詳細分析レポート</div>
+      <button class="btn-outline" onclick="toggleMd()">📖 展開/折りたたみ</button>
+    </div>
+    <div class="md-render" id="mdRender" style="max-height:360px;overflow:hidden"></div>
+  </div>
+</div>
+
+<!-- ═══ HISTORY VIEW ═══ -->
+<div id="v-history" class="hidden">
+  <div class="history-section">
+    <div class="sec-title"><span class="sec-title-bar"></span>予想履歴</div>
+    <div id="historyList">
+      <div class="empty"><div class="e-icon">📂</div><p>まだ予想履歴がありません</p></div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /main-wrap -->
+
+<div class="footer">
+  GIN AND TONIC STELLA v2.0 — AI競馬予想エンジン | GINANDTONIC.py 30,000行+ の分析ロジック搭載
+</div>
+
+<!-- ═══ LOADING OVERLAY ═══ -->
+<div class="loading-overlay" id="loadingOverlay">
+  <div class="ld-spinner"></div>
+  <div class="ld-text" id="ldText">STELLA 分析中...</div>
+  <div class="ld-bar"><div class="ld-fill" id="ldFill" style="width:10%"></div></div>
+  <div class="ld-log" id="ldLog"></div>
+</div>
+
+<!-- ═══ TOAST ═══ -->
+<div class="toast" id="toast"></div>
 
 <script>
 /* ═══════════════════════════════════════════════════════════
    GIN AND TONIC STELLA v2.0 — Frontend Logic
    ═══════════════════════════════════════════════════════════ */
 
-// ─── State ───
-const state = {
-  files: { rating: null, speed: null, meta: null, factor: null, aitime: null, pdf: null },
-  currentJob: null,
-  pollTimer: null,
-};
+const F = {};  // uploaded files
+let jobId = null, pollTmr = null, mdOpen = false;
+let demoData = null, currentVenue = '東京', currentRace = '11R';
 
-// ─── Page Navigation ───
-function showPage(page) {
-  document.querySelectorAll('.page-content').forEach(el => el.classList.add('hidden'));
-  document.querySelectorAll('.nav-tab').forEach(el => el.classList.remove('active'));
-  
-  const pageEl = document.getElementById('page-' + page);
-  if (pageEl) {
-    pageEl.classList.remove('hidden');
-    pageEl.classList.add('fade-in');
+// ── Navigation ──
+const views = ['home','race','predict','result','history'];
+function switchView(v) {
+  views.forEach(id => {
+    const el = document.getElementById('v-'+id);
+    if(el) el.classList.toggle('hidden', id !== v);
+  });
+  document.querySelectorAll('.nav-tab[data-view]').forEach(b => {
+    b.classList.toggle('active', b.dataset.view === v);
+  });
+  document.getElementById('raceBar').style.display = (v==='race')?'':'none';
+  if(v==='race') loadDemoData();
+  if(v==='history') loadHistory();
+}
+document.querySelectorAll('.nav-tab[data-view]').forEach(b => {
+  b.addEventListener('click', () => switchView(b.dataset.view));
+});
+
+// ── Upload Tab ──
+function switchUpTab(id, btn) {
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+}
+
+// ── File Upload ──
+function onFile(input, key, slotId) {
+  const slot = document.getElementById(slotId);
+  if(input.files && input.files.length > 0) {
+    F[key] = input.files;
+    slot.classList.add('filled');
+    const fn = slot.querySelector('.s-fname');
+    if(fn) fn.textContent = Array.from(input.files).map(f=>f.name).join(', ');
   }
-  
-  const navEl = document.querySelector(`.nav-tab[data-page="${page}"]`);
-  if (navEl) navEl.classList.add('active');
-
-  if (page === 'history') loadHistory();
-  if (page === 'results') loadSavedResults();
+  updateBtns();
+}
+function updateBtns() {
+  document.getElementById('btnGo').disabled = !(F.rating_img?.length && F.speed_index_img?.length);
+  document.getElementById('btnPdf').disabled = !(F.pdf?.length);
 }
 
-// ─── File Handling ───
-function handleFile(input, key, fnameId, slotId) {
-  const file = input.files[0];
-  if (!file) return;
-  
-  state.files[key] = file;
-  document.getElementById(fnameId).textContent = '✅ ' + file.name;
-  document.getElementById(slotId).classList.add('filled');
-  
-  updatePredictButton();
+// ── Rank Badge HTML ──
+function rb(grade) {
+  if(!grade || grade==='-') return '<span class="rb rb-none">-</span>';
+  return `<span class="rb rb-${grade}">${grade}</span>`;
 }
 
-function updatePredictButton() {
-  const btn = document.getElementById('btnPredict');
-  const btnPdf = document.getElementById('btnPdfPredict');
+// ── Waku HTML ──
+function wk(num) {
+  const n = Math.min(Math.ceil(Number(num)/2)||1, 8);
+  return `<span class="wk wk-${n}">${n}</span>`;
+}
+
+// ── Render Matrix Rows ──
+function renderMatrixRows(tbody, rankings, anchorNum, wideNums) {
+  const labels = ['総合','能力','展開','適性','安定','上り','調教','EV'];
+  const wSet = new Set((wideNums||[]).map(String));
+  const aStr = String(anchorNum||'');
   
-  const hasRequired = state.files.rating && state.files.speed;
-  btn.disabled = !hasRequired;
+  tbody.innerHTML = rankings.map(h => {
+    const num = String(h.num);
+    const isAnc = num === aStr;
+    const isWide = wSet.has(num);
+    const cls = isAnc ? 'row-anchor' : isWide ? 'row-wide' : '';
+    const mark = isAnc ? '◎' : isWide ? '○' : '';
+    const ranks = h.ranks || {};
+    const jockey = h.jockey ? `<span class="horse-jockey">${h.jockey}</span>` : '';
+    
+    return `<tr class="${cls}">
+      <td>${wk(h.waku||num)}</td>
+      <td>${num}${mark?' '+mark:''}</td>
+      <td><div class="horse-cell"><span class="horse-name">${h.name||'-'}</span>${jockey}</div></td>
+      ${labels.map(l => `<td>${rb(ranks[l])}</td>`).join('')}
+    </tr>`;
+  }).join('');
+}
+
+// ═══ DEMO DATA (netkeita-style race browsing) ═══
+async function loadDemoData(venue, race) {
+  venue = venue || currentVenue;
+  race = race || currentRace;
+  const date = document.getElementById('datePicker').value;
   
-  if (state.files.pdf) {
-    btnPdf.style.display = 'inline-flex';
+  try {
+    const res = await fetch(`/demo_data?venue=${encodeURIComponent(venue)}&race=${encodeURIComponent(race)}&date=${date}`);
+    demoData = await res.json();
+    currentVenue = demoData.selected.venue;
+    currentRace = demoData.selected.race;
+    renderRaceBar();
+    renderRaceView();
+    document.getElementById('raceLoading').classList.add('hidden');
+  } catch(e) {
+    console.error(e);
   }
 }
 
-function toggleExtra() {
-  const el = document.getElementById('extraUploads');
-  const toggle = document.getElementById('extraToggle');
-  if (el.classList.contains('show')) {
-    el.classList.remove('show');
-    toggle.textContent = '＋ 追加画像を表示（精度向上）';
-  } else {
-    el.classList.add('show');
-    toggle.textContent = '－ 追加画像を隠す';
-  }
-}
-
-// ─── Start Prediction ───
-function startPrediction() {
-  const fd = new FormData();
-  fd.append('rating_img', state.files.rating);
-  fd.append('speed_index_img', state.files.speed);
-  if (state.files.meta) fd.append('meta_img', state.files.meta);
-  if (state.files.factor) fd.append('factor_img', state.files.factor);
-  if (state.files.aitime) fd.append('ai_time_img', state.files.aitime);
-
-  document.getElementById('progressContainer').classList.add('active');
-  document.getElementById('resultSection').classList.add('hidden');
-  document.getElementById('btnPredict').disabled = true;
-
-  fetch('/predict', { method: 'POST', body: fd })
-    .then(r => r.json())
-    .then(data => {
-      if (data.error) {
-        alert(data.error);
-        document.getElementById('btnPredict').disabled = false;
-        return;
-      }
-      state.currentJob = data.job_id;
-      startPolling();
-    })
-    .catch(err => {
-      alert('エラー: ' + err);
-      document.getElementById('btnPredict').disabled = false;
-    });
-}
-
-function startPdfPrediction() {
-  if (!state.files.pdf) return;
-  const fd = new FormData();
-  fd.append('pdf', state.files.pdf);
-
-  document.getElementById('progressContainer').classList.add('active');
-  document.getElementById('resultSection').classList.add('hidden');
-
-  fetch('/predict_pdf', { method: 'POST', body: fd })
-    .then(r => r.json())
-    .then(data => {
-      if (data.error) { alert(data.error); return; }
-      state.currentJob = data.job_id;
-      startPolling();
-    });
-}
-
-// ─── Polling ───
-function startPolling() {
-  if (state.pollTimer) clearInterval(state.pollTimer);
-  state.pollTimer = setInterval(pollStatus, 1500);
-}
-
-function pollStatus() {
-  if (!state.currentJob) return;
-  fetch('/status/' + state.currentJob)
-    .then(r => r.json())
-    .then(job => {
-      const elapsed = (job.elapsed || 0).toFixed(1);
-      document.getElementById('progressTime').textContent = elapsed + 's';
-      
-      // Progress bar animation
-      const pct = Math.min(95, (parseFloat(elapsed) / 120) * 100);
-      document.getElementById('progressBar').style.width = pct + '%';
-
-      // Log
-      if (job.log) {
-        const logEl = document.getElementById('progressLog');
-        logEl.textContent = job.log.slice(-500);
-        logEl.scrollTop = logEl.scrollHeight;
-      }
-
-      if (job.status === 'done') {
-        clearInterval(state.pollTimer);
-        document.getElementById('progressBar').style.width = '100%';
-        setTimeout(() => showResult(job), 500);
-      } else if (job.status === 'error') {
-        clearInterval(state.pollTimer);
-        document.getElementById('progressContainer').classList.remove('active');
-        alert('エラー: ' + (job.error || '不明なエラー'));
-        document.getElementById('btnPredict').disabled = false;
-      }
-    });
-}
-
-// ─── Show Result ───
-function showResult(job) {
-  document.getElementById('progressContainer').classList.remove('active');
-  document.getElementById('resultSection').classList.remove('hidden');
-  document.getElementById('btnPredict').disabled = false;
-
-  const structured = job.structured || {};
-  const md = job.markdown || '';
-
-  // Render anchor card
-  renderAnchorCard(structured);
+function renderRaceBar() {
+  const d = demoData;
+  // Venue buttons
+  const vb = document.getElementById('venueButtons');
+  vb.innerHTML = d.venues.map(v => 
+    `<button class="venue-btn ${v===d.selected.venue?'active':''}" onclick="loadDemoData('${v}')">${v}</button>`
+  ).join('');
   
-  // Render rank matrix
-  renderRankMatrix(structured);
+  // Race number buttons
+  const rn = document.getElementById('raceNums');
+  rn.innerHTML = d.races.map(r => 
+    `<button class="race-num-btn ${r.R===d.selected.race?'active':''}" onclick="loadDemoData('${d.selected.venue}','${r.R}')">${r.R.replace('R','')}</button>`
+  ).join('');
   
-  // Render bet plan
-  renderBetPlan(structured);
+  // Race meta
+  const sel = d.selected;
+  let gradeClass = 'grade-default';
+  if(sel.grade.includes('GI') && !sel.grade.includes('II') && !sel.grade.includes('III')) gradeClass = 'grade-GI';
+  else if(sel.grade.includes('GII')) gradeClass = 'grade-GII';
+  else if(sel.grade.includes('GIII')) gradeClass = 'grade-GIII';
+  else if(sel.grade === 'OP') gradeClass = 'grade-OP';
   
-  // Render markdown
-  if (md && typeof marked !== 'undefined') {
-    document.getElementById('mdResultContainer').innerHTML = marked.parse(md);
-  }
-
-  switchResultTab('matrix');
+  document.getElementById('raceMeta').innerHTML = `
+    <span class="race-meta-name">${sel.race} ${sel.race_name}</span>
+    <span class="race-meta-tag ${gradeClass}">${sel.grade}</span>
+    <span class="race-meta-dist">${sel.distance}</span>
+    <span style="font-size:11px;color:var(--text3)">${sel.date} ${sel.venue}</span>
+  `;
 }
 
-// ─── Render Anchor Card ───
-function renderAnchorCard(data) {
-  const anchor = data.anchor || {};
-  if (!anchor.num) {
-    document.getElementById('anchorCard').style.display = 'none';
-    return;
-  }
-  document.getElementById('anchorCard').style.display = 'block';
-  document.getElementById('anchorNum').textContent = anchor.num + '番 ';
-  document.getElementById('anchorName').textContent = anchor.name || '';
-
-  const conf = anchor.confidence_level || '';
-  const confEl = document.getElementById('anchorConfidence');
-  if (conf) {
-    confEl.className = 'confidence confidence-' + conf;
-    confEl.textContent = '信頼度: ' + conf;
-  } else {
-    confEl.textContent = '';
-  }
-
-  const statsEl = document.getElementById('anchorStats');
-  const score = anchor.score != null ? anchor.score.toFixed(1) : '-';
-  const pPlace = anchor.p_place_est_pct != null ? anchor.p_place_est_pct.toFixed(1) + '%' : '-';
-  const gap = anchor.confidence_score_gap != null ? anchor.confidence_score_gap.toFixed(1) + 'pt' : '-';
-  const placeOk = anchor.place_ok ? '✅ 購入' : '❌ 見送り';
-  const placeClass = anchor.place_ok ? 'high' : 'low';
-
-  statsEl.innerHTML = `
-    <div class="stat-item">
-      <div class="stat-label">AnchorScore</div>
-      <div class="stat-value">${score}</div>
+function renderRaceView() {
+  const d = demoData;
+  const anc = d.anchor;
+  const rankings = d.rankings;
+  const wide = d.wide;
+  const trio = d.trio;
+  
+  // Anchor hero
+  const ah = document.getElementById('anchorHero');
+  ah.classList.remove('hidden');
+  document.getElementById('aNum').textContent = anc.num;
+  document.getElementById('aName').textContent = anc.name;
+  document.getElementById('aMeta').textContent = 
+    `${d.selected.date} ${d.selected.venue} ${d.selected.race} ${d.selected.race_name} / ${anc.jockey||''}`;
+  document.getElementById('aScore').textContent = 
+    anc.score != null ? Number(anc.score).toFixed(1) : '-';
+  document.getElementById('aPPlace').textContent = 
+    anc.p_place_est_pct != null ? Number(anc.p_place_est_pct).toFixed(1)+'%' : '-';
+  const confEl = document.getElementById('aConf');
+  confEl.textContent = anc.confidence_level || '-';
+  confEl.className = 'anchor-stat-val conf-'+(anc.confidence_level||'LOW');
+  
+  // Prediction cards
+  const pc = document.getElementById('predCards');
+  pc.classList.remove('hidden');
+  pc.innerHTML = `
+    <div class="pred-card">
+      <div class="pred-card-lbl">🎯 複勝</div>
+      <div class="pred-card-val" style="color:${anc.place_ok?'var(--green2)':'var(--text3)'}">${anc.place_ok?'✅ 購入OK':'⏸ 見送り'}</div>
+      <div class="pred-card-sub">◎ ${anc.num}番 ${anc.name}</div>
     </div>
-    <div class="stat-item">
-      <div class="stat-label">複勝確率</div>
-      <div class="stat-value high">${pPlace}</div>
+    <div class="pred-card">
+      <div class="pred-card-lbl">📈 ワイド</div>
+      <div class="pred-card-val">${wide.length}点</div>
+      <div class="pred-card-sub">◎軸流し: ${wide.join(' - ')}</div>
     </div>
-    <div class="stat-item">
-      <div class="stat-label">スコアGAP</div>
-      <div class="stat-value medium">${gap}</div>
+    <div class="pred-card">
+      <div class="pred-card-lbl">🎰 三連複</div>
+      <div class="pred-card-val">${trio.points||'-'}点</div>
+      <div class="pred-card-sub">${trio.a} / ${(trio.b||[]).join(',')} / ${(trio.c||[]).join(',')}</div>
     </div>
-    <div class="stat-item">
-      <div class="stat-label">複勝判定</div>
-      <div class="stat-value ${placeClass}" style="font-size:16px">${placeOk}</div>
+    <div class="pred-card">
+      <div class="pred-card-lbl">🔒 信頼度</div>
+      <div class="pred-card-val conf-${anc.confidence_level||'LOW'}">${anc.confidence_level||'-'}</div>
+      <div class="pred-card-sub">Gap: ${anc.confidence_score_gap!=null?Number(anc.confidence_score_gap).toFixed(1)+'pt':'-'}</div>
+    </div>
+  `;
+  
+  // Matrix
+  renderMatrixRows(document.getElementById('raceMatrix'), rankings, anc.num, wide);
+  
+  // Betting section
+  const bs = document.getElementById('betSection');
+  bs.classList.remove('hidden');
+  bs.innerHTML = `
+    <div class="bet-box">
+      <div class="bet-box-title">ワイド ◎軸流し <span class="bet-tag">${wide.length}点</span></div>
+      <div class="bet-nums-row">
+        <div class="bet-circle anc">${anc.num}</div>
+        <span class="bet-arrow">→</span>
+        ${wide.map(n=>`<div class="bet-circle">${n}</div>`).join('')}
+      </div>
+    </div>
+    <div class="bet-box">
+      <div class="bet-box-title">三連複フォーメーション <span class="bet-tag">${trio.points||'-'}点</span></div>
+      <div class="trio-box">
+        A列（軸）: ${trio.a}<br>
+        B列（連軸）: ${(trio.b||[]).join(', ')}<br>
+        C列（相手）: ${(trio.c||[]).join(', ')}
+      </div>
     </div>
   `;
 }
 
-// ─── Render Rank Matrix ───
-function renderRankMatrix(data) {
-  const rankings = data.rankings || [];
-  const anchor = data.anchor || {};
-  const container = document.getElementById('rankMatrixContainer');
+// Date change reloads
+document.getElementById('datePicker').addEventListener('change', () => {
+  loadDemoData();
+});
 
-  if (!rankings.length) {
-    container.innerHTML = '<div class="empty-state"><div class="icon">📊</div><p>ランク指数データがありません</p></div>';
-    return;
-  }
-
-  const cols = ['総合', '能力', '展開', '適性', '安定', '上り', '調教', 'EV'];
-  let html = '<table class="rank-matrix"><thead><tr>';
-  html += '<th>枠</th><th>番</th><th>馬名</th>';
-  cols.forEach(c => { html += `<th>${c}</th>`; });
-  html += '</tr></thead><tbody>';
-
-  rankings.forEach(h => {
-    const isAnchor = String(h.num) === String(anchor.num);
-    const rowClass = isAnchor ? 'anchor-row' : '';
-    const numInt = parseInt(h.num) || 0;
-    const waku = Math.ceil(numInt / 2) || 1;
-    const wakuClass = 'waku-' + Math.min(waku, 8);
-
-    html += `<tr class="${rowClass}">`;
-    html += `<td><span class="horse-num ${wakuClass}">${waku}</span></td>`;
-    html += `<td><b>${h.num}</b></td>`;
-    html += `<td class="horse-name">${isAnchor ? '◎ ' : ''}${h.name || ''}</td>`;
-    
-    cols.forEach(c => {
-      const rank = (h.ranks && h.ranks[c]) || '-';
-      html += `<td><span class="rank-badge rank-${rank}">${rank}</span></td>`;
-    });
-    
-    html += '</tr>';
-  });
-
-  html += '</tbody></table>';
-  container.innerHTML = html;
-}
-
-// ─── Render Bet Plan ───
-function renderBetPlan(data) {
-  const anchor = data.anchor || {};
-  const wide = data.wide || [];
-  const trio = data.trio || {};
-  const container = document.getElementById('betPlanContainer');
-
-  if (!anchor.num) {
-    container.innerHTML = '<div class="empty-state"><div class="icon">🎫</div><p>買い目データがありません</p></div>';
-    return;
-  }
-
-  let html = '<div class="bet-grid">';
-
-  // 複勝
-  html += `<div class="bet-card">
-    <h4>🎯 複勝</h4>
-    <div class="bet-nums">
-      <div class="bet-num anchor-num">${anchor.num}</div>
-    </div>
-    <div style="margin-top:8px;font-size:12px;color:var(--text-sub)">
-      ${anchor.place_ok ? '✅ 購入推奨' : '❌ 見送り'}
-    </div>
-  </div>`;
-
-  // ワイド
-  if (wide.length) {
-    html += `<div class="bet-card">
-      <h4>🔗 ワイド（◎軸流し ${wide.length}点）</h4>
-      <div class="bet-nums">
-        <div class="bet-num anchor-num">${anchor.num}</div>
-        <span style="color:var(--text-muted);font-size:18px;align-self:center">—</span>`;
-    wide.forEach(n => {
-      html += `<div class="bet-num">${n}</div>`;
-    });
-    html += `</div></div>`;
-  }
-
-  // 三連複
-  if (trio.a) {
-    html += `<div class="bet-card">
-      <h4>🏆 三連複フォーメーション（${trio.points || 0}点）</h4>
-      <div style="font-size:12px">
-        <div style="margin-bottom:6px"><b style="color:var(--gold)">A列:</b> ${trio.a}</div>
-        <div style="margin-bottom:6px"><b style="color:var(--blue)">B列:</b> ${(trio.b || []).join(', ')}</div>
-        <div><b style="color:var(--green)">C列:</b> ${(trio.c || []).join(', ')}</div>
-      </div>
-    </div>`;
-  }
-
-  html += '</div>';
-  container.innerHTML = html;
-}
-
-// ─── Result Tabs ───
-function switchResultTab(tab) {
-  document.querySelectorAll('.result-tab').forEach(el => el.classList.remove('active'));
-  document.querySelectorAll('.result-panel').forEach(el => el.classList.remove('active'));
-  
-  document.querySelector(`.result-tab[onclick="switchResultTab('${tab}')"]`).classList.add('active');
-  document.getElementById('panel-' + tab).classList.add('active');
-}
-
-// ─── Load History ───
-function loadHistory() {
-  fetch('/history').then(r => r.json()).then(data => {
-    const items = data.history || [];
-    const container = document.getElementById('historyContainer');
-    if (!items.length) {
-      container.innerHTML = '<div class="empty-state"><div class="icon">📂</div><p>予想履歴はまだありません</p></div>';
-      return;
-    }
-
-    let html = '<ul class="history-list">';
-    items.forEach(h => {
-      const confClass = h.confidence ? `confidence-${h.confidence}` : '';
-      html += `<li class="history-item" onclick="loadHistoryResult('${h.job_id}')">
-        <div class="history-venue">${h.venue || '🏇'}</div>
-        <div class="history-info">
-          <div class="history-title">${h.title}</div>
-          <div class="history-meta">${h.date || ''} ${h.race || ''} · ${h.timestamp}</div>
-        </div>
-        <div class="history-confidence">
-          ${h.confidence ? `<span class="confidence ${confClass}">${h.confidence}</span>` : ''}
-        </div>
-      </li>`;
-    });
-    html += '</ul>';
-    container.innerHTML = html;
-  });
-}
-
-function loadHistoryResult(jobId) {
-  showPage('predict');
-  fetch('/result/' + jobId)
-    .then(r => r.json())
-    .then(data => {
-      if (!data.success) return;
-      const structured = data.structured || {};
-      document.getElementById('resultSection').classList.remove('hidden');
-      renderAnchorCard(structured);
-      renderRankMatrix(structured);
-      renderBetPlan(structured);
-      if (data.markdown && typeof marked !== 'undefined') {
-        document.getElementById('mdResultContainer').innerHTML = marked.parse(data.markdown);
-      }
-      switchResultTab('matrix');
-    });
-}
-
-// ─── Load Saved Results ───
-function loadSavedResults() {
-  fetch('/results').then(r => r.json()).then(data => {
-    const items = data.results || [];
-    const container = document.getElementById('savedResultsList');
-    if (!items.length) {
-      container.innerHTML = '<div class="empty-state"><div class="icon">📋</div><p>保存済みの予想結果はありません</p></div>';
-      return;
-    }
-
-    let html = '<ul class="history-list">';
-    items.forEach(r => {
-      const hitIcon = r.place_hit === true ? '✅' : r.place_hit === false ? '❌' : '⏳';
-      const confClass = r.confidence ? `confidence-${r.confidence}` : '';
-      html += `<li class="history-item">
-        <div class="history-venue">${r.venue || '🏇'}</div>
-        <div class="history-info">
-          <div class="history-title">${r.date || ''} ${r.venue || ''} ${r.race || ''}</div>
-          <div class="history-meta">◎ ${r.anchor_num || ''}番 ${r.anchor_name || ''} · ${hitIcon}</div>
-        </div>
-        <div class="history-confidence">
-          ${r.confidence ? `<span class="confidence ${confClass}">${r.confidence}</span>` : ''}
-        </div>
-      </li>`;
-    });
-    html += '</ul>';
-    container.innerHTML = html;
-  });
-}
-
-// ─── Health Check ───
-function checkHealth() {
-  fetch('/health')
-    .then(r => r.json())
+// ═══ SAMPLE TABLE ON HOME ═══
+function loadSampleTable() {
+  fetch('/demo_data?venue=東京&race=11R')
+    .then(r=>r.json())
     .then(d => {
-      const badge = document.getElementById('healthBadge');
-      badge.textContent = d.status === 'ok' ? 'ONLINE' : 'OFFLINE';
+      const rows = d.rankings.slice(0, 6);
+      renderMatrixRows(document.getElementById('sampleBody'), rows, d.anchor.num, d.wide);
     })
-    .catch(() => {
-      document.getElementById('healthBadge').textContent = 'OFFLINE';
-    });
+    .catch(()=>{});
 }
 
-// ─── Init ───
-checkHealth();
-setInterval(checkHealth, 30000);
+// ═══ REAL PREDICTION ═══
+function startPredict() {
+  const fd = new FormData();
+  if(F.rating_img) fd.append('rating_img', F.rating_img[0]);
+  if(F.speed_index_img) fd.append('speed_index_img', F.speed_index_img[0]);
+  if(F.meta_img) fd.append('meta_img', F.meta_img[0]);
+  if(F.factor_img) fd.append('factor_img', F.factor_img[0]);
+  if(F.ai_time_img) fd.append('ai_time_img', F.ai_time_img[0]);
+  if(F.training_imgs) Array.from(F.training_imgs).forEach(f=>fd.append('training_imgs',f));
+  const rid = document.getElementById('raceIdIn').value.trim();
+  if(rid) fd.append('race_id', rid);
+  if(document.getElementById('fastChk').checked) fd.append('fast','true');
+  
+  showLoading('STELLA 画像分析を開始しました...');
+  fetch('/predict',{method:'POST',body:fd})
+    .then(r=>r.json())
+    .then(data => {
+      if(data.error){hideLoading();toast(data.error,'error');return}
+      jobId = data.job_id;
+      startPoll();
+    })
+    .catch(e=>{hideLoading();toast('通信エラー: '+e,'error')});
+}
+
+function startPdfPredict() {
+  const fd = new FormData();
+  if(F.pdf) fd.append('pdf', F.pdf[0]);
+  if(document.getElementById('fastChk')?.checked) fd.append('fast','true');
+  
+  showLoading('STELLA PDF分析を開始しました...');
+  fetch('/predict_pdf',{method:'POST',body:fd})
+    .then(r=>r.json())
+    .then(data => {
+      if(data.error){hideLoading();toast(data.error,'error');return}
+      jobId = data.job_id;
+      startPoll();
+    })
+    .catch(e=>{hideLoading();toast('通信エラー: '+e,'error')});
+}
+
+// ── Polling ──
+function startPoll() {
+  if(pollTmr) clearInterval(pollTmr);
+  pollTmr = setInterval(pollStatus, 1500);
+}
+function pollStatus() {
+  if(!jobId) return;
+  fetch('/status/'+jobId)
+    .then(r=>r.json())
+    .then(job => {
+      if(job.status==='running') {
+        const el = job.elapsed||0;
+        document.getElementById('ldFill').style.width = Math.min(95, 10+el*0.8)+'%';
+        document.getElementById('ldText').textContent = `STELLA 分析中... (${Math.round(el)}秒)`;
+        if(job.log) {
+          const logEl = document.getElementById('ldLog');
+          logEl.textContent = job.log.split('\n').slice(-10).join('\n');
+          logEl.scrollTop = logEl.scrollHeight;
+        }
+      } else if(job.status==='done') {
+        clearInterval(pollTmr);
+        document.getElementById('ldFill').style.width = '100%';
+        setTimeout(()=>{hideLoading();displayResult(job);toast(`分析完了 (${job.elapsed||'-'}秒)`,'success');}, 400);
+      } else if(job.status==='error') {
+        clearInterval(pollTmr);
+        hideLoading();
+        toast('分析エラー: '+(job.error||'不明'),'error');
+      }
+    }).catch(()=>{});
+}
+
+// ── Display real result ──
+function displayResult(job) {
+  switchView('result');
+  const s = job.structured || {};
+  const anc = s.anchor || {};
+  const rankings = s.rankings || [];
+  const wide = s.wide || [];
+  const trio = s.trio || {};
+  const ri = s.race_info || {};
+  
+  // Anchor
+  if(anc.num) {
+    const ah = document.getElementById('resAnchorHero');
+    ah.classList.remove('hidden');
+    document.getElementById('rANum').textContent = anc.num;
+    document.getElementById('rAName').textContent = anc.name || '-';
+    document.getElementById('rAMeta').textContent = [ri.date, ri.venue, ri.race].filter(Boolean).join(' / ') + ' ◎本命';
+    document.getElementById('rAScore').textContent = anc.score!=null ? Number(anc.score).toFixed(1) : '-';
+    document.getElementById('rAPPlace').textContent = anc.p_place_est_pct!=null ? Number(anc.p_place_est_pct).toFixed(1)+'%' : '-';
+    const c = document.getElementById('rAConf');
+    c.textContent = anc.confidence_level||'-';
+    c.className = 'anchor-stat-val conf-'+(anc.confidence_level||'LOW');
+  }
+  
+  // Pred cards
+  if(anc.num) {
+    const pc = document.getElementById('resPredCards');
+    pc.classList.remove('hidden');
+    pc.innerHTML = `
+      <div class="pred-card">
+        <div class="pred-card-lbl">🎯 複勝</div>
+        <div class="pred-card-val" style="color:${anc.place_ok?'var(--green2)':'var(--text3)'}">${anc.place_ok?'✅ 購入OK':'⏸ 見送り'}</div>
+        <div class="pred-card-sub">◎ ${anc.num}番 ${anc.name||''}</div>
+      </div>
+      <div class="pred-card">
+        <div class="pred-card-lbl">📈 ワイド</div>
+        <div class="pred-card-val">${wide.length}点</div>
+        <div class="pred-card-sub">◎軸流し: ${wide.join(' - ')||'-'}</div>
+      </div>
+      <div class="pred-card">
+        <div class="pred-card-lbl">🎰 三連複</div>
+        <div class="pred-card-val">${trio.points||'-'}点</div>
+        <div class="pred-card-sub">${trio.a||'-'} / ${(trio.b||[]).join(',')||'-'} / ${(trio.c||[]).join(',')||'-'}</div>
+      </div>
+      <div class="pred-card">
+        <div class="pred-card-lbl">🔒 信頼度</div>
+        <div class="pred-card-val conf-${anc.confidence_level||'LOW'}">${anc.confidence_level||'-'}</div>
+        <div class="pred-card-sub">Gap: ${anc.confidence_score_gap!=null?Number(anc.confidence_score_gap).toFixed(1)+'pt':'-'}</div>
+      </div>
+    `;
+  }
+  
+  // Matrix
+  if(rankings.length > 0) {
+    document.getElementById('resMatrixSec').classList.remove('hidden');
+    const sorted = [...rankings].sort((a,b)=>(b.anchor_score||0)-(a.anchor_score||0));
+    renderMatrixRows(document.getElementById('resMatrix'), sorted, anc.num, wide);
+  }
+  
+  // Betting
+  if(wide.length > 0 || trio.a) {
+    const bs = document.getElementById('resBetSection');
+    bs.classList.remove('hidden');
+    bs.innerHTML = `
+      <div class="bet-box">
+        <div class="bet-box-title">ワイド ◎軸流し <span class="bet-tag">${wide.length}点</span></div>
+        <div class="bet-nums-row">
+          <div class="bet-circle anc">${anc.num}</div>
+          <span class="bet-arrow">→</span>
+          ${wide.map(n=>`<div class="bet-circle">${n}</div>`).join('')}
+        </div>
+      </div>
+      <div class="bet-box">
+        <div class="bet-box-title">三連複フォーメーション <span class="bet-tag">${trio.points||'-'}点</span></div>
+        <div class="trio-box">
+          A列（軸）: ${trio.a||'-'}<br>
+          B列（連軸）: ${(trio.b||[]).join(', ')||'-'}<br>
+          C列（相手）: ${(trio.c||[]).join(', ')||'-'}
+        </div>
+      </div>
+    `;
+  }
+  
+  // Markdown
+  if(job.markdown) {
+    const sec = document.getElementById('resMdSec');
+    sec.classList.remove('hidden');
+    document.getElementById('mdRender').innerHTML = marked.parse(job.markdown);
+    mdOpen = false;
+  }
+}
+
+function toggleMd() {
+  const el = document.getElementById('mdRender');
+  mdOpen = !mdOpen;
+  el.style.maxHeight = mdOpen ? 'none' : '360px';
+  el.style.overflow = mdOpen ? 'visible' : 'hidden';
+}
+
+// ── History ──
+function loadHistory() {
+  fetch('/history').then(r=>r.json()).then(data => {
+    const list = document.getElementById('historyList');
+    const items = data.history || [];
+    if(!items.length) {
+      list.innerHTML = '<div class="empty"><div class="e-icon">📂</div><p>まだ予想履歴がありません</p></div>';
+      return;
+    }
+    list.innerHTML = items.map(i => `
+      <div class="hist-item" onclick="loadResult('${i.job_id}')">
+        <div class="hist-badge">${i.anchor_num||'?'}</div>
+        <div class="hist-info">
+          <h4>${i.title}</h4>
+          <div class="meta">${[i.date,i.venue,i.race].filter(Boolean).join(' / ')} | ${i.timestamp} | 信頼度: ${i.confidence||'-'}</div>
+        </div>
+      </div>
+    `).join('');
+  });
+}
+
+function loadResult(jid) {
+  fetch('/result/'+jid).then(r=>r.json()).then(data => {
+    if(data.success) {
+      displayResult({markdown:data.markdown, structured:data.structured||{}});
+    } else {
+      toast('結果が見つかりません','error');
+    }
+  });
+}
+
+// ── UI Helpers ──
+function showLoading(msg) {
+  document.getElementById('loadingOverlay').classList.add('show');
+  document.getElementById('ldText').textContent = msg||'STELLA 分析中...';
+  document.getElementById('ldLog').textContent = '';
+  document.getElementById('ldFill').style.width = '10%';
+}
+function hideLoading() {
+  document.getElementById('loadingOverlay').classList.remove('show');
+}
+function toast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast '+(type||'')+' show';
+  setTimeout(()=>t.classList.remove('show'), 4000);
+}
+
+// ── Health ──
+function checkHealth() {
+  fetch('/health').then(r=>r.json()).then(d => {
+    const b = document.getElementById('healthBadge');
+    if(d.status==='ok') b.innerHTML = '<span class="health-dot"></span>稼働中';
+  }).catch(()=>{});
+}
+
+// ── Init ──
+document.addEventListener('DOMContentLoaded', () => {
+  checkHealth();
+  setInterval(checkHealth, 30000);
+  loadSampleTable();
+});
 </script>
 </body>
 </html>

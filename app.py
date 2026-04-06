@@ -595,6 +595,185 @@ def health():
     })
 
 
+@app.route("/demo_data")
+def demo_data():
+    """netkeita.com風デモデータを生成する（実際の予想実行なしでUI確認用）。"""
+    import random
+    random.seed(42)
+
+    venues_races = {
+        "東京": [
+            {"R": "11R", "name": "安田記念", "distance": "芝1600m", "grade": "GI", "horses": 16},
+            {"R": "10R", "name": "芝の薫り賞", "distance": "芝2000m", "grade": "3勝C", "horses": 14},
+            {"R": "9R", "name": "TVh杯", "distance": "ダ1400m", "grade": "2勝C", "horses": 16},
+            {"R": "8R", "name": "メイS", "distance": "芝1800m", "grade": "OP", "horses": 12},
+            {"R": "7R", "name": "3歳1勝C", "distance": "芝1600m", "grade": "1勝C", "horses": 16},
+            {"R": "6R", "name": "3歳未勝利", "distance": "ダ1600m", "grade": "未勝利", "horses": 16},
+            {"R": "5R", "name": "3歳未勝利", "distance": "芝2000m", "grade": "未勝利", "horses": 14},
+            {"R": "4R", "name": "3歳未勝利", "distance": "ダ1400m", "grade": "未勝利", "horses": 16},
+            {"R": "3R", "name": "3歳未勝利", "distance": "芝1400m", "grade": "未勝利", "horses": 16},
+            {"R": "2R", "name": "3歳未勝利", "distance": "ダ1300m", "grade": "未勝利", "horses": 16},
+            {"R": "1R", "name": "2歳新馬", "distance": "芝1600m", "grade": "新馬", "horses": 10},
+        ],
+        "阪神": [
+            {"R": "11R", "name": "鳴尾記念", "distance": "芝2000m", "grade": "GII", "horses": 12},
+            {"R": "10R", "name": "灘S", "distance": "芝1400m", "grade": "3勝C", "horses": 16},
+            {"R": "9R", "name": "御影S", "distance": "ダ1800m", "grade": "3勝C", "horses": 14},
+            {"R": "8R", "name": "3歳1勝C", "distance": "芝2000m", "grade": "1勝C", "horses": 14},
+            {"R": "7R", "name": "3歳1勝C", "distance": "ダ1400m", "grade": "1勝C", "horses": 16},
+            {"R": "6R", "name": "3歳未勝利", "distance": "芝1800m", "grade": "未勝利", "horses": 16},
+            {"R": "5R", "name": "3歳未勝利", "distance": "ダ1200m", "grade": "未勝利", "horses": 16},
+        ],
+        "中京": [
+            {"R": "11R", "name": "中京記念", "distance": "芝1600m", "grade": "GIII", "horses": 16},
+            {"R": "10R", "name": "豊明S", "distance": "ダ1800m", "grade": "3勝C", "horses": 14},
+            {"R": "9R", "name": "3歳1勝C", "distance": "芝2000m", "grade": "1勝C", "horses": 14},
+        ],
+    }
+
+    horse_names = [
+        "ショウナンバルディ", "タイセイドリーマー", "メイショウハリオ", "テーオーロイヤル",
+        "ジャスティンパレス", "ドウデュース", "リバティアイランド", "イクイノックス",
+        "スターズオンアース", "ソールオリエンス", "タスティエーラ", "レモンポップ",
+        "ウシュバテソーロ", "セリフォス", "ナミュール", "ジオグリフ",
+        "ヴェルトライゼンデ", "エフフォーリア", "シャフリヤール", "ダノンザキッド",
+        "ステラヴェローチェ", "アスクビクターモア", "ボルドグフーシュ", "ジャックドール",
+        "プログノーシス", "ヒシイグアス", "マテンロウレオ", "サリオス",
+        "ガイアフォース", "ノースブリッジ", "ピースオブエイト", "エヒト",
+    ]
+    jockey_names = [
+        "C.ルメール", "武豊", "川田将雅", "横山武史", "松山弘平",
+        "M.デムーロ", "戸崎圭太", "福永祐一", "岩田望来", "浜中俊",
+        "池添謙一", "田辺裕信", "三浦皇成", "石橋脩", "吉田隼人", "丹内祐次",
+    ]
+
+    venue = request.args.get("venue", "東京")
+    race_r = request.args.get("race", "11R")
+    date = request.args.get("date", "2026-04-06")
+
+    if venue not in venues_races:
+        venue = "東京"
+
+    races_list = venues_races[venue]
+    selected_race = None
+    for r in races_list:
+        if r["R"] == race_r:
+            selected_race = r
+            break
+    if not selected_race:
+        selected_race = races_list[0]
+        race_r = selected_race["R"]
+
+    n_horses = selected_race["horses"]
+    grades = ["S", "A", "B", "C", "D"]
+    labels = ["総合", "能力", "展開", "適性", "安定", "上り", "調教", "EV"]
+
+    random.seed(hash(f"{venue}{race_r}{date}") % 2**31)
+
+    used_names = random.sample(horse_names, min(n_horses, len(horse_names)))
+    if len(used_names) < n_horses:
+        used_names += [f"デモホース{i}" for i in range(len(used_names), n_horses)]
+    used_jockeys = [jockey_names[i % len(jockey_names)] for i in range(n_horses)]
+
+    rankings = []
+    for i in range(n_horses):
+        num = i + 1
+        waku = min(((num - 1) // 2) + 1, 8)
+        base_strength = random.gauss(0, 1)
+
+        rank_dict = {}
+        raw_scores = {}
+        for label in labels:
+            noise = random.gauss(0, 0.8)
+            val = base_strength + noise
+            raw_scores[label] = round(val * 15 + 50, 1)
+
+        rankings.append({
+            "num": str(num),
+            "waku": waku,
+            "name": used_names[i],
+            "jockey": used_jockeys[i],
+            "raw_scores": raw_scores,
+            "ranks": {},
+            "anchor_score": raw_scores.get("総合", 50),
+        })
+
+    # Relative grading
+    for label in labels:
+        vals = [(idx, r["raw_scores"].get(label, 50)) for idx, r in enumerate(rankings)]
+        vals.sort(key=lambda x: x[1], reverse=True)
+        total = len(vals)
+        for rank_idx, (orig_idx, _) in enumerate(vals):
+            pct = rank_idx / max(total - 1, 1)
+            if pct <= 0.12:
+                grade = "S"
+            elif pct <= 0.30:
+                grade = "A"
+            elif pct <= 0.55:
+                grade = "B"
+            elif pct <= 0.78:
+                grade = "C"
+            else:
+                grade = "D"
+            rankings[orig_idx]["ranks"][label] = grade
+
+    # Sort by overall score desc
+    rankings.sort(key=lambda x: x["raw_scores"].get("総合", 0), reverse=True)
+
+    # Anchor = top scorer
+    anchor = rankings[0]
+    anchor_num = anchor["num"]
+    anchor_name = anchor["name"]
+
+    # Wide = next 4 by score
+    wide_nums = [rankings[i]["num"] for i in range(1, min(5, len(rankings)))]
+
+    # Trio
+    trio_b = [rankings[i]["num"] for i in range(1, min(5, len(rankings)))]
+    trio_c = [rankings[i]["num"] for i in range(1, min(8, len(rankings)))]
+
+    p_place_pct = round(random.uniform(28, 68), 1)
+    score_gap = round(random.uniform(1.5, 12.0), 1)
+    if p_place_pct >= 50:
+        conf_level = "HIGH"
+    elif p_place_pct >= 35:
+        conf_level = "MEDIUM"
+    else:
+        conf_level = "LOW"
+
+    return jsonify({
+        "venues": list(venues_races.keys()),
+        "races": [{"R": r["R"], "name": r["name"], "distance": r["distance"],
+                    "grade": r["grade"], "horses": r["horses"]} for r in races_list],
+        "selected": {
+            "venue": venue,
+            "race": race_r,
+            "race_name": selected_race["name"],
+            "distance": selected_race["distance"],
+            "grade": selected_race["grade"],
+            "date": date,
+        },
+        "anchor": {
+            "num": anchor_num,
+            "name": anchor_name,
+            "score": anchor["raw_scores"]["総合"],
+            "p_place_est_pct": p_place_pct,
+            "place_ok": p_place_pct >= 35,
+            "confidence_level": conf_level,
+            "confidence_score_gap": score_gap,
+            "jockey": anchor.get("jockey", ""),
+        },
+        "rankings": rankings,
+        "wide": wide_nums,
+        "trio": {
+            "a": anchor_num,
+            "b": trio_b,
+            "c": trio_c,
+            "points": len(trio_b) * (len(trio_c) - 1) // 2 + len(trio_b),
+        },
+    })
+
+
 # ── 起動 ──────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
