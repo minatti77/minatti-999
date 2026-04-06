@@ -3,1594 +3,1566 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🏇 STELLA 競馬予想エンジン v1.34</title>
+<title>GIN AND TONIC STELLA | AI競馬予想エンジン</title>
 <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
-<!-- marked.js for Markdown rendering -->
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
-/* ═══════════════════════════════════════════════════
-   STELLA v1.34 — Premium Racing Prediction UI
-   ═══════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════
+   GIN AND TONIC STELLA v2.0 — netkeita.com品質 Premium UI
+   ═══════════════════════════════════════════════════════════ */
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg-deep:     #080b12;
-  --bg-panel:    #0c1018;
-  --bg-card:     #111827;
-  --bg-hover:    #161f2e;
-  --border:      #1e2a3d;
-  --border-soft: #16213099;
-  --gold:        #f5c518;
-  --gold-soft:   #f5c51833;
-  --gold-glow:   #f5c51866;
-  --blue:        #3b82f6;
-  --blue-soft:   #3b82f622;
-  --green:       #22c55e;
-  --green-soft:  #22c55e22;
-  --red:         #ef4444;
-  --red-soft:    #ef444422;
-  --text:        #d8e0ee;
-  --text-sub:    #8899b0;
-  --text-muted:  #4a5a72;
+  --bg:          #0f1117;
+  --bg-card:     #1a1d28;
+  --bg-card2:    #1e2233;
+  --bg-hover:    #252a3a;
+  --bg-input:    #13151e;
+  --border:      #2a2f42;
+  --border-soft: #1e2235;
+  --gold:        #f0b90b;
+  --gold-dim:    #f0b90b55;
+  --gold-glow:   #f0b90b22;
+  --green:       #00d68f;
+  --green-dim:   #00d68f33;
+  --red:         #f44336;
+  --red-dim:     #f4433622;
+  --blue:        #4d9fff;
+  --blue-dim:    #4d9fff22;
+  --purple:      #a78bfa;
+  --orange:      #ff9800;
+  --cyan:        #22d3ee;
+  --text:        #e4e8f1;
+  --text-sub:    #8892a8;
+  --text-muted:  #4b5366;
+  --radius:      10px;
   --radius-sm:   6px;
-  --radius-md:   10px;
-  --radius-lg:   14px;
+  --radius-lg:   16px;
+  --shadow:      0 4px 24px rgba(0,0,0,0.35);
+  --transition:  all 0.2s ease;
+  --font:        'Hiragino Kaku Gothic ProN','Noto Sans JP','Segoe UI',sans-serif;
 }
 
 html, body {
   height: 100%;
-  font-family: "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", sans-serif;
-  background: var(--bg-deep);
+  font-family: var(--font);
+  background: var(--bg);
   color: var(--text);
-  overflow: hidden;
+  line-height: 1.6;
+  overflow-x: hidden;
 }
 
-/* ═══════════════════════════════════════
-   HEADER
-   ═══════════════════════════════════════ */
-#header {
-  height: 54px;
-  background: linear-gradient(135deg, #0c1220 0%, #0a0f1a 100%);
+/* ─── SCROLLBAR ─── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3a4058; }
+
+/* ═══ TOP HEADER ═══ */
+.top-header {
+  background: linear-gradient(135deg, #111420 0%, #0d1019 100%);
   border-bottom: 1px solid var(--border);
+  padding: 0 24px;
+  height: 56px;
   display: flex;
   align-items: center;
-  padding: 0 20px;
-  gap: 14px;
-  flex-shrink: 0;
-  position: relative;
-  z-index: 10;
+  gap: 16px;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+}
+.logo-icon {
+  font-size: 28px;
+  filter: drop-shadow(0 0 8px var(--gold-dim));
+}
+.logo-text {
+  font-size: 15px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  background: linear-gradient(135deg, #f0b90b, #ffd54f, #f0b90b);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.logo-sub {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-left: 4px;
+}
+.header-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.status-badge {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.badge-live {
+  background: var(--green-dim);
+  color: var(--green);
+  border: 1px solid rgba(0,214,143,0.3);
+}
+.badge-live::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  background: var(--green);
+  border-radius: 50%;
+  animation: blink 2s infinite;
+}
+@keyframes blink {
+  0%,100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.badge-ai {
+  background: var(--blue-dim);
+  color: var(--blue);
+  border: 1px solid rgba(77,159,255,0.3);
 }
 
-.logo-horse { font-size: 26px; filter: drop-shadow(0 0 8px var(--gold-glow)); }
-.logo-text  { 
-  font-size: 16px; font-weight: 900; 
-  background: linear-gradient(135deg, #f5c518, #ffd700, #f0a500);
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+/* ═══ NAVIGATION TABS ═══ */
+.nav-tabs {
+  display: flex;
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border);
+  padding: 0 24px;
+  gap: 2px;
+  overflow-x: auto;
+}
+.nav-tab {
+  padding: 12px 20px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-sub);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+  transition: var(--transition);
+  user-select: none;
+}
+.nav-tab:hover { color: var(--text); background: var(--bg-hover); }
+.nav-tab.active {
+  color: var(--gold);
+  border-bottom-color: var(--gold);
+}
+
+/* ═══ MAIN LAYOUT ═══ */
+.main-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px 16px;
+}
+
+/* ═══ SECTION CARD ═══ */
+.section-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  margin-bottom: 20px;
+  overflow: hidden;
+}
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 15px;
+  font-weight: 700;
+}
+.section-header .icon {
+  font-size: 20px;
+}
+.section-body {
+  padding: 20px;
+}
+
+/* ═══ HERO BANNER ═══ */
+.hero {
+  background: linear-gradient(135deg, #111827 0%, #0f1524 50%, #131b2e 100%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 40px 32px;
+  margin-bottom: 24px;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+}
+.hero::before {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  background: radial-gradient(circle at 30% 40%, var(--gold-glow) 0%, transparent 50%);
+  pointer-events: none;
+}
+.hero-title {
+  font-size: 28px;
+  font-weight: 900;
+  margin-bottom: 8px;
+  position: relative;
+}
+.hero-title .accent {
+  background: linear-gradient(135deg, var(--gold), #ffd54f);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.hero-sub {
+  font-size: 14px;
+  color: var(--text-sub);
+  position: relative;
+}
+.hero-features {
+  display: flex;
+  justify-content: center;
+  gap: 24px;
+  margin-top: 24px;
+  flex-wrap: wrap;
+  position: relative;
+}
+.feature-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-sub);
+}
+.feature-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+}
+.fi-gold   { background: var(--gold-glow); }
+.fi-green  { background: var(--green-dim); }
+.fi-blue   { background: var(--blue-dim); }
+.fi-purple { background: rgba(167,139,250,0.15); }
+
+/* ═══ UPLOAD AREA ═══ */
+.upload-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+@media (max-width: 640px) {
+  .upload-grid { grid-template-columns: 1fr; }
+}
+.upload-slot {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  text-align: center;
+  cursor: pointer;
+  transition: var(--transition);
+  position: relative;
+}
+.upload-slot:hover {
+  border-color: var(--gold-dim);
+  background: var(--gold-glow);
+}
+.upload-slot.required {
+  border-color: rgba(240,185,11,0.4);
+}
+.upload-slot.filled {
+  border-color: var(--green);
+  border-style: solid;
+  background: var(--green-dim);
+}
+.upload-slot input[type="file"] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.upload-icon { font-size: 28px; margin-bottom: 6px; }
+.upload-label {
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 2px;
+}
+.upload-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.upload-filename {
+  font-size: 11px;
+  color: var(--green);
+  margin-top: 4px;
+  word-break: break-all;
+}
+.tag-required {
+  display: inline-block;
+  background: var(--red-dim);
+  color: var(--red);
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: 4px;
+}
+.tag-optional {
+  display: inline-block;
+  background: var(--blue-dim);
+  color: var(--blue);
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: 4px;
+}
+
+/* ─── Extra Uploads Toggle ─── */
+.extra-toggle {
+  text-align: center;
+  padding: 12px;
+  font-size: 13px;
+  color: var(--blue);
+  cursor: pointer;
+  border-top: 1px solid var(--border-soft);
+}
+.extra-toggle:hover { background: var(--bg-hover); }
+.extra-uploads { display: none; padding: 16px 20px; }
+.extra-uploads.show { display: block; }
+
+/* ═══ BUTTONS ═══ */
+.btn {
+  padding: 12px 28px;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: var(--transition);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.btn-primary {
+  background: linear-gradient(135deg, var(--gold), #e5a800);
+  color: #0f1117;
+  box-shadow: 0 4px 16px var(--gold-dim);
+}
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 24px rgba(240,185,11,0.4);
+}
+.btn-primary:disabled {
+  opacity: 0.5;
+  transform: none;
+  cursor: not-allowed;
+}
+.btn-secondary {
+  background: var(--bg-card2);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.btn-secondary:hover { background: var(--bg-hover); }
+.btn-sm { padding: 8px 16px; font-size: 12px; }
+
+.btn-group {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+
+/* ═══ PROGRESS ═══ */
+.progress-container {
+  display: none;
+  text-align: center;
+  padding: 32px 20px;
+}
+.progress-container.active { display: block; }
+.progress-bar-wrap {
+  width: 100%;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  margin: 16px 0;
+  overflow: hidden;
+}
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--gold), #ffd54f, var(--gold));
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite;
+  border-radius: 2px;
+  width: 0%;
+  transition: width 0.5s;
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.progress-text {
+  font-size: 13px;
+  color: var(--text-sub);
+}
+.progress-time {
+  font-size: 24px;
+  font-weight: 900;
+  color: var(--gold);
+  margin-top: 8px;
+}
+.progress-log {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  max-height: 150px;
+  overflow-y: auto;
+  text-align: left;
+  font-family: 'Fira Code', 'Consolas', monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 12px;
+  white-space: pre-wrap;
+}
+
+/* ═══ RANK MATRIX TABLE (netkeita.com style) ═══ */
+.rank-matrix-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.rank-matrix {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13px;
+}
+.rank-matrix thead th {
+  background: #161a28;
+  color: var(--text-sub);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 10px 8px;
+  text-align: center;
+  border-bottom: 2px solid var(--border);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+.rank-matrix tbody tr {
+  transition: var(--transition);
+}
+.rank-matrix tbody tr:hover {
+  background: var(--bg-hover);
+}
+.rank-matrix tbody tr.anchor-row {
+  background: rgba(240,185,11,0.08);
+}
+.rank-matrix tbody tr.anchor-row:hover {
+  background: rgba(240,185,11,0.14);
+}
+.rank-matrix td {
+  padding: 10px 8px;
+  text-align: center;
+  border-bottom: 1px solid var(--border-soft);
+  white-space: nowrap;
+}
+.rank-matrix td:first-child,
+.rank-matrix td:nth-child(2),
+.rank-matrix td:nth-child(3) {
+  text-align: left;
+}
+.rank-matrix .horse-num {
+  font-weight: 900;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: #fff;
+}
+.rank-matrix .horse-name {
+  font-weight: 600;
+  font-size: 13px;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ─── Rank Badges ─── */
+.rank-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 24px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+.rank-S { background: linear-gradient(135deg, #f0b90b, #ffd54f); color: #1a1200; }
+.rank-A { background: linear-gradient(135deg, #4d9fff, #6db3ff); color: #001a3a; }
+.rank-B { background: rgba(142,159,184,0.2); color: #8e9fb8; border: 1px solid rgba(142,159,184,0.3); }
+.rank-C { background: rgba(75,83,102,0.2); color: #6b7385; border: 1px solid rgba(75,83,102,0.3); }
+.rank-D { background: rgba(60,65,80,0.15); color: #555b6e; }
+.rank-- { background: transparent; color: var(--text-muted); font-size: 10px; }
+
+/* ─── Waku Colors ─── */
+.waku-1 { background: #f5f5f5; color: #333; }
+.waku-2 { background: #333; color: #fff; }
+.waku-3 { background: #e53935; }
+.waku-4 { background: #1e88e5; }
+.waku-5 { background: #fdd835; color: #333; }
+.waku-6 { background: #43a047; }
+.waku-7 { background: #ff8f00; }
+.waku-8 { background: #e91e63; }
+
+/* ═══ ANCHOR CARD ═══ */
+.anchor-card {
+  background: linear-gradient(135deg, rgba(240,185,11,0.08), rgba(240,185,11,0.03));
+  border: 1px solid rgba(240,185,11,0.25);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  margin-bottom: 20px;
+}
+.anchor-top {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.anchor-mark {
+  font-size: 36px;
+  font-weight: 900;
+  color: var(--gold);
+  line-height: 1;
+}
+.anchor-info h3 {
+  font-size: 20px;
+  font-weight: 800;
+}
+.anchor-info .num {
+  color: var(--gold);
+  margin-right: 6px;
+}
+.anchor-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+}
+.stat-item {
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 12px;
+  text-align: center;
+}
+.stat-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
   letter-spacing: 0.08em;
 }
-.logo-ver   { font-size: 10px; color: var(--text-muted); margin-top: 1px; }
+.stat-value {
+  font-size: 22px;
+  font-weight: 900;
+  margin-top: 4px;
+}
+.stat-value.high { color: var(--green); }
+.stat-value.medium { color: var(--gold); }
+.stat-value.low { color: var(--red); }
 
-.header-badges { margin-left: auto; display: flex; align-items: center; gap: 10px; }
-.badge {
+/* ═══ CONFIDENCE BADGE ═══ */
+.confidence {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 3px 10px;
   border-radius: 20px;
   font-size: 11px;
   font-weight: 700;
-  display: flex; align-items: center; gap: 4px;
 }
-.badge-live {
-  background: var(--green-soft);
-  border: 1px solid #22c55e44;
+.confidence-HIGH {
+  background: var(--green-dim);
   color: var(--green);
+  border: 1px solid rgba(0,214,143,0.3);
 }
-.badge-live::before {
-  content: ""; width: 6px; height: 6px;
-  background: var(--green); border-radius: 50%;
-  animation: pulse 2s infinite;
-}
-@keyframes pulse {
-  0%, 100% { opacity:1; transform:scale(1); }
-  50%       { opacity:0.5; transform:scale(0.85); }
-}
-
-.header-health {
-  font-size: 11px; color: var(--text-muted);
-  padding: 3px 10px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  cursor: pointer;
-  transition: all .15s;
-}
-.header-health:hover { border-color: var(--gold-soft); color: var(--gold); }
-
-/* ═══════════════════════════════════════
-   MAIN LAYOUT
-   ═══════════════════════════════════════ */
-#app {
-  height: calc(100vh - 54px);
-  display: flex;
-  overflow: hidden;
-}
-
-/* ═══════════════════════════════════════
-   SIDEBAR (Left)
-   ═══════════════════════════════════════ */
-#sidebar {
-  width: 340px;
-  min-width: 280px;
-  display: flex;
-  flex-direction: column;
-  border-right: 1px solid var(--border);
-  background: var(--bg-panel);
-  flex-shrink: 0;
-  overflow: hidden;
-}
-
-/* Chat messages */
-#chat-box {
-  flex: 1;
-  overflow-y: auto;
-  padding: 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  scroll-behavior: smooth;
-}
-
-.msg { display: flex; gap: 8px; animation: fadeIn .2s ease; }
-@keyframes fadeIn {
-  from { opacity:0; transform:translateY(6px); }
-  to   { opacity:1; transform:none; }
-}
-.msg.user { flex-direction: row-reverse; }
-
-.av {
-  width: 28px; height: 28px;
-  border-radius: 50%;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 14px; flex-shrink: 0;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-}
-.msg.user .av { background: #152848; border-color: #1e4080; }
-
-.bubble {
-  max-width: calc(100% - 40px);
-  padding: 9px 13px;
-  border-radius: 12px 12px 12px 3px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  font-size: 13px;
-  line-height: 1.7;
-  word-break: break-word;
-}
-.msg.user .bubble {
-  background: #0e2040;
-  border-color: #1e4080;
-  border-radius: 12px 12px 3px 12px;
-  color: #b8cfef;
-}
-.bubble h1,.bubble h2,.bubble h3 { color:var(--gold); font-size:13px; margin:6px 0 3px; }
-.bubble strong { color:var(--gold); }
-.bubble code { background:var(--bg-deep); border:1px solid var(--border); border-radius:3px; padding:1px 4px; font-size:11.5px; }
-.bubble ul,.bubble ol { padding-left:14px; }
-.bubble li,.bubble p { margin:2px 0; }
-.bubble table { width:100%; border-collapse:collapse; font-size:12px; margin:6px 0; }
-.bubble th,.bubble td { border:1px solid var(--border); padding:3px 7px; }
-.bubble th { background:var(--bg-deep); color:var(--text-sub); }
-
-/* Typing indicator */
-#typing {
-  display: none;
-  padding: 4px 0;
-}
-#typing.show { display: flex; gap: 8px; }
-.typing-dots { display:flex; gap:4px; padding:9px 13px; background:var(--bg-card); border:1px solid var(--border); border-radius:12px 12px 12px 3px; }
-.typing-dots span { width:6px;height:6px; border-radius:50%; background:var(--text-muted); animation:bounce 1.2s infinite; }
-.typing-dots span:nth-child(2) { animation-delay:.2s; }
-.typing-dots span:nth-child(3) { animation-delay:.4s; }
-@keyframes bounce {
-  0%,80%,100% { transform:translateY(0); background:var(--text-muted); }
-  40% { transform:translateY(-7px); background:var(--gold); }
-}
-
-/* Chat input */
-#chat-input-area {
-  border-top: 1px solid var(--border);
-  padding: 10px;
-  display: flex;
-  gap: 7px;
-  align-items: flex-end;
-  background: var(--bg-panel);
-}
-
-#msg-input {
-  flex: 1;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  color: var(--text);
-  padding: 8px 12px;
-  font-size: 13px;
-  resize: none;
-  min-height: 38px;
-  max-height: 100px;
-  outline: none;
-  line-height: 1.5;
-  font-family: inherit;
-  transition: border-color .15s;
-}
-#msg-input:focus { border-color: var(--gold-soft); }
-#msg-input::placeholder { color: var(--text-muted); }
-
-#send-btn {
-  width: 38px; height: 38px;
-  background: var(--gold);
-  border: none;
-  border-radius: 9px;
-  cursor: pointer;
-  font-size: 16px;
-  display: flex; align-items: center; justify-content: center;
-  color: #080b12;
-  flex-shrink: 0;
-  transition: all .15s;
-}
-#send-btn:hover  { background: #ffd700; transform:scale(1.06); }
-#send-btn:active { transform:scale(0.95); }
-
-/* ═══════════════════════════════════════
-   MAIN PANEL (Right)
-   ═══════════════════════════════════════ */
-#main-panel {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  background: var(--bg-deep);
-}
-
-/* Tabs */
-#tabs {
-  display: flex;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-panel);
-  flex-shrink: 0;
-  overflow-x: auto;
-}
-#tabs::-webkit-scrollbar { display:none; }
-
-.tab {
-  padding: 0 18px;
-  height: 44px;
-  border: none;
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  font-family: inherit;
-  border-bottom: 2px solid transparent;
-  white-space: nowrap;
-  display: flex; align-items: center; gap: 6px;
-  transition: all .15s;
-  flex-shrink: 0;
-}
-.tab:hover  { color: var(--text-sub); }
-.tab.active { color: var(--gold); border-bottom-color: var(--gold); }
-
-/* Tab contents */
-.tab-pane { display:none; flex:1; overflow:hidden; flex-direction:column; }
-.tab-pane.active { display:flex; }
-
-.pane-scroll { flex:1; overflow-y:auto; padding:22px; }
-.pane-scroll::-webkit-scrollbar { width:4px; }
-.pane-scroll::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
-
-/* Section title */
-.sec-title {
-  font-size: 14px; font-weight: 800;
+.confidence-MEDIUM {
+  background: rgba(240,185,11,0.15);
   color: var(--gold);
-  margin-bottom: 16px;
-  display: flex; align-items: center; gap: 8px;
+  border: 1px solid rgba(240,185,11,0.3);
 }
-.sec-title::after {
-  content:""; flex:1; height:1px;
-  background: linear-gradient(90deg, var(--gold-soft), transparent);
+.confidence-LOW {
+  background: var(--red-dim);
+  color: var(--red);
+  border: 1px solid rgba(244,67,54,0.3);
 }
 
-/* ═══════════════════════════════════════
-   UPLOAD TAB
-   ═══════════════════════════════════════ */
-.hint-box {
-  background: var(--bg-card);
+/* ═══ BET PLAN ═══ */
+.bet-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+}
+.bet-card {
+  background: var(--bg-card2);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 12px 16px;
-  font-size: 12.5px;
-  color: var(--text-sub);
-  margin-bottom: 18px;
-  line-height: 1.65;
+  border-radius: var(--radius);
+  padding: 16px;
 }
-.hint-box strong { color: var(--text); }
-
-/* Race ID input */
-.race-id-row {
+.bet-card h4 {
+  font-size: 13px;
+  color: var(--text-sub);
+  margin-bottom: 10px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 18px;
+  gap: 6px;
 }
-.race-id-row label { font-size: 12.5px; color: var(--text-sub); white-space: nowrap; }
-.race-id-input {
-  flex: 1;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
-  padding: 7px 12px;
+.bet-nums {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.bet-num {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--bg-input);
+  border: 2px solid var(--gold-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
   font-size: 13px;
-  outline: none;
-  font-family: inherit;
-  transition: border-color .15s;
+  color: var(--gold);
 }
-.race-id-input:focus { border-color: var(--gold-soft); }
-.race-id-input::placeholder { color: var(--text-muted); }
-
-/* Upload grid */
-.upload-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 10px;
-  margin-bottom: 18px;
+.bet-num.anchor-num {
+  background: var(--gold);
+  color: #1a1200;
+  border-color: var(--gold);
 }
 
-.up-card {
-  position: relative;
-  background: var(--bg-card);
-  border: 2px dashed var(--border);
-  border-radius: var(--radius-md);
-  padding: 14px 10px 12px;
-  cursor: pointer;
-  transition: all .18s;
+/* ═══ MARKDOWN RESULT ═══ */
+.md-result {
+  padding: 24px;
+  line-height: 1.75;
+  font-size: 14px;
+}
+.md-result h1, .md-result h2, .md-result h3 {
+  color: var(--gold);
+  margin: 20px 0 10px;
+  font-weight: 800;
+}
+.md-result h1 { font-size: 22px; }
+.md-result h2 { font-size: 18px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+.md-result h3 { font-size: 15px; color: var(--blue); }
+.md-result table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: 12px;
+}
+.md-result th, .md-result td {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
   text-align: center;
-  min-height: 108px;
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
+}
+.md-result th {
+  background: #161a28;
+  color: var(--text-sub);
+  font-weight: 600;
+}
+.md-result tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
+.md-result code {
+  background: var(--bg-input);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--orange);
+}
+.md-result pre {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 16px;
+  overflow-x: auto;
+  font-size: 12px;
+}
+.md-result blockquote {
+  border-left: 3px solid var(--gold);
+  padding-left: 16px;
+  margin: 12px 0;
+  color: var(--text-sub);
+}
+
+/* ═══ HISTORY LIST ═══ */
+.history-list { list-style: none; }
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-soft);
+  cursor: pointer;
+  transition: var(--transition);
+}
+.history-item:hover { background: var(--bg-hover); }
+.history-venue {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  background: var(--bg-card2);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: 800;
+  color: var(--gold);
+  flex-shrink: 0;
+}
+.history-info { flex: 1; min-width: 0; }
+.history-title {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
   overflow: hidden;
+  text-overflow: ellipsis;
 }
-.up-card:hover     { border-color: var(--gold-soft); background: #161f2e; transform:translateY(-1px); }
-.up-card.required  { border-color: #2563eb33; }
-.up-card.drag-over { border-color: var(--gold); background: #1c1600; border-style: solid; }
-.up-card.has-file  { border-color: #22c55e66; background: #061a10; border-style: solid; }
-.up-card.has-file::after {
-  content: "✅";
-  position: absolute; top:5px; right:8px; font-size:12px;
-}
-.up-card input[type=file] {
-  position: absolute; inset: 0; opacity: 0; cursor: pointer; width:100%; height:100%;
-}
-.up-card .uc-icon { font-size: 22px; margin-bottom: 5px; }
-.up-card .uc-name { font-size: 11.5px; font-weight: 700; color: var(--text); margin-bottom: 2px; }
-.up-card .uc-key  { font-size: 10px; color: var(--text-muted); }
-.badge-req { display:inline-block; margin-top:4px; padding:1px 7px; border-radius:10px; font-size:10px; font-weight:700; background:#1a3a6a22; color:#4a9aff; border:1px solid #1a3a6a; }
-.badge-opt { display:inline-block; margin-top:4px; padding:1px 7px; border-radius:10px; font-size:10px; font-weight:700; background:#2a2a3a22; color:var(--text-muted); border:1px solid #2a2a3a; }
-.up-card .prev-img { width:100%; height:55px; object-fit:cover; border-radius:5px; margin-top:7px; display:none; }
-.up-card.has-file .prev-img { display:block; }
-
-/* Multi-file upload section */
-.multi-upload-section {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 14px 16px;
-  margin-bottom: 18px;
-}
-.multi-upload-section h4 { font-size:13px; color:var(--text-sub); margin-bottom:12px; }
-.multi-upload-row { display:flex; align-items:center; gap:10px; margin-bottom:10px; font-size:12.5px; }
-.multi-upload-label { color:var(--text-sub); white-space:nowrap; min-width:80px; }
-.multi-file-input { flex:1; font-size:12px; color:var(--text-muted); }
-.multi-file-input::-webkit-file-upload-button {
-  background:var(--bg-hover); border:1px solid var(--border); color:var(--text-sub);
-  padding:3px 10px; border-radius:6px; cursor:pointer; font-size:11px; font-family:inherit;
-}
-
-/* Options row */
-.options-row {
-  display: flex; align-items: center; flex-wrap: wrap; gap: 16px;
-  margin-bottom: 16px;
-}
-.opt-check {
-  display: flex; align-items: center; gap: 7px;
-  font-size: 12.5px; color: var(--text-sub);
-  cursor: pointer;
-}
-.opt-check input[type=checkbox] { accent-color: var(--gold); width:14px; height:14px; cursor:pointer; }
-
-/* Run button */
-#run-btn {
-  width: 100%;
-  padding: 13px;
-  background: linear-gradient(135deg, #f5c518, #f0a500);
-  border: none;
-  border-radius: var(--radius-md);
-  font-size: 15px; font-weight: 900;
-  color: #080b12;
-  cursor: pointer;
-  letter-spacing: 0.05em;
-  margin-bottom: 14px;
-  box-shadow: 0 4px 20px var(--gold-soft), 0 2px 8px rgba(0,0,0,0.3);
-  transition: all .2s;
-}
-#run-btn:hover    { transform:translateY(-2px); box-shadow:0 6px 28px var(--gold-glow); }
-#run-btn:active   { transform:none; }
-#run-btn:disabled { opacity:0.35; cursor:not-allowed; transform:none; box-shadow:none; }
-
-/* Progress */
-#progress-box {
-  display: none;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 14px;
-}
-#progress-box.show { display:block; }
-
-.prog-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
-.prog-label  { font-size:12.5px; font-weight:700; color:var(--text-sub); }
-.prog-time   { font-size:11px; color:var(--text-muted); font-variant-numeric:tabular-nums; }
-
-.prog-bar-bg { background:var(--bg-deep); border-radius:6px; height:7px; overflow:hidden; margin-bottom:10px; }
-#prog-bar {
-  height:100%; width:0%;
-  background: linear-gradient(90deg, var(--gold), var(--green));
-  border-radius:6px; transition:width .5s ease;
-}
-#prog-bar.success { background:var(--green); }
-#prog-bar.error   { background:var(--red); }
-
-.prog-steps { display:flex; gap:6px; margin-bottom:10px; flex-wrap:wrap; }
-.prog-step {
-  font-size:10.5px; padding:2px 9px; border-radius:10px;
-  border:1px solid var(--border); color:var(--text-muted);
-  transition:all .3s;
-}
-.prog-step.active { border-color:var(--gold); color:var(--gold); background:var(--gold-soft); }
-.prog-step.done   { border-color:var(--green); color:var(--green); background:var(--green-soft); }
-
-#prog-log {
-  font-size:11px; color:var(--text-muted);
-  font-family: "SFMono-Regular", Consolas, monospace;
-  max-height:100px; overflow-y:auto;
-  white-space:pre-wrap; line-height:1.5;
-}
-
-/* ═══════════════════════════════════════
-   PDF TAB
-   ═══════════════════════════════════════ */
-#pdf-drop-zone {
-  border: 2px dashed var(--border);
-  border-radius: var(--radius-lg);
-  padding: 40px 20px;
-  text-align: center;
-  cursor: pointer;
-  transition: all .18s;
-  margin-bottom: 18px;
-  position: relative;
-}
-#pdf-drop-zone:hover  { border-color:var(--blue); background:var(--blue-soft); }
-#pdf-drop-zone.drag-over { border-color:var(--blue); background:#0d1f3d; }
-#pdf-drop-zone.has-file  { border-color:var(--green); background:var(--green-soft); border-style:solid; }
-#pdf-drop-zone input[type=file] { position:absolute; inset:0; opacity:0; cursor:pointer; }
-
-.pdf-drop-icon { font-size:40px; margin-bottom:10px; }
-.pdf-drop-text { font-size:14px; font-weight:700; color:var(--text-sub); margin-bottom:5px; }
-.pdf-drop-sub  { font-size:12px; color:var(--text-muted); }
-
-.pdf-info {
-  display:none;
-  background:var(--bg-card); border:1px solid var(--border);
-  border-radius:var(--radius-md); padding:12px 16px;
-  font-size:12.5px; color:var(--text-sub);
-  margin-bottom:14px;
-  align-items:center; gap:10px;
-}
-.pdf-info.show { display:flex; }
-.pdf-info-icon { font-size:22px; }
-.pdf-info-name { font-weight:700; color:var(--text); }
-
-.pdf-options-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px; }
-.pdf-opt-group label { font-size:12px; color:var(--text-muted); display:block; margin-bottom:5px; }
-.pdf-select {
-  width:100%; background:var(--bg-card); border:1px solid var(--border);
-  border-radius:7px; color:var(--text); padding:7px 10px;
-  font-size:13px; font-family:inherit; outline:none; cursor:pointer;
-  transition:border-color .15s;
-}
-.pdf-select:focus { border-color:var(--gold-soft); }
-
-#pdf-run-btn {
-  width: 100%;
-  padding: 13px;
-  background: linear-gradient(135deg, #3b82f6, #1d4ed8);
-  border: none; border-radius: var(--radius-md);
-  font-size: 15px; font-weight: 900;
-  color: #fff; cursor: pointer;
-  letter-spacing: 0.05em; margin-bottom:14px;
-  box-shadow: 0 4px 20px #3b82f622;
-  transition: all .2s;
-}
-#pdf-run-btn:hover    { transform:translateY(-2px); box-shadow:0 6px 28px #3b82f644; }
-#pdf-run-btn:active   { transform:none; }
-#pdf-run-btn:disabled { opacity:0.35; cursor:not-allowed; transform:none; box-shadow:none; }
-
-#pdf-progress-box {
-  display: none;
-  background: var(--bg-card); border:1px solid var(--border);
-  border-radius:var(--radius-md); padding:14px;
-}
-#pdf-progress-box.show { display:block; }
-#pdf-prog-bar {
-  height:100%; width:0%;
-  background: linear-gradient(90deg, var(--blue), var(--green));
-  border-radius:6px; transition:width .5s ease;
-}
-#pdf-prog-bar.success { background:var(--green); }
-#pdf-prog-bar.error   { background:var(--red); }
-
-/* ═══════════════════════════════════════
-   RESULT TAB
-   ═══════════════════════════════════════ */
-.result-toolbar {
-  display: flex; gap:8px; flex-wrap:wrap; margin-bottom:16px;
-}
-.result-toolbar button {
-  padding: 7px 14px; border-radius:8px;
-  border:1px solid var(--border); background:var(--bg-card);
-  color:var(--text-sub); cursor:pointer; font-size:12.5px;
-  font-family:inherit; transition:all .15s;
-  display:flex; align-items:center; gap:5px;
-}
-.result-toolbar button:hover { border-color:var(--gold-soft); color:var(--gold); }
-.result-toolbar button.primary { background:var(--gold-soft); border-color:var(--gold-soft); color:var(--gold); }
-
-#result-md {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 22px 26px;
-  line-height: 1.85; font-size:13.5px;
-  min-height: 200px;
-}
-#result-md h1 { color:var(--gold); font-size:18px; border-bottom:1px solid var(--border); padding-bottom:8px; margin:16px 0 10px; }
-#result-md h2 { color:var(--gold); font-size:15.5px; margin:14px 0 8px; }
-#result-md h3 { color:#d4a017; font-size:14px; margin:12px 0 6px; }
-#result-md table { width:100%; border-collapse:collapse; margin:12px 0; }
-#result-md th, #result-md td { border:1px solid var(--border); padding:6px 12px; font-size:13px; }
-#result-md th { background:#0a0f18; color:var(--text-sub); font-weight:700; }
-#result-md tr:nth-child(even) td { background:#0c1118; }
-#result-md tr:hover td { background:var(--bg-hover); }
-#result-md strong { color:var(--gold); }
-#result-md code   { background:var(--bg-deep); border:1px solid var(--border); border-radius:4px; padding:2px 6px; font-family:monospace; font-size:12px; }
-#result-md pre    { background:var(--bg-deep); border:1px solid var(--border); border-radius:8px; padding:14px; overflow-x:auto; margin:10px 0; }
-#result-md pre code { border:none; background:transparent; }
-#result-md hr     { border-color:var(--border); margin:14px 0; }
-#result-md ul, #result-md ol { padding-left:20px; }
-#result-md li     { margin:4px 0; }
-#result-md blockquote { border-left:3px solid var(--gold-soft); padding-left:14px; color:var(--text-muted); margin:8px 0; }
-
-/* Empty state */
-.empty-state {
-  text-align: center; padding: 60px 20px;
+.history-meta {
+  font-size: 11px;
   color: var(--text-muted);
 }
-.empty-state .es-icon { font-size:48px; margin-bottom:12px; opacity:0.5; }
-.empty-state .es-text { font-size:14px; }
+.history-confidence { flex-shrink: 0; }
 
-/* ═══════════════════════════════════════
-   HISTORY TAB
-   ═══════════════════════════════════════ */
-.hist-item {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 14px 16px;
-  margin-bottom: 10px;
+/* ═══ TABS INSIDE RESULTS ═══ */
+.result-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border-soft);
+  background: #14171f;
+}
+.result-tab {
+  padding: 10px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
   cursor: pointer;
-  transition: all .18s;
-  display: flex; align-items: flex-start; gap: 12px;
+  border-bottom: 2px solid transparent;
+  transition: var(--transition);
 }
-.hist-item:hover { border-color:var(--gold-soft); background:var(--bg-hover); }
-.hist-icon { font-size:20px; flex-shrink:0; margin-top:2px; }
-.hist-info { flex:1; min-width:0; }
-.hist-title { font-size:13.5px; font-weight:700; color:var(--text); margin-bottom:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.hist-time  { font-size:11px; color:var(--text-muted); margin-bottom:4px; }
-.hist-prev  { font-size:12px; color:var(--text-sub); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.hist-arrow { color:var(--text-muted); font-size:16px; flex-shrink:0; align-self:center; }
+.result-tab:hover { color: var(--text-sub); }
+.result-tab.active { color: var(--gold); border-bottom-color: var(--gold); }
+.result-panel { display: none; }
+.result-panel.active { display: block; }
 
-/* ═══════════════════════════════════════
-   GUIDE TAB
-   ═══════════════════════════════════════ */
-.guide-section { margin-bottom:22px; }
-.guide-card {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 16px 18px;
-  margin-bottom:10px;
+/* ═══ EMPTY STATE ═══ */
+.empty-state {
+  text-align: center;
+  padding: 48px 20px;
+  color: var(--text-muted);
 }
-.guide-card h3 { color:var(--gold); font-size:13.5px; margin-bottom:10px; display:flex; align-items:center; gap:7px; }
-.guide-card p, .guide-card li { color:var(--text-sub); font-size:13px; line-height:1.7; }
-.guide-card ul, .guide-card ol { padding-left:18px; }
-.guide-card code { background:var(--bg-deep); border-radius:4px; padding:2px 6px; font-size:12px; color:#94a3b8; }
+.empty-state .icon { font-size: 48px; margin-bottom: 12px; }
+.empty-state p { font-size: 14px; }
 
-.steps { counter-reset:step; }
-.step-item {
-  display:flex; align-items:flex-start; gap:10px;
-  margin-bottom:12px; padding-bottom:12px;
-  border-bottom:1px solid var(--border);
-  font-size:13px; color:var(--text-sub); line-height:1.65;
-}
-.step-item:last-child { border-bottom:none; margin-bottom:0; padding-bottom:0; }
-.step-num {
-  width:22px; height:22px; border-radius:50%;
-  background: var(--gold); color:#080b12;
-  font-size:12px; font-weight:900;
-  display:flex; align-items:center; justify-content:center;
-  flex-shrink:0; margin-top:2px;
-}
-.step-num.blue { background:var(--blue); color:#fff; }
-
-.input-table { width:100%; border-collapse:collapse; font-size:12.5px; margin-top:8px; }
-.input-table th, .input-table td { border:1px solid var(--border); padding:7px 11px; }
-.input-table th { background:var(--bg-deep); color:var(--text-muted); font-weight:700; }
-.input-table td:last-child { color:var(--text-muted); font-size:11.5px; }
-
-/* ═══════════════════════════════════════
-   STATUS MODAL
-   ═══════════════════════════════════════ */
-#status-modal {
-  display:none;
-  position:fixed; inset:0; z-index:100;
-  background: rgba(8,11,18,0.85);
-  backdrop-filter:blur(4px);
-  align-items:center; justify-content:center;
-}
-#status-modal.show { display:flex; }
-.modal-box {
-  background:var(--bg-card);
-  border:1px solid var(--border);
-  border-radius:var(--radius-lg);
-  padding:24px; min-width:340px; max-width:480px;
-  box-shadow:0 24px 64px rgba(0,0,0,0.6);
-}
-.modal-box h3 { font-size:15px; color:var(--gold); margin-bottom:14px; }
-.modal-row { display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid var(--border); font-size:13px; }
-.modal-row:last-of-type { border-bottom:none; }
-.modal-label { color:var(--text-muted); }
-.modal-value { font-weight:700; }
-.modal-ok  { color:var(--green); }
-.modal-err { color:var(--red); }
-.modal-close-btn {
-  width:100%; margin-top:14px; padding:9px;
-  background:var(--bg-hover); border:1px solid var(--border);
-  border-radius:8px; color:var(--text-sub); cursor:pointer;
-  font-size:13px; font-family:inherit; transition:all .15s;
-}
-.modal-close-btn:hover { border-color:var(--gold-soft); color:var(--gold); }
-
-/* ═══════════════════════════════════════
-   RESPONSIVE
-   ═══════════════════════════════════════ */
-@media (max-width:800px) {
-  #app { flex-direction:column; }
-  #sidebar { width:100%; min-width:unset; max-height:40vh; border-right:none; border-bottom:1px solid var(--border); }
-  .upload-grid { grid-template-columns:repeat(2,1fr); }
-  .pane-scroll { padding:14px; }
-}
-@media (max-width:480px) {
-  .upload-grid { grid-template-columns:1fr; }
-  .pdf-options-grid { grid-template-columns:1fr; }
+/* ═══ RESPONSIVE ═══ */
+@media (max-width: 768px) {
+  .top-header { padding: 0 12px; }
+  .logo-text { font-size: 13px; }
+  .main-container { padding: 12px 8px; }
+  .hero { padding: 24px 16px; }
+  .hero-title { font-size: 20px; }
+  .section-body { padding: 12px; }
+  .upload-grid { grid-template-columns: 1fr; }
+  .anchor-stats { grid-template-columns: repeat(2, 1fr); }
 }
 
-/* Scrollbar */
-::-webkit-scrollbar { width:4px; height:4px; }
-::-webkit-scrollbar-track { background:transparent; }
-::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+/* ═══ FADE IN ANIMATION ═══ */
+.fade-in {
+  animation: fadeIn 0.4s ease;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ═══ LOADING SPINNER ═══ */
+.spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--border);
+  border-top-color: var(--gold);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin: 0 auto 16px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* hidden */
+.hidden { display: none !important; }
 </style>
 </head>
 <body>
 
-<!-- ════════════════════ HEADER ════════════════════ -->
-<div id="header">
-  <span class="logo-horse">🏇</span>
-  <div>
-    <div class="logo-text">STELLA 競馬予想エンジン</div>
-    <div class="logo-ver">GIN AND TONIC STELLA v1.34 — ルールベース予想システム</div>
+<!-- ═══ HEADER ═══ -->
+<header class="top-header">
+  <a class="logo" href="/" onclick="showPage('home');return false;">
+    <span class="logo-icon">🏇</span>
+    <span class="logo-text">GIN AND TONIC</span>
+    <span class="logo-sub">STELLA v2.0</span>
+  </a>
+  <div class="header-right">
+    <span class="status-badge badge-ai">🤖 AI Engine</span>
+    <span class="status-badge badge-live" id="healthBadge">ONLINE</span>
   </div>
-  <div class="header-badges">
-    <div class="badge badge-live">稼働中</div>
-    <button class="header-health" onclick="showHealth()">⚕ システム状態</button>
-  </div>
-</div>
+</header>
 
-<!-- ════════════════════ APP ════════════════════ -->
-<div id="app">
+<!-- ═══ NAVIGATION ═══ -->
+<nav class="nav-tabs" id="mainNav">
+  <div class="nav-tab active" data-page="home" onclick="showPage('home')">🏠 ホーム</div>
+  <div class="nav-tab" data-page="predict" onclick="showPage('predict')">📊 予想する</div>
+  <div class="nav-tab" data-page="results" onclick="showPage('results')">📋 分析結果</div>
+  <div class="nav-tab" data-page="history" onclick="showPage('history')">📂 予想履歴</div>
+</nav>
 
-  <!-- ── SIDEBAR ── -->
-  <div id="sidebar">
-    <div id="chat-box">
-      <div class="msg bot">
-        <div class="av">🤖</div>
-        <div class="bubble">
-          <strong>STELLA へようこそ！🏇</strong><br><br>
-          <strong>「競馬予想」</strong> と入力するだけで予想を開始できます。<br><br>
-          📸 スクリーンショット画像または PDF をアップロードすると自動OCR解析します。<br><br>
-          💡 <em>「使い方」と入力で詳細ガイドを表示</em>
-        </div>
+<!-- ═══ MAIN CONTENT ═══ -->
+<div class="main-container" id="mainContent">
+
+  <!-- ─── HOME PAGE ─── -->
+  <div id="page-home" class="page-content fade-in">
+    <div class="hero">
+      <div class="hero-title">
+        <span class="accent">8項目AI指数</span>で全馬を可視化
       </div>
-      <div id="typing" class="msg bot">
-        <div class="av">🤖</div>
-        <div class="typing-dots"><span></span><span></span><span></span></div>
+      <div class="hero-sub">
+        独自の複合AI分析が生成するランク指数で、出走馬を一目で比較。<br>
+        GIN AND TONIC STELLA — 高精度競馬AI予想エンジン
       </div>
-    </div>
-    <div id="chat-input-area">
-      <textarea id="msg-input" placeholder="「競馬予想」と入力..." rows="1"></textarea>
-      <button id="send-btn" title="送信（Enter）">▶</button>
-    </div>
-  </div>
-
-  <!-- ── MAIN PANEL ── -->
-  <div id="main-panel">
-    <!-- Tabs -->
-    <div id="tabs">
-      <button class="tab active" data-tab="upload" onclick="showTab('upload')">📸 画像アップロード</button>
-      <button class="tab" data-tab="pdf" onclick="showTab('pdf')">📄 PDF資料</button>
-      <button class="tab" data-tab="result" id="tab-result-btn" onclick="showTab('result')" style="display:none;">🏆 予想結果</button>
-      <button class="tab" data-tab="history" onclick="showTab('history'); loadHistory();">📂 履歴</button>
-      <button class="tab" data-tab="guide" onclick="showTab('guide')">📖 使い方</button>
-    </div>
-
-    <!-- ── UPLOAD PANE ── -->
-    <div class="tab-pane active" id="pane-upload">
-      <div class="pane-scroll">
-        <div class="sec-title">📸 レース画像アップロード</div>
-
-        <div class="hint-box">
-          <strong>スマホのスクリーンショット</strong>（jpg/png/webp）をドラッグ&ドロップ、またはクリックして選択してください。<br>
-          ✅ <strong>必須</strong>：レイティング表 ＋ スピード指数表 ／ 残りは任意（精度向上）
-        </div>
-
-        <div class="race-id-row">
-          <label>🏁 レースID（任意）:</label>
-          <input type="text" id="race-id-input" class="race-id-input" placeholder="例: 2025_阪神_11R">
-        </div>
-
-        <!-- Required images -->
-        <div class="upload-grid">
-          <div class="up-card required" id="card-rating" ondragover="dov(event,'rating')" ondragleave="dol('rating')" ondrop="dof(event,'rating')">
-            <div class="uc-icon">📊</div>
-            <div class="uc-name" id="lbl-rating">レイティング表</div>
-            <div class="uc-key">rating_img</div>
-            <span class="badge-req">✅ 必須</span>
-            <img class="prev-img" id="prev-rating" alt="">
-            <input type="file" id="file-rating" accept="image/*" onchange="onfc('rating')">
-          </div>
-
-          <div class="up-card required" id="card-speed" ondragover="dov(event,'speed')" ondragleave="dol('speed')" ondrop="dof(event,'speed')">
-            <div class="uc-icon">⚡</div>
-            <div class="uc-name" id="lbl-speed">スピード指数表</div>
-            <div class="uc-key">speed_index_img</div>
-            <span class="badge-req">✅ 必須</span>
-            <img class="prev-img" id="prev-speed" alt="">
-            <input type="file" id="file-speed" accept="image/*" onchange="onfc('speed')">
-          </div>
-
-          <div class="up-card" id="card-meta" ondragover="dov(event,'meta')" ondragleave="dol('meta')" ondrop="dof(event,'meta')">
-            <div class="uc-icon">📋</div>
-            <div class="uc-name" id="lbl-meta">レース情報</div>
-            <div class="uc-key">meta_img</div>
-            <span class="badge-opt">任意</span>
-            <img class="prev-img" id="prev-meta" alt="">
-            <input type="file" id="file-meta" accept="image/*" onchange="onfc('meta')">
-          </div>
-
-          <div class="up-card" id="card-factor" ondragover="dov(event,'factor')" ondragleave="dol('factor')" ondrop="dof(event,'factor')">
-            <div class="uc-icon">🔍</div>
-            <div class="uc-name" id="lbl-factor">ファクター表</div>
-            <div class="uc-key">factor_img</div>
-            <span class="badge-opt">任意</span>
-            <img class="prev-img" id="prev-factor" alt="">
-            <input type="file" id="file-factor" accept="image/*" onchange="onfc('factor')">
-          </div>
-
-          <div class="up-card" id="card-aitime" ondragover="dov(event,'aitime')" ondragleave="dol('aitime')" ondrop="dof(event,'aitime')">
-            <div class="uc-icon">🤖</div>
-            <div class="uc-name" id="lbl-aitime">AI展開予測</div>
-            <div class="uc-key">ai_time_img</div>
-            <span class="badge-opt">任意</span>
-            <img class="prev-img" id="prev-aitime" alt="">
-            <input type="file" id="file-aitime" accept="image/*" onchange="onfc('aitime')">
-          </div>
-
-          <div class="up-card" id="card-track" ondragover="dov(event,'track')" ondragleave="dol('track')" ondrop="dof(event,'track')">
-            <div class="uc-icon">🌿</div>
-            <div class="uc-name" id="lbl-track">馬場状態</div>
-            <div class="uc-key">track_imgs</div>
-            <span class="badge-opt">任意</span>
-            <img class="prev-img" id="prev-track" alt="">
-            <input type="file" id="file-track" accept="image/*" onchange="onfc('track')">
-          </div>
-        </div>
-
-        <!-- Multi-file section -->
-        <div class="multi-upload-section">
-          <h4>📎 追加ファイル（複数可）</h4>
-          <div class="multi-upload-row">
-            <span class="multi-upload-label">予測タイム表:</span>
-            <input type="file" id="file-pred" class="multi-file-input" accept="image/*" multiple>
-          </div>
-          <div class="multi-upload-row">
-            <span class="multi-upload-label">調教画像:</span>
-            <input type="file" id="file-train" class="multi-file-input" accept="image/*" multiple>
-          </div>
-          <div class="multi-upload-row">
-            <span class="multi-upload-label">厩舎コメントCSV:</span>
-            <input type="file" id="file-comments" class="multi-file-input" accept=".csv">
-          </div>
-        </div>
-
-        <!-- Options -->
-        <div class="options-row">
-          <label class="opt-check">
-            <input type="checkbox" id="fast-mode">
-            ⚡ 高速モード（精度を少し下げて高速化）
-          </label>
-        </div>
-
-        <button id="run-btn" onclick="runPredict()" disabled>
-          🏇 予想を開始する
-        </button>
-
-        <!-- Progress -->
-        <div id="progress-box">
-          <div class="prog-header">
-            <span class="prog-label" id="prog-label">処理中...</span>
-            <span class="prog-time" id="prog-time">0s</span>
-          </div>
-          <div class="prog-bar-bg">
-            <div id="prog-bar"></div>
-          </div>
-          <div class="prog-steps">
-            <div class="prog-step" id="step-upload">📤 アップロード</div>
-            <div class="prog-step" id="step-ocr">🔍 OCR解析</div>
-            <div class="prog-step" id="step-score">📊 スコア計算</div>
-            <div class="prog-step" id="step-bet">🎯 買い目決定</div>
-            <div class="prog-step" id="step-report">📝 レポート生成</div>
-          </div>
-          <div id="prog-log">待機中...</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ── PDF PANE ── -->
-    <div class="tab-pane" id="pane-pdf">
-      <div class="pane-scroll">
-        <div class="sec-title">📄 PDF資料から予想する</div>
-
-        <div class="hint-box">
-          <strong>競馬資料のPDFをアップロード</strong>するだけで予想を開始できます。<br>
-          PDFの各ページを自動で画像変換してOCR処理します。Google Drive等のPDF資料もそのまま使用可能。
-        </div>
-
-        <div id="pdf-drop-zone"
-             ondragover="pdfDov(event)" ondragleave="pdfDol()" ondrop="pdfDof(event)">
-          <div class="pdf-drop-icon" id="pdf-icon">📄</div>
-          <div class="pdf-drop-text" id="pdf-drop-text">PDFをドラッグ&ドロップ</div>
-          <div class="pdf-drop-sub">またはクリックしてファイルを選択</div>
-          <input type="file" id="file-pdf" accept=".pdf,application/pdf" onchange="onPdfChange()">
-        </div>
-
-        <div class="pdf-info" id="pdf-info">
-          <span class="pdf-info-icon">📎</span>
+      <div class="hero-features">
+        <div class="feature-item">
+          <div class="feature-icon fi-gold">📊</div>
           <div>
-            <div class="pdf-info-name" id="pdf-name">-</div>
-            <div style="font-size:11.5px;color:var(--text-muted);" id="pdf-size">-</div>
+            <div style="font-weight:700;color:var(--text)">8項目ランク指数</div>
+            <div>S〜Dで一目把握</div>
           </div>
         </div>
-
-        <div class="pdf-options-grid">
-          <div class="pdf-opt-group">
-            <label>🎯 OCR解像度 (DPI)</label>
-            <select class="pdf-select" id="pdf-dpi">
-              <option value="150">150 — 高速</option>
-              <option value="200" selected>200 — 標準（推奨）</option>
-              <option value="300">300 — 高精度</option>
-            </select>
-          </div>
-          <div class="pdf-opt-group">
-            <label>⚡ 処理モード</label>
-            <select class="pdf-select" id="pdf-mode">
-              <option value="">通常</option>
-              <option value="fast">高速（精度低下あり）</option>
-            </select>
+        <div class="feature-item">
+          <div class="feature-icon fi-green">🎯</div>
+          <div>
+            <div style="font-weight:700;color:var(--text)">信頼度フィルター</div>
+            <div>HIGH/MEDIUM/LOW判定</div>
           </div>
         </div>
-
-        <button id="pdf-run-btn" onclick="runPdfPredict()" disabled>
-          📄 PDFから予想する
-        </button>
-
-        <div id="pdf-progress-box">
-          <div class="prog-header">
-            <span class="prog-label" id="pdf-prog-label">PDF処理中...</span>
-            <span class="prog-time" id="pdf-prog-time">0s</span>
+        <div class="feature-item">
+          <div class="feature-icon fi-blue">🤖</div>
+          <div>
+            <div style="font-weight:700;color:var(--text)">複合AI分析</div>
+            <div>4エンジン統合</div>
           </div>
-          <div class="prog-bar-bg">
-            <div id="pdf-prog-bar"></div>
-          </div>
-          <div class="prog-steps">
-            <div class="prog-step" id="pdf-step-upload">📤 アップロード</div>
-            <div class="prog-step" id="pdf-step-convert">🖼 ページ変換</div>
-            <div class="prog-step" id="pdf-step-ocr">🔍 OCR解析</div>
-            <div class="prog-step" id="pdf-step-predict">🎯 予想計算</div>
-          </div>
-          <div id="pdf-prog-log" style="font-size:11px;color:var(--text-muted);font-family:monospace;max-height:100px;overflow-y:auto;white-space:pre-wrap;line-height:1.5;">待機中...</div>
         </div>
-      </div>
-    </div>
-
-    <!-- ── RESULT PANE ── -->
-    <div class="tab-pane" id="pane-result">
-      <div class="pane-scroll">
-        <div class="sec-title">🏆 STELLA 予想結果</div>
-
-        <div class="result-toolbar">
-          <button onclick="copyResult()">📋 コピー</button>
-          <button onclick="dlResult()">💾 MD保存</button>
-          <button onclick="printResult()">🖨 印刷</button>
-          <button onclick="newRace()" class="primary">🔄 新しいレースを予想</button>
-        </div>
-
-        <div id="result-md">
-          <div class="empty-state">
-            <div class="es-icon">🏇</div>
-            <div class="es-text">予想結果がここに表示されます<br><br>画像またはPDFをアップロードして予想を開始してください</div>
+        <div class="feature-item">
+          <div class="feature-icon fi-purple">🎫</div>
+          <div>
+            <div style="font-weight:700;color:var(--text)">買い目自動生成</div>
+            <div>複勝・ワイド・三連複</div>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- ── HISTORY PANE ── -->
-    <div class="tab-pane" id="pane-history">
-      <div class="pane-scroll">
-        <div class="sec-title">📂 予想履歴</div>
-        <div id="history-list">
-          <div class="empty-state">
-            <div class="es-icon">📭</div>
-            <div class="es-text">まだ予想履歴がありません<br>予想を実行すると、ここに記録されます</div>
-          </div>
-        </div>
+    <!-- ─── SAMPLE RANK MATRIX ─── -->
+    <div class="section-card">
+      <div class="section-header">
+        <span class="icon">📊</span>
+        8項目ランク指数 — サンプル表示
       </div>
-    </div>
-
-    <!-- ── GUIDE PANE ── -->
-    <div class="tab-pane" id="pane-guide">
-      <div class="pane-scroll">
-        <div class="sec-title">📖 STELLA 使い方ガイド</div>
-
-        <!-- 基本の使い方 -->
-        <div class="guide-card">
-          <h3>🚀 基本の使い方（画像モード）</h3>
-          <div class="steps">
-            <div class="step-item">
-              <span class="step-num">1</span>
-              左のチャットに <strong>「競馬予想」</strong> と入力して予想モードを開始
-            </div>
-            <div class="step-item">
-              <span class="step-num">2</span>
-              「📸 画像アップロード」タブで<strong>レイティング表</strong>と<strong>スピード指数表</strong>の画像をアップロード
-            </div>
-            <div class="step-item">
-              <span class="step-num">3</span>
-              必要に応じてレース情報、ファクター表、AI展開予測などの画像も追加
-            </div>
-            <div class="step-item">
-              <span class="step-num">4</span>
-              「🏇 <strong>予想を開始する</strong>」ボタンをクリック → OCR解析→スコア計算→買い目決定が自動実行されます
-            </div>
-            <div class="step-item">
-              <span class="step-num">5</span>
-              「🏆 予想結果」タブで結果を確認 → <strong>複勝・ワイド・三連複フォーメーション</strong>の買い目が表示されます
-            </div>
-          </div>
-        </div>
-
-        <!-- PDFモード -->
-        <div class="guide-card" style="border-color:var(--blue-soft);">
-          <h3 style="color:var(--blue);">📄 PDFモード（競馬資料をそのまま使用）</h3>
-          <div class="steps">
-            <div class="step-item">
-              <span class="step-num blue">1</span>
-              「📄 PDF資料」タブを選択
-            </div>
-            <div class="step-item">
-              <span class="step-num blue">2</span>
-              PDFファイルをドラッグ&ドロップ（または選択）
-            </div>
-            <div class="step-item">
-              <span class="step-num blue">3</span>
-              DPIと処理モードを選択して「📄 <strong>PDFから予想する</strong>」をクリック
-            </div>
-          </div>
-          <p style="font-size:12px;margin-top:8px;">ℹ️ Google Drive・Dropboxから保存したPDF資料もそのまま使えます</p>
-        </div>
-
-        <!-- 入力ファイル表 -->
-        <div class="guide-card">
-          <h3>📋 入力ファイル一覧</h3>
-          <table class="input-table">
-            <tr><th>ファイル</th><th>パラメータ</th><th>説明</th></tr>
-            <tr><td>📊 レイティング表</td><td><code>rating_img</code></td><td>✅ 必須 — 各馬のレイティング一覧</td></tr>
-            <tr><td>⚡ スピード指数表</td><td><code>speed_index_img</code></td><td>✅ 必須 — 各馬のスピード指数</td></tr>
-            <tr><td>📋 レース情報</td><td><code>meta_img</code></td><td>任意 — 距離・馬場・クラス等</td></tr>
-            <tr><td>🔍 ファクター表</td><td><code>factor_img</code></td><td>任意 — 脚質・ペース等のファクター</td></tr>
-            <tr><td>🤖 AI展開予測</td><td><code>ai_time_img</code></td><td>任意 — AIによるタイム・展開予測</td></tr>
-            <tr><td>🌿 馬場状態</td><td><code>track_imgs</code></td><td>任意 — 馬場状態詳細</td></tr>
-            <tr><td>📎 予測タイム表</td><td><code>pred_times_imgs</code></td><td>任意 — 複数枚可</td></tr>
-            <tr><td>🏋 調教画像</td><td><code>training_imgs</code></td><td>任意 — 複数枚可</td></tr>
-            <tr><td>💬 厩舎コメント</td><td><code>comments_csv</code></td><td>任意 — CSV形式</td></tr>
+      <div class="section-body" style="padding:0">
+        <div class="rank-matrix-wrap">
+          <table class="rank-matrix">
+            <thead>
+              <tr>
+                <th style="width:36px">枠</th>
+                <th style="width:36px">番</th>
+                <th>馬名</th>
+                <th>総合</th>
+                <th>能力</th>
+                <th>展開</th>
+                <th>適性</th>
+                <th>安定</th>
+                <th>上り</th>
+                <th>調教</th>
+                <th>EV</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="anchor-row">
+                <td><span class="horse-num waku-5">5</span></td>
+                <td><b>7</b></td>
+                <td class="horse-name">ショウナンバルディ</td>
+                <td><span class="rank-badge rank-S">S</span></td>
+                <td><span class="rank-badge rank-A">A</span></td>
+                <td><span class="rank-badge rank-S">S</span></td>
+                <td><span class="rank-badge rank-A">A</span></td>
+                <td><span class="rank-badge rank-S">S</span></td>
+                <td><span class="rank-badge rank-A">A</span></td>
+                <td><span class="rank-badge rank-B">B</span></td>
+                <td><span class="rank-badge rank-S">S</span></td>
+              </tr>
+              <tr>
+                <td><span class="horse-num waku-3">3</span></td>
+                <td><b>4</b></td>
+                <td class="horse-name">タイセイドリーマー</td>
+                <td><span class="rank-badge rank-A">A</span></td>
+                <td><span class="rank-badge rank-S">S</span></td>
+                <td><span class="rank-badge rank-A">A</span></td>
+                <td><span class="rank-badge rank-S">S</span></td>
+                <td><span class="rank-badge rank-A">A</span></td>
+                <td><span class="rank-badge rank-B">B</span></td>
+                <td><span class="rank-badge rank-A">A</span></td>
+                <td><span class="rank-badge rank-A">A</span></td>
+              </tr>
+              <tr>
+                <td><span class="horse-num waku-7">7</span></td>
+                <td><b>12</b></td>
+                <td class="horse-name">メイショウハリオ</td>
+                <td><span class="rank-badge rank-A">A</span></td>
+                <td><span class="rank-badge rank-A">A</span></td>
+                <td><span class="rank-badge rank-B">B</span></td>
+                <td><span class="rank-badge rank-A">A</span></td>
+                <td><span class="rank-badge rank-B">B</span></td>
+                <td><span class="rank-badge rank-S">S</span></td>
+                <td><span class="rank-badge rank-A">A</span></td>
+                <td><span class="rank-badge rank-B">B</span></td>
+              </tr>
+            </tbody>
           </table>
         </div>
-
-        <!-- 予想ルール -->
-        <div class="guide-card">
-          <h3>🎯 固定予想ルール（v1.14準拠）</h3>
-          <ul>
-            <li>◎（本命）：<strong>AnchorScore 最大</strong>の馬を選定</li>
-            <li>複勝：<code>p_place_est ≥ 0.26</code> → 1,000円購入</li>
-            <li>ワイド：◎軸流し <strong>4点以内</strong>（的中率重視）</li>
-            <li>三連複：フォーメーション（30点以内）を必ず1つ提示</li>
-            <li>市場オッズは<strong>表示のみ</strong>（予想スコアには使用しない）</li>
-          </ul>
-        </div>
-
-        <!-- ヒント -->
-        <div class="guide-card">
-          <h3>💡 ヒントと注意事項</h3>
-          <ul>
-            <li>OCR処理のため <strong>30秒〜数分</strong> かかります</li>
-            <li>⚡ 高速モードはモンテカルロのサンプル数を減らして高速化</li>
-            <li>📸 スマホのスクリーンショット（Chrome/Firefox）に最適化されています</li>
-            <li>🔤 Tesseract OCR が日本語を自動認識します</li>
-            <li>📂 予想履歴は「履歴」タブで確認できます（最新20件）</li>
-            <li>💾 結果はMarkdown形式でダウンロード保存できます</li>
-          </ul>
+        <div style="text-align:center;padding:12px;font-size:12px;color:var(--text-muted)">
+          ↑ サンプル表示。画像をアップロードすると全馬のランク指数が表示されます
         </div>
       </div>
     </div>
 
-  </div><!-- /#main-panel -->
-</div><!-- /#app -->
-
-<!-- ════════════════════ STATUS MODAL ════════════════════ -->
-<div id="status-modal">
-  <div class="modal-box">
-    <h3>⚕ システム状態</h3>
-    <div class="modal-row">
-      <span class="modal-label">GINANDTONIC.py</span>
-      <span class="modal-value" id="m-gat">確認中...</span>
+    <div class="btn-group">
+      <button class="btn btn-primary" onclick="showPage('predict')">
+        🚀 予想を開始する
+      </button>
     </div>
-    <div class="modal-row">
-      <span class="modal-label">Tesseract OCR</span>
-      <span class="modal-value" id="m-tess">確認中...</span>
-    </div>
-    <div class="modal-row">
-      <span class="modal-label">PDF サポート (PyMuPDF)</span>
-      <span class="modal-value" id="m-pdf">確認中...</span>
-    </div>
-    <div class="modal-row">
-      <span class="modal-label">pdfplumber</span>
-      <span class="modal-value" id="m-pdfp">確認中...</span>
-    </div>
-    <div class="modal-row">
-      <span class="modal-label">実行中ジョブ</span>
-      <span class="modal-value" id="m-jobs">-</span>
-    </div>
-    <div class="modal-row">
-      <span class="modal-label">予想履歴件数</span>
-      <span class="modal-value" id="m-hist">-</span>
-    </div>
-    <button class="modal-close-btn" onclick="document.getElementById('status-modal').classList.remove('show')">
-      閉じる
-    </button>
   </div>
+
+  <!-- ─── PREDICT PAGE ─── -->
+  <div id="page-predict" class="page-content hidden">
+
+    <!-- Upload Section -->
+    <div class="section-card fade-in">
+      <div class="section-header">
+        <span class="icon">📤</span>
+        画像アップロード
+        <span style="margin-left:auto;font-size:11px;color:var(--text-muted)">画像/PDF対応</span>
+      </div>
+      <div class="section-body">
+        <div class="upload-grid">
+          <div class="upload-slot required" id="slot-rating">
+            <div class="upload-icon">📊</div>
+            <div class="upload-label">レイティング表 <span class="tag-required">必須</span></div>
+            <div class="upload-desc">rating_img — 馬別レイティング</div>
+            <div class="upload-filename" id="fname-rating"></div>
+            <input type="file" accept="image/*" onchange="handleFile(this,'rating','fname-rating','slot-rating')">
+          </div>
+          <div class="upload-slot required" id="slot-speed">
+            <div class="upload-icon">⚡</div>
+            <div class="upload-label">スピード指数表 <span class="tag-required">必須</span></div>
+            <div class="upload-desc">speed_index_img — SP指数</div>
+            <div class="upload-filename" id="fname-speed"></div>
+            <input type="file" accept="image/*" onchange="handleFile(this,'speed','fname-speed','slot-speed')">
+          </div>
+        </div>
+
+        <div class="extra-toggle" id="extraToggle" onclick="toggleExtra()">
+          ＋ 追加画像を表示（精度向上）
+        </div>
+        <div class="extra-uploads" id="extraUploads">
+          <div class="upload-grid">
+            <div class="upload-slot" id="slot-meta">
+              <div class="upload-icon">📋</div>
+              <div class="upload-label">レース情報 <span class="tag-optional">任意</span></div>
+              <div class="upload-filename" id="fname-meta"></div>
+              <input type="file" accept="image/*" onchange="handleFile(this,'meta','fname-meta','slot-meta')">
+            </div>
+            <div class="upload-slot" id="slot-factor">
+              <div class="upload-icon">🔍</div>
+              <div class="upload-label">ファクター表 <span class="tag-optional">任意</span></div>
+              <div class="upload-filename" id="fname-factor"></div>
+              <input type="file" accept="image/*" onchange="handleFile(this,'factor','fname-factor','slot-factor')">
+            </div>
+            <div class="upload-slot" id="slot-aitime">
+              <div class="upload-icon">🤖</div>
+              <div class="upload-label">AI展開予測 <span class="tag-optional">任意</span></div>
+              <div class="upload-filename" id="fname-aitime"></div>
+              <input type="file" accept="image/*" onchange="handleFile(this,'aitime','fname-aitime','slot-aitime')">
+            </div>
+            <div class="upload-slot" id="slot-pdf">
+              <div class="upload-icon">📄</div>
+              <div class="upload-label">PDF資料 <span class="tag-optional">PDF入力</span></div>
+              <div class="upload-filename" id="fname-pdf"></div>
+              <input type="file" accept=".pdf" onchange="handleFile(this,'pdf','fname-pdf','slot-pdf')">
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="btn-group" style="padding:0 20px 20px">
+        <button class="btn btn-primary" id="btnPredict" onclick="startPrediction()" disabled>
+          🚀 AI予想を実行
+        </button>
+        <button class="btn btn-secondary" id="btnPdfPredict" onclick="startPdfPrediction()" style="display:none">
+          📄 PDFから予想
+        </button>
+      </div>
+    </div>
+
+    <!-- Progress Section -->
+    <div class="section-card">
+      <div class="progress-container" id="progressContainer">
+        <div class="spinner"></div>
+        <div class="progress-text">STELLA AI分析エンジン 処理中...</div>
+        <div class="progress-bar-wrap">
+          <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <div class="progress-time" id="progressTime">0.0s</div>
+        <div class="progress-log" id="progressLog"></div>
+      </div>
+    </div>
+
+    <!-- Result Section -->
+    <div id="resultSection" class="hidden">
+
+      <!-- Anchor Card -->
+      <div class="anchor-card fade-in" id="anchorCard" style="display:none">
+        <div class="anchor-top">
+          <div class="anchor-mark">◎</div>
+          <div class="anchor-info">
+            <h3><span class="num" id="anchorNum"></span><span id="anchorName"></span></h3>
+            <span class="confidence" id="anchorConfidence"></span>
+          </div>
+        </div>
+        <div class="anchor-stats" id="anchorStats"></div>
+      </div>
+
+      <!-- Result Tabs -->
+      <div class="section-card fade-in">
+        <div class="result-tabs">
+          <div class="result-tab active" onclick="switchResultTab('matrix')">📊 ランク指数</div>
+          <div class="result-tab" onclick="switchResultTab('bet')">🎫 買い目</div>
+          <div class="result-tab" onclick="switchResultTab('detail')">📝 詳細分析</div>
+        </div>
+
+        <!-- Matrix Tab -->
+        <div class="result-panel active" id="panel-matrix">
+          <div class="rank-matrix-wrap" id="rankMatrixContainer">
+            <div class="empty-state">
+              <div class="icon">📊</div>
+              <p>予想を実行するとランク指数が表示されます</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Bet Tab -->
+        <div class="result-panel" id="panel-bet">
+          <div class="section-body" id="betPlanContainer">
+            <div class="empty-state">
+              <div class="icon">🎫</div>
+              <p>予想を実行すると買い目が表示されます</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Detail Tab -->
+        <div class="result-panel" id="panel-detail">
+          <div class="md-result" id="mdResultContainer">
+            <div class="empty-state">
+              <div class="icon">📝</div>
+              <p>予想を実行すると詳細分析が表示されます</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── RESULTS PAGE ─── -->
+  <div id="page-results" class="page-content hidden">
+    <div class="section-card fade-in">
+      <div class="section-header">
+        <span class="icon">📋</span>
+        保存済み予想結果
+      </div>
+      <div class="section-body" id="savedResultsList">
+        <div class="empty-state">
+          <div class="icon">📋</div>
+          <p>保存済みの予想結果はありません</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── HISTORY PAGE ─── -->
+  <div id="page-history" class="page-content hidden">
+    <div class="section-card fade-in">
+      <div class="section-header">
+        <span class="icon">📂</span>
+        予想履歴
+      </div>
+      <div class="section-body" style="padding:0" id="historyContainer">
+        <div class="empty-state">
+          <div class="icon">📂</div>
+          <p>予想履歴はまだありません</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
-<!-- ════════════════════ SCRIPTS ════════════════════ -->
 <script>
-marked.setOptions({ breaks: true, gfm: true });
+/* ═══════════════════════════════════════════════════════════
+   GIN AND TONIC STELLA v2.0 — Frontend Logic
+   ═══════════════════════════════════════════════════════════ */
 
-/* ═══ STATE ═══ */
-const files = { rating:null, speed:null, meta:null, factor:null, aitime:null, track:null };
-let currentJobId = null;
-let pollTimer    = null;
-let pdfPollTimer = null;
-let elTimer      = null;
-let pdfElTimer   = null;
-let elapsed      = 0;
-let pdfElapsed   = 0;
-let resultMd     = "";
-let pdfFile      = null;
-
-/* ═══ TABS ═══ */
-function showTab(name) {
-  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-  const btn = document.querySelector(`.tab[data-tab="${name}"]`);
-  if (btn) btn.classList.add('active');
-  const pane = document.getElementById(`pane-${name}`);
-  if (pane) pane.classList.add('active');
-}
-
-/* ═══ CHAT ═══ */
-const chatBox = document.getElementById('chat-box');
-const msgInput = document.getElementById('msg-input');
-
-function addMsg(text, isUser=false) {
-  const div = document.createElement('div');
-  div.className = `msg ${isUser ? 'user' : 'bot'}`;
-  const av = document.createElement('div');
-  av.className = 'av';
-  av.textContent = isUser ? '👤' : '🤖';
-  const bbl = document.createElement('div');
-  bbl.className = 'bubble';
-  bbl.innerHTML = marked.parse(String(text));
-  div.append(av, bbl);
-  chatBox.insertBefore(div, document.getElementById('typing'));
-  chatBox.scrollTop = chatBox.scrollHeight;
-  return bbl;
-}
-
-function showTyping()  { document.getElementById('typing').classList.add('show'); chatBox.scrollTop=chatBox.scrollHeight; }
-function hideTyping()  { document.getElementById('typing').classList.remove('show'); }
-
-async function sendMsg() {
-  const text = msgInput.value.trim();
-  if (!text) return;
-  msgInput.value = '';
-  msgInput.style.height = '38px';
-  addMsg(text, true);
-  showTyping();
-  try {
-    const r = await fetch('/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:text}) });
-    const d = await r.json();
-    hideTyping();
-    addMsg(d.reply);
-    if (d.action === 'show_upload') showTab('upload');
-    if (d.action === 'show_history') { showTab('history'); loadHistory(); }
-  } catch(e) {
-    hideTyping();
-    addMsg('⚠️ 通信エラーが発生しました。');
-  }
-}
-
-document.getElementById('send-btn').addEventListener('click', sendMsg);
-msgInput.addEventListener('keydown', e => { if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); } });
-msgInput.addEventListener('input', () => {
-  msgInput.style.height = 'auto';
-  msgInput.style.height = Math.min(msgInput.scrollHeight, 100) + 'px';
-});
-
-/* ═══ FILE UPLOAD ═══ */
-const defaultLabels = {
-  rating:'レイティング表', speed:'スピード指数表',
-  meta:'レース情報', factor:'ファクター表',
-  aitime:'AI展開予測', track:'馬場状態'
+// ─── State ───
+const state = {
+  files: { rating: null, speed: null, meta: null, factor: null, aitime: null, pdf: null },
+  currentJob: null,
+  pollTimer: null,
 };
 
-function setFile(key, f) {
-  if (!f) return;
-  files[key] = f;
-  const card = document.getElementById(`card-${key}`);
-  const prev = document.getElementById(`prev-${key}`);
-  card.classList.add('has-file');
-  document.getElementById(`lbl-${key}`).textContent = f.name.length > 16 ? f.name.slice(0,14)+'…' : f.name;
-  if (prev && f.type.startsWith('image/')) prev.src = URL.createObjectURL(f);
-  updateRunBtn();
+// ─── Page Navigation ───
+function showPage(page) {
+  document.querySelectorAll('.page-content').forEach(el => el.classList.add('hidden'));
+  document.querySelectorAll('.nav-tab').forEach(el => el.classList.remove('active'));
+  
+  const pageEl = document.getElementById('page-' + page);
+  if (pageEl) {
+    pageEl.classList.remove('hidden');
+    pageEl.classList.add('fade-in');
+  }
+  
+  const navEl = document.querySelector(`.nav-tab[data-page="${page}"]`);
+  if (navEl) navEl.classList.add('active');
+
+  if (page === 'history') loadHistory();
+  if (page === 'results') loadSavedResults();
 }
 
-function onfc(key) {
-  const input = document.getElementById(`file-${key}`);
-  setFile(key, input.files[0]);
+// ─── File Handling ───
+function handleFile(input, key, fnameId, slotId) {
+  const file = input.files[0];
+  if (!file) return;
+  
+  state.files[key] = file;
+  document.getElementById(fnameId).textContent = '✅ ' + file.name;
+  document.getElementById(slotId).classList.add('filled');
+  
+  updatePredictButton();
 }
 
-function updateRunBtn() {
-  document.getElementById('run-btn').disabled = !(files.rating && files.speed);
+function updatePredictButton() {
+  const btn = document.getElementById('btnPredict');
+  const btnPdf = document.getElementById('btnPdfPredict');
+  
+  const hasRequired = state.files.rating && state.files.speed;
+  btn.disabled = !hasRequired;
+  
+  if (state.files.pdf) {
+    btnPdf.style.display = 'inline-flex';
+  }
 }
 
-// Drag & drop
-function dov(e, key) { e.preventDefault(); document.getElementById(`card-${key}`).classList.add('drag-over'); }
-function dol(key)    { document.getElementById(`card-${key}`).classList.remove('drag-over'); }
-function dof(e, key) {
-  e.preventDefault(); dol(key);
-  const f = e.dataTransfer.files[0];
-  if (f && f.type.startsWith('image/')) setFile(key, f);
+function toggleExtra() {
+  const el = document.getElementById('extraUploads');
+  const toggle = document.getElementById('extraToggle');
+  if (el.classList.contains('show')) {
+    el.classList.remove('show');
+    toggle.textContent = '＋ 追加画像を表示（精度向上）';
+  } else {
+    el.classList.add('show');
+    toggle.textContent = '－ 追加画像を隠す';
+  }
 }
 
-/* ═══ PREDICT ═══ */
-async function runPredict() {
-  const btn  = document.getElementById('run-btn');
-  const pbox = document.getElementById('progress-box');
-  const bar  = document.getElementById('prog-bar');
-  const lbl  = document.getElementById('prog-label');
-
-  btn.disabled = true; btn.textContent = '⏳ 予想中...';
-  pbox.classList.add('show');
-  bar.className = ''; bar.style.width = '5%';
-  lbl.textContent = '画像を送信中...';
-  document.getElementById('prog-log').textContent = '';
-
-  // Steps reset
-  ['upload','ocr','score','bet','report'].forEach(s => {
-    document.getElementById(`step-${s}`).className = 'prog-step';
-  });
-  setStep('upload', 'active');
-
-  elapsed = 0;
-  clearInterval(elTimer);
-  elTimer = setInterval(() => { elapsed++; document.getElementById('prog-time').textContent = elapsed+'s'; }, 1000);
-
+// ─── Start Prediction ───
+function startPrediction() {
   const fd = new FormData();
-  fd.append('rating_img',      files.rating);
-  fd.append('speed_index_img', files.speed);
-  if (files.meta)   fd.append('meta_img',    files.meta);
-  if (files.factor) fd.append('factor_img',  files.factor);
-  if (files.aitime) fd.append('ai_time_img', files.aitime);
-  if (files.track)  fd.append('track_imgs',  files.track);
+  fd.append('rating_img', state.files.rating);
+  fd.append('speed_index_img', state.files.speed);
+  if (state.files.meta) fd.append('meta_img', state.files.meta);
+  if (state.files.factor) fd.append('factor_img', state.files.factor);
+  if (state.files.aitime) fd.append('ai_time_img', state.files.aitime);
 
-  const predFiles  = document.getElementById('file-pred').files;
-  const trainFiles = document.getElementById('file-train').files;
-  const commFiles  = document.getElementById('file-comments').files;
-  for (const f of predFiles)  fd.append('pred_times_imgs', f);
-  for (const f of trainFiles) fd.append('training_imgs', f);
-  if (commFiles.length > 0)   fd.append('comments_csv', commFiles[0]);
+  document.getElementById('progressContainer').classList.add('active');
+  document.getElementById('resultSection').classList.add('hidden');
+  document.getElementById('btnPredict').disabled = true;
 
-  const raceId = document.getElementById('race-id-input').value.trim();
-  if (raceId) fd.append('race_id', raceId);
-  if (document.getElementById('fast-mode').checked) fd.append('fast', 'true');
-
-  try {
-    const r = await fetch('/predict', { method:'POST', body:fd });
-    const d = await r.json();
-    if (d.error) throw new Error(d.error);
-    currentJobId = d.job_id;
-    setStep('upload', 'done'); setStep('ocr', 'active');
-    lbl.textContent = 'OCR解析中...';
-    bar.style.width = '15%';
-    addMsg('🏇 予想を開始しました！OCR解析中です…（数十秒かかる場合があります）');
-    pollJob();
-  } catch(e) {
-    clearInterval(elTimer);
-    btn.disabled = false; btn.textContent = '🏇 予想を開始する';
-    addMsg(`❌ エラー: ${e.message}`);
-  }
-}
-
-function setStep(id, state) {
-  const el = document.getElementById(`step-${id}`);
-  if (el) el.className = `prog-step ${state}`;
-}
-
-let pollCount = 0;
-function pollJob() {
-  if (pollTimer) clearInterval(pollTimer);
-  pollCount = 0;
-  pollTimer = setInterval(async () => {
-    pollCount++;
-    // Progress estimation
-    const pct = Math.min(15 + pollCount * 3, 90);
-    document.getElementById('prog-bar').style.width = pct + '%';
-    // Step indicator
-    if (pollCount < 5)  { setStep('ocr','active'); }
-    else if (pollCount < 10) { setStep('ocr','done'); setStep('score','active'); }
-    else if (pollCount < 15) { setStep('score','done'); setStep('bet','active'); }
-    else                { setStep('bet','done'); setStep('report','active'); }
-
-    try {
-      const r = await fetch(`/status/${currentJobId}`);
-      if (!r.ok) return;
-      const d = await r.json();
-
-      if (d.log) {
-        const lines = d.log.split('\n').filter(Boolean);
-        document.getElementById('prog-log').textContent = lines.slice(-5).join('\n');
+  fetch('/predict', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) {
+        alert(data.error);
+        document.getElementById('btnPredict').disabled = false;
+        return;
       }
-
-      if (d.status === 'done') {
-        clearInterval(pollTimer); clearInterval(elTimer);
-        document.getElementById('prog-bar').style.width = '100%';
-        document.getElementById('prog-bar').classList.add('success');
-        document.getElementById('prog-label').textContent = `✅ 完了（${d.elapsed ?? elapsed}秒）`;
-        ['upload','ocr','score','bet','report'].forEach(s => setStep(s,'done'));
-        showResult(d.markdown);
-      } else if (d.status === 'error') {
-        clearInterval(pollTimer); clearInterval(elTimer);
-        document.getElementById('prog-bar').style.width = '100%';
-        document.getElementById('prog-bar').classList.add('error');
-        document.getElementById('prog-label').textContent = '❌ エラー';
-        addMsg(`❌ 予想に失敗しました:\n\`\`\`\n${(d.error||'').slice(0,500)}\n\`\`\``);
-        const btn = document.getElementById('run-btn');
-        btn.disabled = false; btn.textContent = '🏇 予想を開始する';
-      }
-    } catch(e) {}
-  }, 2500);
+      state.currentJob = data.job_id;
+      startPolling();
+    })
+    .catch(err => {
+      alert('エラー: ' + err);
+      document.getElementById('btnPredict').disabled = false;
+    });
 }
 
-/* ═══ RESULT ═══ */
-function showResult(md) {
-  resultMd = md;
-  const tabBtn = document.getElementById('tab-result-btn');
-  tabBtn.style.display = '';
-  showTab('result');
-
-  const el = document.getElementById('result-md');
-  el.innerHTML = marked.parse(md);
-  el.scrollTop = 0;
-
-  const preview = md.split('\n').filter(Boolean).slice(0,10).join('\n');
-  addMsg(`✅ **予想完了！** 「🏆 予想結果」タブをご確認ください。\n\n---\n${preview}`);
-
-  const btn = document.getElementById('run-btn');
-  btn.disabled = false; btn.textContent = '🏇 予想を開始する';
-}
-
-function copyResult() {
-  navigator.clipboard.writeText(resultMd)
-    .then(() => addMsg('📋 予想結果をクリップボードにコピーしました。'))
-    .catch(() => addMsg('⚠️ コピーに失敗しました。'));
-}
-
-function dlResult() {
-  const blob = new Blob([resultMd], { type:'text/markdown;charset=utf-8' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `stella_${new Date().toISOString().slice(0,16).replace(/[T:]/g,'-')}.md`;
-  a.click();
-}
-
-function printResult() {
-  const w = window.open('', '_blank');
-  w.document.write(`<html><head><title>STELLA 予想結果</title>
-    <style>body{font-family:sans-serif;padding:20px;line-height:1.7;}
-    table{border-collapse:collapse;width:100%;}th,td{border:1px solid #ccc;padding:6px 10px;}
-    </style></head><body>${document.getElementById('result-md').innerHTML}</body></html>`);
-  w.document.close(); w.focus(); w.print();
-}
-
-function newRace() {
-  showTab('upload');
-  addMsg('🔄 別レースの予想モードに切り替えました。新しい画像をアップロードしてください。');
-  for (const key of Object.keys(files)) {
-    files[key] = null;
-    const card = document.getElementById(`card-${key}`);
-    if (card) { card.classList.remove('has-file','drag-over'); }
-    const lbl = document.getElementById(`lbl-${key}`);
-    if (lbl) lbl.textContent = defaultLabels[key];
-    const prev = document.getElementById(`prev-${key}`);
-    if (prev) prev.src = '';
-    const inp = document.getElementById(`file-${key}`);
-    if (inp) inp.value = '';
-  }
-  document.getElementById('file-pred').value = '';
-  document.getElementById('file-train').value = '';
-  document.getElementById('file-comments').value = '';
-  updateRunBtn();
-  document.getElementById('progress-box').classList.remove('show');
-  document.getElementById('prog-bar').style.width = '0%';
-  document.getElementById('prog-bar').className = '';
-}
-
-/* ═══ PDF ═══ */
-function pdfDov(e) { e.preventDefault(); document.getElementById('pdf-drop-zone').classList.add('drag-over'); }
-function pdfDol()  { document.getElementById('pdf-drop-zone').classList.remove('drag-over'); }
-function pdfDof(e) {
-  e.preventDefault(); pdfDol();
-  const f = e.dataTransfer.files[0];
-  if (f && (f.type==='application/pdf' || f.name.toLowerCase().endsWith('.pdf'))) setPdf(f);
-  else addMsg('⚠️ PDFファイルのみ対応しています。');
-}
-
-function onPdfChange() {
-  const f = document.getElementById('file-pdf').files[0];
-  if (f) setPdf(f);
-}
-
-function setPdf(f) {
-  pdfFile = f;
-  const zone = document.getElementById('pdf-drop-zone');
-  zone.classList.add('has-file');
-  document.getElementById('pdf-icon').textContent = '✅';
-  document.getElementById('pdf-drop-text').textContent = f.name.length > 36 ? f.name.slice(0,34)+'…' : f.name;
-  const info = document.getElementById('pdf-info');
-  info.classList.add('show');
-  document.getElementById('pdf-name').textContent = f.name;
-  document.getElementById('pdf-size').textContent = (f.size/1024/1024).toFixed(2) + ' MB';
-  document.getElementById('pdf-run-btn').disabled = false;
-}
-
-async function runPdfPredict() {
-  if (!pdfFile) return;
-  const btn  = document.getElementById('pdf-run-btn');
-  const pbox = document.getElementById('pdf-progress-box');
-  const bar  = document.getElementById('pdf-prog-bar');
-  const lbl  = document.getElementById('pdf-prog-label');
-
-  btn.disabled = true; btn.textContent = '⏳ PDF処理中...';
-  pbox.classList.add('show');
-  bar.className = ''; bar.style.width = '5%';
-  lbl.textContent = 'PDFをアップロード中...';
-  document.getElementById('pdf-prog-log').textContent = '';
-
-  ['upload','convert','ocr','predict'].forEach(s => {
-    const el = document.getElementById(`pdf-step-${s}`);
-    if (el) el.className = 'prog-step';
-  });
-  setPdfStep('upload', 'active');
-
-  pdfElapsed = 0;
-  clearInterval(pdfElTimer);
-  pdfElTimer = setInterval(() => { pdfElapsed++; document.getElementById('pdf-prog-time').textContent = pdfElapsed+'s'; }, 1000);
-
-  const dpi  = document.getElementById('pdf-dpi').value;
-  const mode = document.getElementById('pdf-mode').value;
-
+function startPdfPrediction() {
+  if (!state.files.pdf) return;
   const fd = new FormData();
-  fd.append('pdf', pdfFile);
-  fd.append('dpi', dpi);
-  if (mode === 'fast') fd.append('fast', 'true');
+  fd.append('pdf', state.files.pdf);
 
-  try {
-    const r = await fetch('/predict_pdf', { method:'POST', body:fd });
-    const d = await r.json();
-    if (d.error) throw new Error(d.error);
-    currentJobId = d.job_id;
-    setPdfStep('upload','done'); setPdfStep('convert','active');
-    lbl.textContent = 'ページ変換中...';
-    bar.style.width = '12%';
-    addMsg('📄 PDFから予想を開始しました！ページ変換→OCR処理中です…');
-    pollPdfJob();
-  } catch(e) {
-    clearInterval(pdfElTimer);
-    btn.disabled = false; btn.textContent = '📄 PDFから予想する';
-    pbox.classList.remove('show');
-    addMsg(`❌ エラー: ${e.message}`);
+  document.getElementById('progressContainer').classList.add('active');
+  document.getElementById('resultSection').classList.add('hidden');
+
+  fetch('/predict_pdf', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { alert(data.error); return; }
+      state.currentJob = data.job_id;
+      startPolling();
+    });
+}
+
+// ─── Polling ───
+function startPolling() {
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  state.pollTimer = setInterval(pollStatus, 1500);
+}
+
+function pollStatus() {
+  if (!state.currentJob) return;
+  fetch('/status/' + state.currentJob)
+    .then(r => r.json())
+    .then(job => {
+      const elapsed = (job.elapsed || 0).toFixed(1);
+      document.getElementById('progressTime').textContent = elapsed + 's';
+      
+      // Progress bar animation
+      const pct = Math.min(95, (parseFloat(elapsed) / 120) * 100);
+      document.getElementById('progressBar').style.width = pct + '%';
+
+      // Log
+      if (job.log) {
+        const logEl = document.getElementById('progressLog');
+        logEl.textContent = job.log.slice(-500);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      if (job.status === 'done') {
+        clearInterval(state.pollTimer);
+        document.getElementById('progressBar').style.width = '100%';
+        setTimeout(() => showResult(job), 500);
+      } else if (job.status === 'error') {
+        clearInterval(state.pollTimer);
+        document.getElementById('progressContainer').classList.remove('active');
+        alert('エラー: ' + (job.error || '不明なエラー'));
+        document.getElementById('btnPredict').disabled = false;
+      }
+    });
+}
+
+// ─── Show Result ───
+function showResult(job) {
+  document.getElementById('progressContainer').classList.remove('active');
+  document.getElementById('resultSection').classList.remove('hidden');
+  document.getElementById('btnPredict').disabled = false;
+
+  const structured = job.structured || {};
+  const md = job.markdown || '';
+
+  // Render anchor card
+  renderAnchorCard(structured);
+  
+  // Render rank matrix
+  renderRankMatrix(structured);
+  
+  // Render bet plan
+  renderBetPlan(structured);
+  
+  // Render markdown
+  if (md && typeof marked !== 'undefined') {
+    document.getElementById('mdResultContainer').innerHTML = marked.parse(md);
   }
+
+  switchResultTab('matrix');
 }
 
-function setPdfStep(id, state) {
-  const el = document.getElementById(`pdf-step-${id}`);
-  if (el) el.className = `prog-step ${state}`;
+// ─── Render Anchor Card ───
+function renderAnchorCard(data) {
+  const anchor = data.anchor || {};
+  if (!anchor.num) {
+    document.getElementById('anchorCard').style.display = 'none';
+    return;
+  }
+  document.getElementById('anchorCard').style.display = 'block';
+  document.getElementById('anchorNum').textContent = anchor.num + '番 ';
+  document.getElementById('anchorName').textContent = anchor.name || '';
+
+  const conf = anchor.confidence_level || '';
+  const confEl = document.getElementById('anchorConfidence');
+  if (conf) {
+    confEl.className = 'confidence confidence-' + conf;
+    confEl.textContent = '信頼度: ' + conf;
+  } else {
+    confEl.textContent = '';
+  }
+
+  const statsEl = document.getElementById('anchorStats');
+  const score = anchor.score != null ? anchor.score.toFixed(1) : '-';
+  const pPlace = anchor.p_place_est_pct != null ? anchor.p_place_est_pct.toFixed(1) + '%' : '-';
+  const gap = anchor.confidence_score_gap != null ? anchor.confidence_score_gap.toFixed(1) + 'pt' : '-';
+  const placeOk = anchor.place_ok ? '✅ 購入' : '❌ 見送り';
+  const placeClass = anchor.place_ok ? 'high' : 'low';
+
+  statsEl.innerHTML = `
+    <div class="stat-item">
+      <div class="stat-label">AnchorScore</div>
+      <div class="stat-value">${score}</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-label">複勝確率</div>
+      <div class="stat-value high">${pPlace}</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-label">スコアGAP</div>
+      <div class="stat-value medium">${gap}</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-label">複勝判定</div>
+      <div class="stat-value ${placeClass}" style="font-size:16px">${placeOk}</div>
+    </div>
+  `;
 }
 
-let pdfPollCount = 0;
-function pollPdfJob() {
-  if (pdfPollTimer) clearInterval(pdfPollTimer);
-  pdfPollCount = 0;
-  pdfPollTimer = setInterval(async () => {
-    pdfPollCount++;
-    const pct = Math.min(12 + pdfPollCount * 2.5, 90);
-    document.getElementById('pdf-prog-bar').style.width = pct + '%';
+// ─── Render Rank Matrix ───
+function renderRankMatrix(data) {
+  const rankings = data.rankings || [];
+  const anchor = data.anchor || {};
+  const container = document.getElementById('rankMatrixContainer');
 
-    if (pdfPollCount < 4)       setPdfStep('convert','active');
-    else if (pdfPollCount < 12) { setPdfStep('convert','done'); setPdfStep('ocr','active'); }
-    else                        { setPdfStep('ocr','done'); setPdfStep('predict','active'); }
+  if (!rankings.length) {
+    container.innerHTML = '<div class="empty-state"><div class="icon">📊</div><p>ランク指数データがありません</p></div>';
+    return;
+  }
 
-    try {
-      const r = await fetch(`/status/${currentJobId}`);
-      if (!r.ok) return;
-      const d = await r.json();
+  const cols = ['総合', '能力', '展開', '適性', '安定', '上り', '調教', 'EV'];
+  let html = '<table class="rank-matrix"><thead><tr>';
+  html += '<th>枠</th><th>番</th><th>馬名</th>';
+  cols.forEach(c => { html += `<th>${c}</th>`; });
+  html += '</tr></thead><tbody>';
 
-      if (d.log) {
-        const lines = d.log.split('\n').filter(Boolean);
-        document.getElementById('pdf-prog-log').textContent = lines.slice(-5).join('\n');
-      }
+  rankings.forEach(h => {
+    const isAnchor = String(h.num) === String(anchor.num);
+    const rowClass = isAnchor ? 'anchor-row' : '';
+    const numInt = parseInt(h.num) || 0;
+    const waku = Math.ceil(numInt / 2) || 1;
+    const wakuClass = 'waku-' + Math.min(waku, 8);
 
-      if (d.status === 'done') {
-        clearInterval(pdfPollTimer); clearInterval(pdfElTimer);
-        document.getElementById('pdf-prog-bar').style.width = '100%';
-        document.getElementById('pdf-prog-bar').classList.add('success');
-        document.getElementById('pdf-prog-label').textContent = `✅ 完了（${d.elapsed ?? pdfElapsed}秒）`;
-        ['upload','convert','ocr','predict'].forEach(s => setPdfStep(s,'done'));
-        showResult(d.markdown);
-        const btn = document.getElementById('pdf-run-btn');
-        btn.disabled = false; btn.textContent = '📄 PDFから予想する';
-      } else if (d.status === 'error') {
-        clearInterval(pdfPollTimer); clearInterval(pdfElTimer);
-        document.getElementById('pdf-prog-bar').style.width = '100%';
-        document.getElementById('pdf-prog-bar').classList.add('error');
-        document.getElementById('pdf-prog-label').textContent = '❌ エラー';
-        addMsg(`❌ PDF予想に失敗しました:\n\`\`\`\n${(d.error||'').slice(0,500)}\n\`\`\``);
-        const btn = document.getElementById('pdf-run-btn');
-        btn.disabled = false; btn.textContent = '📄 PDFから予想する';
-      }
-    } catch(e) {}
-  }, 2500);
+    html += `<tr class="${rowClass}">`;
+    html += `<td><span class="horse-num ${wakuClass}">${waku}</span></td>`;
+    html += `<td><b>${h.num}</b></td>`;
+    html += `<td class="horse-name">${isAnchor ? '◎ ' : ''}${h.name || ''}</td>`;
+    
+    cols.forEach(c => {
+      const rank = (h.ranks && h.ranks[c]) || '-';
+      html += `<td><span class="rank-badge rank-${rank}">${rank}</span></td>`;
+    });
+    
+    html += '</tr>';
+  });
+
+  html += '</tbody></table>';
+  container.innerHTML = html;
 }
 
-/* ═══ HISTORY ═══ */
-async function loadHistory() {
-  try {
-    const r = await fetch('/history');
-    const d = await r.json();
-    const list = document.getElementById('history-list');
+// ─── Render Bet Plan ───
+function renderBetPlan(data) {
+  const anchor = data.anchor || {};
+  const wide = data.wide || [];
+  const trio = data.trio || {};
+  const container = document.getElementById('betPlanContainer');
 
-    if (!d.history || d.history.length === 0) {
-      list.innerHTML = `
-        <div class="empty-state">
-          <div class="es-icon">📭</div>
-          <div class="es-text">まだ予想履歴がありません<br>予想を実行すると、ここに記録されます</div>
-        </div>`;
+  if (!anchor.num) {
+    container.innerHTML = '<div class="empty-state"><div class="icon">🎫</div><p>買い目データがありません</p></div>';
+    return;
+  }
+
+  let html = '<div class="bet-grid">';
+
+  // 複勝
+  html += `<div class="bet-card">
+    <h4>🎯 複勝</h4>
+    <div class="bet-nums">
+      <div class="bet-num anchor-num">${anchor.num}</div>
+    </div>
+    <div style="margin-top:8px;font-size:12px;color:var(--text-sub)">
+      ${anchor.place_ok ? '✅ 購入推奨' : '❌ 見送り'}
+    </div>
+  </div>`;
+
+  // ワイド
+  if (wide.length) {
+    html += `<div class="bet-card">
+      <h4>🔗 ワイド（◎軸流し ${wide.length}点）</h4>
+      <div class="bet-nums">
+        <div class="bet-num anchor-num">${anchor.num}</div>
+        <span style="color:var(--text-muted);font-size:18px;align-self:center">—</span>`;
+    wide.forEach(n => {
+      html += `<div class="bet-num">${n}</div>`;
+    });
+    html += `</div></div>`;
+  }
+
+  // 三連複
+  if (trio.a) {
+    html += `<div class="bet-card">
+      <h4>🏆 三連複フォーメーション（${trio.points || 0}点）</h4>
+      <div style="font-size:12px">
+        <div style="margin-bottom:6px"><b style="color:var(--gold)">A列:</b> ${trio.a}</div>
+        <div style="margin-bottom:6px"><b style="color:var(--blue)">B列:</b> ${(trio.b || []).join(', ')}</div>
+        <div><b style="color:var(--green)">C列:</b> ${(trio.c || []).join(', ')}</div>
+      </div>
+    </div>`;
+  }
+
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+// ─── Result Tabs ───
+function switchResultTab(tab) {
+  document.querySelectorAll('.result-tab').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.result-panel').forEach(el => el.classList.remove('active'));
+  
+  document.querySelector(`.result-tab[onclick="switchResultTab('${tab}')"]`).classList.add('active');
+  document.getElementById('panel-' + tab).classList.add('active');
+}
+
+// ─── Load History ───
+function loadHistory() {
+  fetch('/history').then(r => r.json()).then(data => {
+    const items = data.history || [];
+    const container = document.getElementById('historyContainer');
+    if (!items.length) {
+      container.innerHTML = '<div class="empty-state"><div class="icon">📂</div><p>予想履歴はまだありません</p></div>';
       return;
     }
 
-    list.innerHTML = d.history.map(item => `
-      <div class="hist-item" onclick="loadHistResult('${item.job_id}')">
-        <div class="hist-icon">🏇</div>
-        <div class="hist-info">
-          <div class="hist-title">${escHtml(item.title)}</div>
-          <div class="hist-time">🕐 ${escHtml(item.timestamp)}</div>
-          <div class="hist-prev">${escHtml(item.preview.replace(/\n/g,' '))}</div>
+    let html = '<ul class="history-list">';
+    items.forEach(h => {
+      const confClass = h.confidence ? `confidence-${h.confidence}` : '';
+      html += `<li class="history-item" onclick="loadHistoryResult('${h.job_id}')">
+        <div class="history-venue">${h.venue || '🏇'}</div>
+        <div class="history-info">
+          <div class="history-title">${h.title}</div>
+          <div class="history-meta">${h.date || ''} ${h.race || ''} · ${h.timestamp}</div>
         </div>
-        <div class="hist-arrow">›</div>
-      </div>
-    `).join('');
-  } catch(e) {
-    document.getElementById('history-list').innerHTML = '<p style="color:var(--red);padding:16px;">履歴の読み込みに失敗しました。</p>';
-  }
-}
-
-async function loadHistResult(jobId) {
-  try {
-    const r = await fetch(`/result/${jobId}`);
-    const d = await r.json();
-    if (d.success) {
-      showResult(d.markdown);
-      addMsg('📂 履歴から予想結果を読み込みました。「🏆 予想結果」タブをご確認ください。');
-    }
-  } catch(e) {
-    addMsg('⚠️ 結果の読み込みに失敗しました。');
-  }
-}
-
-function escHtml(str) {
-  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-/* ═══ HEALTH CHECK ═══ */
-async function showHealth() {
-  document.getElementById('status-modal').classList.add('show');
-  try {
-    const r = await fetch('/health');
-    const d = await r.json();
-    const ok  = v => `<span class="modal-value modal-ok">✅ ${v}</span>`;
-    const err = v => `<span class="modal-value modal-err">❌ ${v}</span>`;
-    document.getElementById('m-gat').outerHTML = `<span class="modal-value" id="m-gat">${d.ginandtonic === 'True' ? ok('存在') : err('未検出')}</span>`;
-    document.getElementById('m-tess').outerHTML = `<span class="modal-value" id="m-tess">${d.tesseract ? ok(d.tesseract_ver || 'OK') : err('未インストール')}</span>`;
-    document.getElementById('m-pdf').outerHTML  = `<span class="modal-value" id="m-pdf">${d.pdf_support ? ok('利用可能') : err('未インストール')}</span>`;
-    document.getElementById('m-pdfp').outerHTML = `<span class="modal-value" id="m-pdfp">${d.pdfplumber ? ok('利用可能') : err('未インストール')}</span>`;
-    document.getElementById('m-jobs').outerHTML = `<span class="modal-value" id="m-jobs">${d.active_jobs ?? 0} 件</span>`;
-    document.getElementById('m-hist').outerHTML = `<span class="modal-value" id="m-hist">${d.total_history ?? 0} 件</span>`;
-  } catch(e) {
-    ['m-gat','m-tess','m-pdf','m-pdfp'].forEach(id => {
-      document.getElementById(id).textContent = 'エラー';
+        <div class="history-confidence">
+          ${h.confidence ? `<span class="confidence ${confClass}">${h.confidence}</span>` : ''}
+        </div>
+      </li>`;
     });
-  }
+    html += '</ul>';
+    container.innerHTML = html;
+  });
 }
 
-// Close modal on backdrop click
-document.getElementById('status-modal').addEventListener('click', function(e) {
-  if (e.target === this) this.classList.remove('show');
-});
+function loadHistoryResult(jobId) {
+  showPage('predict');
+  fetch('/result/' + jobId)
+    .then(r => r.json())
+    .then(data => {
+      if (!data.success) return;
+      const structured = data.structured || {};
+      document.getElementById('resultSection').classList.remove('hidden');
+      renderAnchorCard(structured);
+      renderRankMatrix(structured);
+      renderBetPlan(structured);
+      if (data.markdown && typeof marked !== 'undefined') {
+        document.getElementById('mdResultContainer').innerHTML = marked.parse(data.markdown);
+      }
+      switchResultTab('matrix');
+    });
+}
+
+// ─── Load Saved Results ───
+function loadSavedResults() {
+  fetch('/results').then(r => r.json()).then(data => {
+    const items = data.results || [];
+    const container = document.getElementById('savedResultsList');
+    if (!items.length) {
+      container.innerHTML = '<div class="empty-state"><div class="icon">📋</div><p>保存済みの予想結果はありません</p></div>';
+      return;
+    }
+
+    let html = '<ul class="history-list">';
+    items.forEach(r => {
+      const hitIcon = r.place_hit === true ? '✅' : r.place_hit === false ? '❌' : '⏳';
+      const confClass = r.confidence ? `confidence-${r.confidence}` : '';
+      html += `<li class="history-item">
+        <div class="history-venue">${r.venue || '🏇'}</div>
+        <div class="history-info">
+          <div class="history-title">${r.date || ''} ${r.venue || ''} ${r.race || ''}</div>
+          <div class="history-meta">◎ ${r.anchor_num || ''}番 ${r.anchor_name || ''} · ${hitIcon}</div>
+        </div>
+        <div class="history-confidence">
+          ${r.confidence ? `<span class="confidence ${confClass}">${r.confidence}</span>` : ''}
+        </div>
+      </li>`;
+    });
+    html += '</ul>';
+    container.innerHTML = html;
+  });
+}
+
+// ─── Health Check ───
+function checkHealth() {
+  fetch('/health')
+    .then(r => r.json())
+    .then(d => {
+      const badge = document.getElementById('healthBadge');
+      badge.textContent = d.status === 'ok' ? 'ONLINE' : 'OFFLINE';
+    })
+    .catch(() => {
+      document.getElementById('healthBadge').textContent = 'OFFLINE';
+    });
+}
+
+// ─── Init ───
+checkHealth();
+setInterval(checkHealth, 30000);
 </script>
 </body>
 </html>
